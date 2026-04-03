@@ -81,12 +81,17 @@ def require_trueasync():
     Skip every test in this module if the TrueAsync infrastructure is absent.
 
     Runs before each test body (after the conftest 'run' fixture starts Unit).
-    Configures a minimal async application, makes one probe request, and calls
-    pytest.skip() if the response is not 200.  Two distinct failure modes are
-    distinguished so the skip message is actionable:
+    Three distinct failure modes are distinguished so the skip message is
+    actionable and unambiguous:
 
-    • Config rejected with "error" → "async"/"entrypoint" fields missing from
-      nxt_php_app_conf_t (TODO.md #1).  The fix is in nxt_application.h.
+    • PHP version < 8.5 → TrueAsync C code was compiled out via
+      #if NXT_PHP_TRUEASYNC (which configure sets to 0 when zend_async_event_t
+      is absent from the PHP headers).  The skip message points to the version
+      guard, not to a missing extension.  This catches any edge case where an
+      older PHP version slips past the prerequisites filter.
+
+    • Config rejected with "error" → "async"/"entrypoint" fields are missing
+      from nxt_php_app_conf_t (TODO.md #1).  The fix is in nxt_application.h.
 
     • Config accepted but status != 200 → nxt_php_extension.c is not built,
       so the PHP worker starts but \\Unit\\Server is undefined and the entrypoint
@@ -97,6 +102,20 @@ def require_trueasync():
     loading whatever config it actually needs — client.conf() in the test body
     will replace the probe config before any real assertions run.
     """
+    # ── Guard 1: PHP version ────────────────────────────────────────────────
+    # TrueAsync C code is compiled only when configure detects
+    # zend_async_event_t in the PHP headers (NXT_PHP_TRUEASYNC=1), which
+    # requires PHP 8.5+.  A misleading "extension not available" message
+    # would appear on older PHP if we went straight to the HTTP probe.
+    php_type = client.get_application_type()  # e.g. "php 8.5.0"
+    match = re.search(r'(\d+)\.(\d+)', php_type)
+    if not match or [match.group(1), match.group(2)] < ['8', '5']:
+        pytest.skip(
+            f'TrueAsync requires PHP 8.5+ with zend_async_event_t in headers '
+            f'(got {php_type!r}); C code excluded by #if NXT_PHP_TRUEASYNC'
+        )
+
+    # ── Guard 2 & 3: runtime probe ──────────────────────────────────────────
     probe_conf = {
         'listeners': {'*:8080': {'pass': 'applications/_trueasync_probe'}},
         'applications': {

@@ -52,6 +52,10 @@ jobs:
             os: ubuntu-latest
           - build: php-8.3
             os: ubuntu-latest
+          - build: php-8.4
+            os: ubuntu-latest
+          - build: php-8.5
+            os: ubuntu-latest
           - build: python-3.11
             os: ubuntu-latest
           - build: python-3.12
@@ -145,6 +149,7 @@ jobs:
             --zlib \
             --zstd \
             --brotli \
+            --otel \
             --cc-opt="-I njs/src/ -I njs/build"  \
             --ld-opt="-L njs/build"
 

@@ -11,7 +11,7 @@ PATCHLEVEL ?= 1
 MODULES ?= go jsc node perl php python ruby wasm
 MODULES_SLIM ?= python
 
-VARIANT ?= bookworm
+VARIANT ?= trixie
 
 VERSIONS_minimal ?=
 CONTAINER_minimal ?= debian:$(VARIANT)-slim
@@ -52,7 +52,7 @@ INSTALL_perl ?=		perl-install
 RUN_perl ?=			/bin/true
 MODULE_PREBUILD_perl ?=	/bin/true
 
-VERSIONS_php ?=		8.3 8.4
+VERSIONS_php ?=		8.3 8.4 8.5
 VARIANT_php ?=		cli-$(VARIANT)
 $(foreach phpversion, $(VERSIONS_php), $(eval CONTAINER_php$(phpversion) = php:$(phpversion)-$(VARIANT_php)))
 CONFIGURE_php ?=	php

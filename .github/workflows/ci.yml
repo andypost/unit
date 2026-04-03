@@ -298,7 +298,7 @@ jobs:
 
       - name: Configure ruby
         run: |
-          ./configure ruby
+          ./configure ruby --ruby=$(which ruby)
         if: steps.metadata.outputs.module == 'ruby'
 
       - name: Make ruby

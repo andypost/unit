@@ -286,14 +286,18 @@ jobs:
       ## Ruby
       ##
 
-      - name: Install ruby dev
-        run: |
-          sudo apt-get install -y ruby${{ steps.metadata.outputs.version }} ruby${{ steps.metadata.outputs.version }}-dev
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '${{ steps.metadata.outputs.version }}'
         if: steps.metadata.outputs.module == 'ruby'
 
       - name: Install rack
         run: |
           gem install rack
+        if: steps.metadata.outputs.module == 'ruby'
+
+      - name: Debug ruby lib
+        run: ls /opt/hostedtoolcache/Ruby/${{ steps.metadata.outputs.version }}.*/x64/lib/libruby* || echo "libruby not found"
         if: steps.metadata.outputs.module == 'ruby'
 
       - name: Configure ruby

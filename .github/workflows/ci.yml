@@ -52,13 +52,17 @@ jobs:
             os: ubuntu-latest
           - build: php-8.3
             os: ubuntu-latest
+          - build: php-8.4
+            os: ubuntu-latest
+          - build: php-8.5
+            os: ubuntu-latest
           - build: python-3.11
             os: ubuntu-latest
           - build: python-3.12
             os: ubuntu-latest
-          - build: ruby-3.2
-            os: ubuntu-latest
           - build: ruby-3.3
+            os: ubuntu-latest
+          - build: ruby-3.4
             os: ubuntu-latest
           - build: wasm
             os: ubuntu-latest
@@ -145,6 +149,7 @@ jobs:
             --zlib \
             --zstd \
             --brotli \
+            --otel \
             --cc-opt="-I njs/src/ -I njs/build"  \
             --ld-opt="-L njs/build"
 
@@ -296,7 +301,7 @@ jobs:
 
       - name: Configure ruby
         run: |
-          ./configure ruby
+          ./configure ruby --module=ruby
         if: steps.metadata.outputs.module == 'ruby'
 
       - name: Make ruby

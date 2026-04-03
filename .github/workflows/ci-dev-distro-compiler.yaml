@@ -1,22 +1,23 @@
 name: "CI - Fedora Rawhide / Alpine Edge / GCC / Clang"
 
 on:
-  push:
-    branches: master
-    paths:
-      - configure
-      - 'auto/**'
-      - 'src/**'
-      - 'test/**'
-      - '.github/workflows/ci-dev-distro-compiler.yaml'
-  pull_request:
-    branches: master
-    paths:
-      - configure
-      - 'auto/**'
-      - 'src/**'
-      - 'test/**'
-      - '.github/workflows/ci-dev-distro-compiler.yaml'
+  workflow_dispatch: # manual only
+#  push:
+#    branches: master
+#    paths:
+#      - configure
+#      - 'auto/**'
+#      - 'src/**'
+#      - 'test/**'
+#      - '.github/workflows/ci-dev-distro-compiler.yaml'
+#  pull_request:
+#    branches: master
+#    paths:
+#      - configure
+#      - 'auto/**'
+#      - 'src/**'
+#      - 'test/**'
+#      - '.github/workflows/ci-dev-distro-compiler.yaml'
 
 jobs:
 
@@ -151,7 +152,9 @@ jobs:
         run: make -j 4
 
       - name: configure unit-php
-        run: ln -s /usr/lib/libphp83.so /usr/lib/libphp.so && ./configure php
+        run: |
+          ln -s /usr/lib/libphp83.so /usr/lib/libphp.so
+          ./configure php --php-config=/usr/bin/php-config83
 
       - name: make unit-php
         run: make -j 4

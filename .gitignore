@@ -2,3 +2,6 @@
 Makefile
 *.pyc
 __pycache__/
+/.idea/
+/CLAUDE.md
+/.claude/

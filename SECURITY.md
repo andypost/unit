@@ -1,21 +1,38 @@
 # Security Policy
 
-## Latest Versions
+## Supported Versions
 
-We advise users to run or update to the most recent release of this
-project. Older versions of this project may not have all enhancements
-and/or bug fixes applied to them.
+FreeUnit provides security maintenance for the following versions:
+
+| Version | Supported |
+|---------|-----------|
+| 1.35.x  | ✅ Active |
+| 1.34.x  | ✅ LTS    |
+| < 1.34  | ❌ No     |
 
 ## Reporting a Vulnerability
 
-The F5 Security Incident Response Team (F5 SIRT) has an email alias that
-makes it easy to report potential security vulnerabilities:
+Please **do not** report security vulnerabilities through public GitHub issues.
 
-- If you’re an F5 customer with an active support contract, please
-contact [F5 Technical Support](https://www.f5.com/services/support).
-- If you aren’t an F5 customer, please report any potential or current
-instances of security vulnerabilities with any F5 product to the
-F5 Security Incident Response Team at <F5SIRT@f5.com>.
+Send a report to: **[team@freeunit.org](mailto:team@freeunit.org)**
 
-For more information please read the F5 SIRT vulnerability reporting
-guidelines available at [https://www.f5.com/services/support/report-a-vulnerability](https://www.f5.com/services/support/report-a-vulnerability).
+Include in your report:
+- Description of the vulnerability
+- Steps to reproduce
+- Affected versions
+- Potential impact
+
+We follow [CVSS v3.1](https://www.first.org/cvss/v3.1/specification-document) for severity scoring.
+
+## Response Timeline
+
+| Stage | Timeline |
+|-------|----------|
+| Acknowledgement | 48 hours |
+| Assessment | 7 days |
+| Fix & Release | 30 days |
+
+## Disclosure Policy
+
+We follow coordinated disclosure. Please allow us to release a fix
+before public disclosure.

@@ -146,12 +146,14 @@ jobs:
           else
             ./configure --openssl --otel --zlib --zstd --brotli --tests
           fi
-
+          
       - name: make unit
         run: make -j 4
 
       - name: configure unit-php
-        run: ln -s /usr/lib/libphp83.so /usr/lib/libphp.so && ./configure php
+        run: |
+          ln -s /usr/lib/libphp83.so /usr/lib/libphp.so
+          ./configure php --php-config=/usr/bin/php-config83
 
       - name: make unit-php
         run: make -j 4

@@ -60,6 +60,8 @@ jobs:
             os: ubuntu-latest
           - build: ruby-3.3
             os: ubuntu-latest
+          - build: ruby-3.4
+            os: ubuntu-latest
           - build: wasm
             os: ubuntu-latest
           - build: wasm-wasi-component
@@ -294,13 +296,9 @@ jobs:
           gem install rack
         if: steps.metadata.outputs.module == 'ruby'
 
-      - name: Debug ruby lib
-        run: ls /opt/hostedtoolcache/Ruby/${{ steps.metadata.outputs.version }}.*/x64/lib/libruby* || echo "libruby not found"
-        if: steps.metadata.outputs.module == 'ruby'
-
       - name: Configure ruby
         run: |
-          ./configure ruby --ruby=$(which ruby)
+          ./configure ruby --module=ruby
         if: steps.metadata.outputs.module == 'ruby'
 
       - name: Make ruby

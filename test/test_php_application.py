@@ -625,6 +625,10 @@ def test_php_application_disable_functions_nonexistent():
 
 
 def test_php_application_disable_classes():
+    versions = option.available['modules'].get('php', [])
+    if versions and versions[0].split('.')[:2] >= ['8', '5']:
+        pytest.skip('disable_classes removed in PHP 8.5')
+
     client.load('date_time')
 
     assert re.search(r'012345', client.get()['body']), 'disable_classes before'
@@ -640,6 +644,10 @@ def test_php_application_disable_classes():
 
 
 def test_php_application_disable_classes_user():
+    versions = option.available['modules'].get('php', [])
+    if versions and versions[0].split('.')[:2] >= ['8', '5']:
+        pytest.skip('disable_classes removed in PHP 8.5')
+
     client.load('date_time')
 
     assert re.search(r'012345', client.get()['body']), 'disable_classes before'

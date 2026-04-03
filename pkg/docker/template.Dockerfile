@@ -1,11 +1,11 @@
 FROM @@CONTAINER@@
 
-LABEL org.opencontainers.image.title="Unit (@@MODULE@@)"
-LABEL org.opencontainers.image.description="Official build of Unit for Docker."
-LABEL org.opencontainers.image.url="https://unit.nginx.org"
-LABEL org.opencontainers.image.source="https://github.com/nginx/unit"
-LABEL org.opencontainers.image.documentation="https://unit.nginx.org/installation/#docker-images"
-LABEL org.opencontainers.image.vendor="NGINX Docker Maintainers <docker-maint@nginx.com>"
+LABEL org.opencontainers.image.title="FreeUnit (@@MODULE@@)"
+LABEL org.opencontainers.image.description="Community build of FreeUnit for Docker."
+LABEL org.opencontainers.image.url="https://freeunit.org"
+LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
+LABEL org.opencontainers.image.documentation="https://github.com/freeunitorg/freeunit/blob/master/README.md"
+LABEL org.opencontainers.image.vendor="FreeUnit Community <team@freeunit.org>"
 LABEL org.opencontainers.image.version="@@VERSION@@"
 
 RUN set -ex \
@@ -35,7 +35,7 @@ RUN set -ex \
     && mkdir -p /usr/lib/unit/modules /usr/lib/unit/debug-modules \
     && mkdir -p /usr/src/unit \
     && cd /usr/src/unit \
-    && git clone --depth 1 -b @@VERSION@@-@@PATCHLEVEL@@ https://github.com/nginx/unit \
+    && git clone --depth 1 -b @@VERSION@@ https://github.com/freeunitorg/freeunit unit \
     && cd unit \
     && NCPU="$(getconf _NPROCESSORS_ONLN)" \
     && DEB_HOST_MULTIARCH="$(dpkg-architecture -q DEB_HOST_MULTIARCH)" \

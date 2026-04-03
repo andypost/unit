@@ -83,6 +83,7 @@ static nxt_int_t nxt_php_setup(nxt_task_t *task, nxt_process_t *process,
     nxt_common_app_conf_t *conf);
 static nxt_int_t nxt_php_start(nxt_task_t *task, nxt_process_data_t *data);
 static void nxt_php_cleanup_targets(void);
+#if NXT_PHP_TRUEASYNC
 static nxt_int_t nxt_php_async_load_entrypoint(nxt_task_t *task, nxt_str_t *entrypoint);
 static bool nxt_php_activate_true_async(nxt_task_t *task);
 static void nxt_php_suspend_coroutine(nxt_unit_ctx_t *ctx);
@@ -90,6 +91,7 @@ static int nxt_php_add_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port);
 static void nxt_php_remove_port(nxt_unit_t *unit, nxt_unit_ctx_t *ctx, nxt_unit_port_t *port);
 static void nxt_php_quit_handler(nxt_unit_ctx_t *ctx);
 static void nxt_php_shm_ack_handler(nxt_unit_ctx_t *ctx);
+#endif /* NXT_PHP_TRUEASYNC */
 static nxt_int_t nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     nxt_conf_value_t *conf);
 static nxt_int_t nxt_php_set_ini_path(nxt_task_t *task, nxt_str_t *path,
@@ -115,11 +117,15 @@ static nxt_int_t nxt_php_do_301(nxt_unit_request_info_t *req);
 static nxt_int_t nxt_php_handle_fs_err(nxt_unit_request_info_t *req);
 
 static void nxt_php_request_handler(nxt_unit_request_info_t *req);
+#if NXT_PHP_TRUEASYNC
 static void nxt_php_request_handler_async(nxt_unit_request_info_t *req);
+#endif /* NXT_PHP_TRUEASYNC */
 static void nxt_php_dynamic_request(nxt_php_run_ctx_t *ctx,
     nxt_unit_request_t *r);
+#if NXT_PHP_TRUEASYNC
 static void nxt_php_scope_init_superglobals(zend_async_scope_t *scope);
 static void nxt_php_scope_populate_superglobals(zend_async_scope_t *scope);
+#endif /* NXT_PHP_TRUEASYNC */
 #if (PHP_VERSION_ID < 70400)
 static void nxt_zend_stream_init_fp(zend_file_handle *handle, FILE *fp,
     const char *filename);
@@ -139,8 +145,10 @@ nxt_inline void nxt_php_set_str(nxt_unit_request_info_t *req, const char *name,
 static void nxt_php_set_cstr(nxt_unit_request_info_t *req, const char *name,
     const char *str, uint32_t len, zval *track_vars_array TSRMLS_DC);
 void nxt_php_register_variables(zval *track_vars_array TSRMLS_DC);
+#if NXT_PHP_TRUEASYNC
 static void nxt_php_register_variables_async(nxt_unit_request_info_t *req,
     nxt_php_run_ctx_t *ctx, zval *track_vars_array TSRMLS_DC);
+#endif /* NXT_PHP_TRUEASYNC */
 #if NXT_PHP8
 static void nxt_php_log_message(const char *message, int syslog_type_int);
 #else
@@ -217,10 +225,12 @@ PHP_MINIT_FUNCTION(nxt_php_ext)
     nxt_php_chdir_handler = func->internal_function.handler;
     func->internal_function.handler = nxt_php_chdir;
 
-    /* Register NginxUnit PHP extension classes */
+#if NXT_PHP_TRUEASYNC
+    /* Register NginxUnit PHP extension classes (TrueAsync only) */
     if (nxt_php_extension_init() != NXT_OK) {
         return FAILURE;
     }
+#endif /* NXT_PHP_TRUEASYNC */
 
     return SUCCESS;
 }
@@ -358,7 +368,7 @@ static sapi_module_struct  nxt_php_sapi_module =
     NULL,                        /* ini_entries */
     NULL,                        /* additional_functions */
     NULL,                        /* input_filter_init */
-#if (PHP_VERSION_ID >= 80500)
+#if NXT_PHP_TRUEASYNC
     NULL,                        /* pre_request_init */
 #endif
 };
@@ -476,6 +486,8 @@ nxt_php_setup(nxt_task_t *task, nxt_process_t *process,
     return NXT_OK;
 }
 
+
+#if NXT_PHP_TRUEASYNC
 
 /**
  * Add pending write to drain_queue
@@ -671,6 +683,8 @@ nxt_php_shm_ack_handler(nxt_unit_ctx_t *ctx)
     }
 }
 
+#endif /* NXT_PHP_TRUEASYNC */
+
 
 static nxt_int_t
 nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
@@ -727,6 +741,7 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
     }
 
     /* Choose request handler based on mode */
+#if NXT_PHP_TRUEASYNC
     if (c->async && c->entrypoint.length > 0) {
         nxt_debug(task, "PHP HTTP Server mode enabled with entrypoint: %V", &c->entrypoint);
         php_init.callbacks.add_port = nxt_php_add_port;
@@ -749,9 +764,12 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
             return NXT_ERROR;
         }
     } else {
+#endif /* NXT_PHP_TRUEASYNC */
         nxt_debug(task, "PHP standard mode");
         php_init.callbacks.request_handler = nxt_php_request_handler;
+#if NXT_PHP_TRUEASYNC
     }
+#endif /* NXT_PHP_TRUEASYNC */
 
     unit_ctx = nxt_unit_init(&php_init);
     if (nxt_slow_path(unit_ctx == NULL)) {
@@ -760,6 +778,7 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
 
     nxt_php_unit_ctx = unit_ctx;
 
+#if NXT_PHP_TRUEASYNC
     /* Initialize async context data for drain_queue */
     if (c->async && c->entrypoint.length > 0) {
         nxt_php_async_ctx_data_t *async_data;
@@ -783,6 +802,9 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
     } else {
         nxt_unit_run(nxt_php_unit_ctx);
     }
+#else
+    nxt_unit_run(nxt_php_unit_ctx);
+#endif /* NXT_PHP_TRUEASYNC */
     nxt_unit_done(nxt_php_unit_ctx);
 
     /* Clean up allocated memory before exit */
@@ -1950,6 +1972,8 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
 }
 
 
+#if NXT_PHP_TRUEASYNC
+
 static void
 nxt_php_register_variables_async(nxt_unit_request_info_t *req,
     nxt_php_run_ctx_t *ctx, zval *track_vars_array TSRMLS_DC)
@@ -2069,6 +2093,8 @@ nxt_php_register_variables_async(nxt_unit_request_info_t *req,
     }
 }
 
+#endif /* NXT_PHP_TRUEASYNC */
+
 
 static void
 nxt_php_set_sptr(nxt_unit_request_info_t *req, const char *name,
@@ -2180,6 +2206,8 @@ nxt_php_log_message(char *message TSRMLS_DC)
     }
 }
 
+
+#if NXT_PHP_TRUEASYNC
 
 /* TrueAsync Mode Implementation */
 
@@ -2617,3 +2645,5 @@ nxt_php_scope_populate_superglobals(zend_async_scope_t *scope)
         }
     }
 }
+
+#endif /* NXT_PHP_TRUEASYNC */

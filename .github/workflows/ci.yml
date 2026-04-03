@@ -52,6 +52,8 @@ jobs:
             os: ubuntu-latest
           - build: php-8.3
             os: ubuntu-latest
+          - build: php-8.4
+            os: ubuntu-latest
           - build: python-3.11
             os: ubuntu-latest
           - build: python-3.12

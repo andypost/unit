@@ -146,7 +146,7 @@ jobs:
           else
             ./configure --openssl --otel --zlib --zstd --brotli --tests
           fi
-          
+
       - name: make unit
         run: make -j 4
 

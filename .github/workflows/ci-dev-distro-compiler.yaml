@@ -1,22 +1,23 @@
 name: "CI - Fedora Rawhide / Alpine Edge / GCC / Clang"
 
 on:
-  push:
-    branches: master
-    paths:
-      - configure
-      - 'auto/**'
-      - 'src/**'
-      - 'test/**'
-      - '.github/workflows/ci-dev-distro-compiler.yaml'
-  pull_request:
-    branches: master
-    paths:
-      - configure
-      - 'auto/**'
-      - 'src/**'
-      - 'test/**'
-      - '.github/workflows/ci-dev-distro-compiler.yaml'
+  workflow_dispatch: # manual only
+#  push:
+#    branches: master
+#    paths:
+#      - configure
+#      - 'auto/**'
+#      - 'src/**'
+#      - 'test/**'
+#      - '.github/workflows/ci-dev-distro-compiler.yaml'
+#  pull_request:
+#    branches: master
+#    paths:
+#      - configure
+#      - 'auto/**'
+#      - 'src/**'
+#      - 'test/**'
+#      - '.github/workflows/ci-dev-distro-compiler.yaml'
 
 jobs:
 

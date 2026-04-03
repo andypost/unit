@@ -286,9 +286,9 @@ jobs:
       ## Ruby
       ##
 
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '${{ steps.metadata.outputs.version }}'
+      - name: Install ruby dev
+        run: |
+          sudo apt-get install -y ruby${{ steps.metadata.outputs.version }} ruby${{ steps.metadata.outputs.version }}-dev
         if: steps.metadata.outputs.module == 'ruby'
 
       - name: Install rack

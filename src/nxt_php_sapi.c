@@ -368,7 +368,7 @@ static sapi_module_struct  nxt_php_sapi_module =
     NULL,                        /* ini_entries */
     NULL,                        /* additional_functions */
     NULL,                        /* input_filter_init */
-#if NXT_PHP_TRUEASYNC
+#if NXT_PHP_PRE_REQUEST_INIT
     NULL,                        /* pre_request_init */
 #endif
 };

@@ -161,5 +161,14 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.variant }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-${{ matrix.variant }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/freeunitorg/freeunit
+          annotations: |
+            index:org.opencontainers.image.description=FreeUnit ${{ steps.version.outputs.VERSION }} (${{ matrix.variant }}) — community LTS fork of the NGINX Unit application server
+            index:org.opencontainers.image.title=FreeUnit (${{ matrix.variant }})
+            index:org.opencontainers.image.url=https://freeunit.org
+            index:org.opencontainers.image.source=https://github.com/freeunitorg/freeunit
+            index:org.opencontainers.image.vendor=FreeUnit Community
+            index:org.opencontainers.image.version=${{ steps.version.outputs.VERSION }}
           cache-from: type=gha,scope=${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.variant }}

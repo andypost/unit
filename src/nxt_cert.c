@@ -170,13 +170,30 @@ nxt_cert_bio(nxt_task_t *task, BIO *bio)
 
             /*
              * EVP_PKEY_asn1_find_str() and EVP_PKEY_asn1_get0_info() are
-             * deprecated in OpenSSL 3.6.  The key type prefix (e.g. "RSA",
-             * "EC", "DSA") is a registered OBJ short name, so OBJ_sn2nid()
-             * gives us the same NID without going through the ASN1 method
-             * table.
+             * deprecated in OpenSSL 3.6.
+             *
+             * OBJ_sn2nid() cannot replace them: the pem_str stored in
+             * EVP_PKEY_ASN1_METHOD ("EC", "RSA", "DSA") lives in a separate
+             * namespace from the OBJ short-name database — e.g. OBJ_sn2nid
+             * knows "id-ecPublicKey", not "EC".
+             *
+             * The only key types that ever appear in legacy "TYPE PRIVATE KEY"
+             * PEM blocks are RSA, DSA, and EC, so an explicit table is both
+             * complete and future-proof without touching the ASN1 method API.
              */
             {
-                char  key_type[64];
+                static const struct {
+                    const char  *pem;
+                    int          id;
+                } pem_key_ids[] = {
+                    { "RSA", EVP_PKEY_RSA },
+                    { "DSA", EVP_PKEY_DSA },
+                    { "EC",  EVP_PKEY_EC  },
+                    { NULL, 0 }
+                };
+
+                char        key_type[64];
+                nxt_uint_t  i;
 
                 if ((size_t) suffix >= sizeof(key_type)) {
                     goto done;
@@ -185,10 +202,19 @@ nxt_cert_bio(nxt_task_t *task, BIO *bio)
                 nxt_memcpy(key_type, type, suffix);
                 key_type[suffix] = '\0';
 
-                key_id = OBJ_sn2nid(key_type);
-                if (key_id == NID_undef) {
+                key_id = 0;
+
+                for (i = 0; pem_key_ids[i].pem != NULL; i++) {
+                    if (nxt_strcmp(key_type, pem_key_ids[i].pem) == 0) {
+                        key_id = pem_key_ids[i].id;
+                        break;
+                    }
+                }
+
+                if (key_id == 0) {
                     nxt_openssl_log_error(task, NXT_LOG_ALERT,
-                                          "OBJ_sn2nid() failed");
+                                          "unknown PEM key type: \"%s\"",
+                                          key_type);
                     goto done;
                 }
             }

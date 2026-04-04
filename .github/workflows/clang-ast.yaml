@@ -40,7 +40,7 @@ jobs:
           # TODO: fix auto/modules/ruby to probe the multiarch libdir via
           #   dpkg-architecture -q DEB_HOST_MULTIARCH
           # and fall back to it when the standard libdir check fails.
-          # Workaround: create a symlink so -L/usr/lib finds the library.
+          # Workaround: create symlinks so -L/usr/lib finds the library.
           MULTIARCH=$(dpkg-architecture -q DEB_HOST_MULTIARCH)
           for f in /usr/lib/$MULTIARCH/libruby-*.so; do
             [ -f "$f" ] && ln -sf "$f" /usr/lib/$(basename "$f") || true
@@ -48,8 +48,10 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      - name: Build clang-ast plugin
-        run: make -C clang-ast
+      - name: Checkout and build clang-ast
+        run: |
+          git clone https://github.com/freeunitorg/clang-ast.git -b unit
+          make -C clang-ast
 
       - name: Configure Unit
         # -Wno-default-const-init-field-unsafe: clang 21 emits this on Ruby 3.3

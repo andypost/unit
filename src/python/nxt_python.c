@@ -38,6 +38,7 @@ static int nxt_python_ready_handler(nxt_unit_ctx_t *ctx);
 static void *nxt_python_thread_func(void *main_ctx);
 static void nxt_python_join_threads(nxt_unit_ctx_t *ctx,
     nxt_python_app_conf_t *c);
+static void nxt_python_join_daemon_threads(void);
 static void nxt_python_atexit(void);
 
 static uint32_t  compat[] = {
@@ -820,6 +821,36 @@ nxt_python_done_strings(nxt_python_string_t *pstr)
 
 
 static void
+nxt_python_join_daemon_threads(void)
+{
+    int  rc;
+
+    /*
+     * This snippet is deliberately written to be safe at teardown time:
+     *  - threading is fetched from sys.modules (already imported), never via
+     *    a bare 'import' that could fail if the import machinery is partially
+     *    torn down.
+     *  - join(timeout=1.0) caps the wait per thread so shutdown is bounded.
+     *  - All temporary names use a leading underscore to avoid polluting the
+     *    __main__ namespace and conflicting with application globals.
+     */
+    rc = PyRun_SimpleString(
+        "import sys as _sys\n"
+        "_threading = _sys.modules.get('threading')\n"
+        "if _threading is not None:\n"
+        "    _cur = _threading.current_thread()\n"
+        "    for _t in list(_threading.enumerate()):\n"
+        "        if _t is not _cur and _t.daemon and _t.is_alive():\n"
+        "            _t.join(timeout=1.0)\n"
+    );
+
+    if (rc != 0) {
+        PyErr_Clear();
+    }
+}
+
+
+static void
 nxt_python_atexit(void)
 {
     nxt_int_t            i;
@@ -843,6 +874,21 @@ nxt_python_atexit(void)
 
         nxt_unit_free(NULL, nxt_py_targets);
     }
+
+    /*
+     * Join Python-level daemon threads before Py_Finalize().
+     *
+     * C extensions that spawn daemon threads (e.g. mysql-connector-python's
+     * NetworkThread) can crash the worker process during Py_Finalize() because
+     * that call nullifies sys.modules while the background thread is still
+     * running and accessing module-level objects, causing SIGSEGV.
+     *
+     * We look up the threading module from sys.modules (no import needed —
+     * it was already loaded by the application) and join each live daemon
+     * thread with a short timeout so they can exit cleanly before the
+     * interpreter is torn down.  See nginx/unit#1606.
+     */
+    nxt_python_join_daemon_threads();
 
     Py_Finalize();
 

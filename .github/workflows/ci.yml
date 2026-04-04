@@ -140,20 +140,15 @@ jobs:
           sudo make install_sw
 
       - name: Set OpenSSL 3.6 build environment
-        # Do NOT overwrite system libssl/libcrypto — sudo links against them
-        # and replacing with a different SONAME version breaks symbol lookup.
-        # Instead keep everything in /opt/openssl-3.6 and tell the compiler
-        # where to look via CFLAGS / LIBRARY_PATH (compile-time only) and
-        # embed an rpath so the built unitd binary loads 3.6 at runtime.
+        # Keep OpenSSL 3.6 isolated in /opt/openssl-3.6.
+        # Mixing libssl.so.3 (3.3) with libcrypto.so.3 (3.6) breaks sudo,
+        # so we never overwrite system libraries.
+        # Export the two helper variables used in later steps.
         run: |
           OSSL=/opt/openssl-3.6
           LIBDIR=$( [ -d "$OSSL/lib64" ] && echo "$OSSL/lib64" || echo "$OSSL/lib" )
-          echo "OPENSSL36_INCDIR=${OSSL}/include"  >> $GITHUB_ENV
-          echo "OPENSSL36_LIBDIR=${LIBDIR}"         >> $GITHUB_ENV
-          # Picked up by auto/feature compile tests ($CC $CFLAGS ...)
-          echo "CFLAGS=-I${OSSL}/include"           >> $GITHUB_ENV
-          # Compile-time library search path (does NOT affect runtime / sudo)
-          echo "LIBRARY_PATH=${LIBDIR}"             >> $GITHUB_ENV
+          echo "OPENSSL36_INCDIR=${OSSL}/include" >> $GITHUB_ENV
+          echo "OPENSSL36_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
 
       ##
       ## njs
@@ -177,6 +172,13 @@ jobs:
       ##
 
       - name: Configure unit
+        # LD_LIBRARY_PATH is set only for this step so that auto/feature
+        # test binaries load OpenSSL 3.6 at runtime.  It is NOT exported
+        # globally — doing so would break sudo (sudoers.so links against
+        # system libssl 3.3 which requires OPENSSL_3.3.0 from libcrypto,
+        # a symbol version that 3.6 does not export in the same slot).
+        env:
+          LD_LIBRARY_PATH: ${{ env.OPENSSL36_LIBDIR }}
         run: |
           ./configure \
             --tests \

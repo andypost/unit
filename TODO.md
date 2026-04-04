@@ -126,6 +126,27 @@ names.  Once item 2 is resolved:
 
 ---
 
+## OpenSSL 3.6 — test openssl-3.x branch
+
+Before the OpenSSL 3.6 migration can be considered fully validated:
+
+- [ ] Verify that the `openssl-3.x` branch (if it exists upstream or as a
+      fork reference) still applies cleanly on top of `master` with the new
+      `OBJ_sn2nid` / `OpenSSL_version_num` replacements.
+- [ ] Run the full CI matrix (`ci.yml`) and confirm the new "Build OpenSSL 3.6"
+      step succeeds on both `amd64` and `arm64` runners.
+- [ ] Confirm `clang-ast` workflow passes end-to-end on `debian:testing`
+      (was broken by `EVP_PKEY_asn1_find_str` / `SSLeay` deprecations).
+- [ ] Smoke-test TLS in a Docker image built from `Dockerfile.minimal`
+      (now `debian:trixie-slim`) — load a certificate via the REST API and
+      make an HTTPS request.
+- [ ] Investigate `eclipse-temurin:11-jdk-noble` (Ubuntu 24.04, OpenSSL 3.3)
+      as the one remaining image that does NOT reach OpenSSL 3.6; decide
+      whether to build OpenSSL 3.6 from source in that Dockerfile or accept
+      the gap until eclipse-temurin gains a Debian trixie variant.
+
+---
+
 ## PHP 8.5 Compatibility
 
 ### `disable_classes` removed (PHP 8.5)

@@ -119,6 +119,39 @@ jobs:
       - name: Install packages
         run: sudo apt-get -y install libbrotli-dev
 
+      - name: Cache OpenSSL 3.6
+        id: cache-openssl36
+        uses: actions/cache@v4
+        with:
+          path: /opt/openssl-3.6
+          key: openssl-3.6.0-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build OpenSSL 3.6
+        if: steps.cache-openssl36.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get -y install build-essential
+          cd /tmp
+          wget -q https://www.openssl.org/source/openssl-3.6.0.tar.gz
+          tar -xzf openssl-3.6.0.tar.gz
+          cd openssl-3.6.0
+          ./Configure --prefix=/opt/openssl-3.6 shared no-docs
+          make -j$(nproc)
+          sudo mkdir -p /opt/openssl-3.6
+          sudo make install_sw
+
+      - name: Install OpenSSL 3.6 headers and libs
+        run: |
+          MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
+          sudo cp -ra /opt/openssl-3.6/include/openssl /usr/include/
+          sudo install -m755 /opt/openssl-3.6/lib64/libssl.so.3    /usr/lib/${MULTIARCH}/ 2>/dev/null || \
+          sudo install -m755 /opt/openssl-3.6/lib/libssl.so.3      /usr/lib/${MULTIARCH}/
+          sudo install -m755 /opt/openssl-3.6/lib64/libcrypto.so.3 /usr/lib/${MULTIARCH}/ 2>/dev/null || \
+          sudo install -m755 /opt/openssl-3.6/lib/libcrypto.so.3   /usr/lib/${MULTIARCH}/
+          sudo cp -a /opt/openssl-3.6/lib64/pkgconfig /usr/lib/${MULTIARCH}/ 2>/dev/null || \
+          sudo cp -a /opt/openssl-3.6/lib/pkgconfig   /usr/lib/${MULTIARCH}/
+          sudo ldconfig
+          openssl version
+
       ##
       ## njs
       ##

@@ -1,4 +1,4 @@
-FROM perl:5.38-bookworm
+FROM perl:5.38-trixie
 
 LABEL org.opencontainers.image.title="Unit (perl5.38)"
 LABEL org.opencontainers.image.description="Official build of Unit for Docker."

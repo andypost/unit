@@ -97,17 +97,16 @@ nxt_cert_fd(nxt_task_t *task, nxt_fd_t fd)
 static nxt_cert_t *
 nxt_cert_bio(nxt_task_t *task, BIO *bio)
 {
-    int                         ret, suffix, key_id;
-    long                        length, reason;
-    char                        *type, *header;
-    X509                        *x509;
-    EVP_PKEY                    *key;
-    nxt_uint_t                  nalloc;
-    nxt_cert_t                  *cert, *new_cert;
-    u_char                      *data;
-    const u_char                *data_copy;
-    PKCS8_PRIV_KEY_INFO         *p8inf;
-    const EVP_PKEY_ASN1_METHOD  *ameth;
+    int                  ret, suffix, key_id;
+    long                 length, reason;
+    char                 *type, *header;
+    X509                 *x509;
+    EVP_PKEY             *key;
+    nxt_uint_t           nalloc;
+    nxt_cert_t           *cert, *new_cert;
+    u_char               *data;
+    const u_char         *data_copy;
+    PKCS8_PRIV_KEY_INFO  *p8inf;
 
     nalloc = 4;
 
@@ -169,14 +168,30 @@ nxt_cert_bio(nxt_task_t *task, BIO *bio)
 
         if (suffix != 0) {
 
-            ameth = EVP_PKEY_asn1_find_str(NULL, type, suffix);
-            if (ameth == NULL) {
-                nxt_openssl_log_error(task, NXT_LOG_ALERT,
-                                      "EVP_PKEY_asn1_find_str() failed");
-                goto done;
-            }
+            /*
+             * EVP_PKEY_asn1_find_str() and EVP_PKEY_asn1_get0_info() are
+             * deprecated in OpenSSL 3.6.  The key type prefix (e.g. "RSA",
+             * "EC", "DSA") is a registered OBJ short name, so OBJ_sn2nid()
+             * gives us the same NID without going through the ASN1 method
+             * table.
+             */
+            {
+                char  key_type[64];
 
-            EVP_PKEY_asn1_get0_info(&key_id, NULL, NULL, NULL, NULL, ameth);
+                if ((size_t) suffix >= sizeof(key_type)) {
+                    goto done;
+                }
+
+                nxt_memcpy(key_type, type, suffix);
+                key_type[suffix] = '\0';
+
+                key_id = OBJ_sn2nid(key_type);
+                if (key_id == NID_undef) {
+                    nxt_openssl_log_error(task, NXT_LOG_ALERT,
+                                          "OBJ_sn2nid() failed");
+                    goto done;
+                }
+            }
 
             data_copy = data;
 

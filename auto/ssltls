@@ -38,10 +38,11 @@ if [ $NXT_OPENSSL = YES ]; then
         nxt_feature_name=NXT_HAVE_OPENSSL_VERSION
         nxt_feature_run=value
         nxt_feature_test="#include <openssl/ssl.h>
+#include <openssl/crypto.h>
 
                           int main(void) {
                               printf(\"\\\"%s\\\"\",
-                                     SSLeay_version(SSLEAY_VERSION));
+                                     OpenSSL_version(OPENSSL_VERSION));
                               return 0;
                           }"
         . auto/feature

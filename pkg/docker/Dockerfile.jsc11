@@ -1,4 +1,4 @@
-FROM eclipse-temurin:11-jdk-jammy
+FROM eclipse-temurin:11-jdk-noble
 
 LABEL org.opencontainers.image.title="Unit (jsc11)"
 LABEL org.opencontainers.image.description="Official build of Unit for Docker."

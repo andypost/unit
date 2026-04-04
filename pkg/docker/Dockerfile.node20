@@ -1,4 +1,4 @@
-FROM node:20-bookworm
+FROM node:20-trixie
 
 LABEL org.opencontainers.image.title="Unit (node20)"
 LABEL org.opencontainers.image.description="Official build of Unit for Docker."

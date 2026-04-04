@@ -166,10 +166,10 @@ nxt_openssl_library_init(nxt_task_t *task)
 
 #endif
 
-    nxt_openssl_version = SSLeay();
+    nxt_openssl_version = OpenSSL_version_num();
 
     nxt_log(task, NXT_LOG_INFO, "%s, %xl",
-            SSLeay_version(SSLEAY_VERSION), nxt_openssl_version);
+            OpenSSL_version(OPENSSL_VERSION), nxt_openssl_version);
 
 #ifndef SSL_OP_NO_COMPRESSION
     {

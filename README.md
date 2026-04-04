@@ -1,5 +1,9 @@
 # FreeUnit — Community LTS fork of Unit
 
+[![Project Status: Active – The project has reached a stable, usable state and is being actively developed.](https://www.repostatus.org/badges/latest/active.svg)](https://www.repostatus.org/#active)
+[![CI](https://github.com/freeunitorg/freeunit/actions/workflows/ci.yml/badge.svg)](https://github.com/freeunitorg/freeunit/actions/workflows/ci.yml "GitHub workflow CI")
+[![GitHub Discussions](https://img.shields.io/badge/GitHub-discussions-009639)](https://github.com/freeunitorg/freeunit/discussions "GitHub Discussions")
+
 **Free as in freedom.**
 
 Unit application server, continued by the community.

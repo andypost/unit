@@ -12,7 +12,7 @@ RUN set -ex \
     && savedAptMark="$(apt-mark showmanual)" \
     && apt-get update \
     && apt-get install --no-install-recommends --no-install-suggests -y \
-         ca-certificates git build-essential libssl-dev libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev curl pkg-config pkgconf libclang-dev cmake \
+         ca-certificates git build-essential libssl-dev openssl libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev curl wget pkg-config pkgconf libclang-dev cmake \
     && export RUST_VERSION=1.89.0 \
     && export RUSTUP_HOME=/usr/src/unit/rustup \
     && export CARGO_HOME=/usr/src/unit/cargo \

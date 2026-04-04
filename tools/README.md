@@ -1,7 +1,7 @@
 # Unit Tools
 
 This directory contains useful tools for installing, configuring, and
-managing NGINX Unit. They may not be part of official packages and
+managing FreeUnit (ex NGINX Unit). They may not be part of official packages and
 should be considered experimental.
 
 * [`setup-unit`](#setup-unit)
@@ -12,18 +12,18 @@ should be considered experimental.
 
 ## setup-unit
 
-### A script that simplifies installing and configuring an NGINX Unit server for first-time users
+### A script that simplifies installing and configuring a FreeUnit server for first-time users
 
-* `setup-unit repo-config` configures your package manager with the NGINX
-Unit repository for later installation.
+* `setup-unit repo-config` configures your package manager with the FreeUnit
+repository for later installation.
 * `setup-unit welcome` creates an initial configuration to serve a welcome
-web page with NGINX Unit.
+web page with FreeUnit.
 
 ---
 
 ## unitc
 
-### A curl wrapper for managing NGINX Unit configuration
+### A curl wrapper for managing FreeUnit configuration
 
 ```USAGE: unitc [options] URI```
 
@@ -66,7 +66,7 @@ unitc /certificates/bundle cert.pem key.pem
 ```
 
 ### Remote Configuration
-For remote instances of NGINX Unit, the control socket on the remote host can
+For remote instances of FreeUnit, the control socket on the remote host can
 be set with the `$UNIT_CTRL` environment variable. The remote control socket
 can be accessed over TCP, SSH, or Docker containers on the host, depending on
 the type of control socket:
@@ -108,11 +108,11 @@ UNIT_CTRL=docker://4d0431488982 unitc /status/requests/total
 
 ## unitctl
 
-### NGINX Unit Rust SDK and unitctl CLI
+### FreeUnit Rust SDK and unitctl CLI (ex NGINX Unit)
 
 This project provides a Rust SDK interface to the
-[NGINX UNIT](https://unit.nginx.org/)
-[control API](https://unit.nginx.org/howto/source/#source-startup)
+[FreeUnit](https://github.com/freeunitorg/freeunit)
+control API
 and a CLI (`unitctl`) that exposes the functionality provided by the SDK.
 
 ---

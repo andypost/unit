@@ -1,19 +1,19 @@
-Welcome to NGINX Unit
-=====================
+Welcome to FreeUnit
+===================
 
-Congratulations! NGINX Unit is installed and running.
+Congratulations! FreeUnit is installed and running.
 
 Useful Links
 ------------
 
- * https://unit.nginx.org/
-   - Get started with the 'Configuration' docs, starting with the 'Quick Start' guide.
+ * https://github.com/freeunitorg/freeunit
+   - Browse the source, open issues, and contribute to FreeUnit.
 
- * https://unit.nginx.org/howto/docker/
-   - Guidance for running Unit in a container and tips for containerized applications.
+ * https://github.com/freeunitorg/freeunit/discussions
+   - Ask questions and get help from the community.
 
- * https://github.com/nginx/unit
-   - See our GitHub repo to browse the code, contribute, or seek help from the community.
+ * https://freeunit.org
+   - FreeUnit project website.
 
 Current Configuration
 ---------------------
@@ -26,4 +26,4 @@ docker exec -ti <containerID> curl --unix-socket /var/run/control.unit.sock http
 ```
 
 ---
-NGINX Unit - the universal web app server
+FreeUnit - the universal web app server

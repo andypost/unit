@@ -1,7 +1,7 @@
 openapi: 3.0.0
 info:
-  title: "NGINX Unit 1.35.0"
-  description: "NGINX Unit is a lightweight and versatile application runtime
+  title: "FreeUnit 1.35.2 (ex NGINX Unit)"
+  description: "FreeUnit (ex NGINX Unit) is a lightweight and versatile application runtime
     that provides the essential components for your web application as a
     single open-source server: running application code, serving static assets,
     handling TLS and request routing.
@@ -25,13 +25,12 @@ info:
 
     \n\n**Note**: By default, Unit is configured through a UNIX domain
     socket. To use this specification with OpenAPI tools interactively,
-    [start](https://unit.nginx.org/howto/source/#source-startup) Unit
-    with a TCP port as the control socket."
+    start Unit with a TCP port as the control socket."
 
   contact:
-    name: "Unit project"
-    email: "unit-owner@nginx.org"
-    url: "https://unit.nginx.org/"
+    name: "FreeUnit project"
+    email: "team@freeunit.org"
+    url: "https://github.com/freeunitorg/freeunit"
 
   license:
     name: "Apache 2.0"
@@ -7799,4 +7798,4 @@ tags:
 
 externalDocs:
   description: "Find us on GitHub"
-  url: "https://github.com/nginx/unit"
+  url: "https://github.com/freeunitorg/freeunit"

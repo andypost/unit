@@ -1,7 +1,7 @@
 {
     "name": "unit-http",
     "version": "%%VERSION%%",
-    "description": "HTTP module for NGINX Unit",
+    "description": "HTTP module for FreeUnit (ex NGINX Unit)",
     "main": "http.js",
     "scripts": {
         "clean": "node-gyp clean",

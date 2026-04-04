@@ -1,8 +1,8 @@
-# NGINX Unit Rust SDK and CLI
+# FreeUnit Rust SDK and CLI (ex NGINX Unit)
 
 This project provides a Rust SDK interface to the
-[NGINX Unit](https://unit.nginx.org/)
-[control API](https://unit.nginx.org/howto/source/#source-startup)
+[FreeUnit](https://github.com/freeunitorg/freeunit)
+control API
 and a CLI (`unitctl`) that exposes the functionality provided by the SDK.
 
 ## Installation and Use
@@ -52,7 +52,7 @@ desired.
 ## Features (Current)
 
 ```
-CLI interface to the NGINX Unit Control API
+CLI interface to the FreeUnit Control API
 
 Usage: unitctl [OPTIONS] <COMMAND>
 
@@ -198,7 +198,7 @@ To do this, pass multiple values for the `-s` flag as shown below:
 $ unitctl -s '127.0.0.1:8001' -s /run/nginx-unit.control.sock listeners
 ```
 
-### Get the current status of NGINX Unit processes
+### Get the current status of FreeUnit processes
 Unitctl can query the control API to provide the status of the running
 Unit daemon.
 

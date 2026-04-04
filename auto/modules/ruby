@@ -72,6 +72,11 @@ if /bin/sh -c "$NXT_RUBY -v" >> $NXT_AUTOCONF_ERR 2>&1; then
     NXT_RUBY_LIBSCONF=`$NXT_RUBY -rrbconfig -e 'print RbConfig::CONFIG["LIBS"]'`
     NXT_RUBY_LIBPATH=`$NXT_RUBY -rrbconfig -e 'print RbConfig::CONFIG["libdir"]'`
     NXT_RUBY_LIBS="-l$NXT_RUBY_LIBNAME $NXT_RUBY_LIBSCONF"
+    # TODO: on Debian/Ubuntu with multiarch, RbConfig["libdir"] returns
+    # /usr/lib but the actual libruby-X.Y.so lives in /usr/lib/<triplet>/.
+    # The two-pass check below therefore misses it.  A proper fix would probe
+    # the multiarch libdir via `dpkg-architecture -q DEB_HOST_MULTIARCH` when
+    # available and add it as a third fallback before giving up.
 
     if [ $NXT_CC_NAME = clang ]; then
         # Workaround Clang bug

@@ -32,19 +32,32 @@ jobs:
           apt-get -y install git wget curl llvm-dev libclang-dev clang make \
                              libssl-dev libpcre2-dev libperl-dev \
                              libphp-embed php-dev python3-dev libpython3-dev \
-                             ruby-dev openjdk-21-jdk npm
+                             ruby-dev openjdk-21-jdk npm dpkg-dev
           npm install -g node-gyp
+          # Debian multiarch: RbConfig["libdir"] returns /usr/lib but the
+          # actual libruby-X.Y.so is in /usr/lib/<triplet>/.  auto/modules/ruby
+          # checks -L$(RbConfig["libdir"]) which misses the multiarch path.
+          # TODO: fix auto/modules/ruby to probe the multiarch libdir via
+          #   dpkg-architecture -q DEB_HOST_MULTIARCH
+          # and fall back to it when the standard libdir check fails.
+          # Workaround: create a symlink so -L/usr/lib finds the library.
+          MULTIARCH=$(dpkg-architecture -q DEB_HOST_MULTIARCH)
+          for f in /usr/lib/$MULTIARCH/libruby-*.so; do
+            [ -f "$f" ] && ln -sf "$f" /usr/lib/$(basename "$f") || true
+          done
 
       - uses: actions/checkout@v5
 
-      - name: Checkout and build clang-ast
-        run: |
-          git clone https://github.com/nginx/clang-ast.git -b unit
-          cd clang-ast
-          make
+      - name: Build clang-ast plugin
+        run: make -C clang-ast
 
       - name: Configure Unit
-        run: ./configure --cc=clang --cc-opt="-Xclang -load -Xclang clang-ast/ngx-ast.so -Xclang -add-plugin -Xclang ngx-ast" --openssl --debug --tests
+        # -Wno-default-const-init-field-unsafe: clang 21 emits this on Ruby 3.3
+        # headers (rstring.h struct RString has a const member).  Suppressed
+        # globally because (a) it is a C++ idiom that cannot fire in our pure-C
+        # source and (b) it also affects the autoconf feature-test compilation
+        # for the Ruby module.
+        run: ./configure --cc=clang --cc-opt="-Xclang -load -Xclang clang-ast/ngx-ast.so -Xclang -add-plugin -Xclang ngx-ast -Wno-default-const-init-field-unsafe" --openssl --debug --tests
 
       - name: Build Unit
         run: make -j4 unitd

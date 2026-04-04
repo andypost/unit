@@ -198,8 +198,8 @@ jobs:
 
             ## Unit
 
-            For the current release of the NGINX Unit application server check the
-            [Unit Installation Guide](https://unit.nginx.org/installation/) and the
-            [Unit Quickstart Guide](https://github.com/nginx/unit/).
+            For the current release of the FreeUnit application server (ex NGINX Unit) check the
+            [FreeUnit repository](https://github.com/freeunitorg/freeunit) and the
+            [FreeUnit releases](https://github.com/freeunitorg/freeunit/releases).
 
           allowUpdates: true

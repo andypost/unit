@@ -1,5 +1,5 @@
-This document describes the release process for NGINX Unit and as such is
-likely only of interest to NGINX Unit maintainers.
+This document describes the release process for FreeUnit (ex NGINX Unit) and as such is
+likely only of interest to FreeUnit maintainers.
 
 # Create a preparatory branch
 
@@ -62,7 +62,7 @@ is tagged.
 Once the above has been merged you can tag it with the new version. For
 this we create an annotated tag. E.g. On master
 
-    $ git tag -a -m "Unit 1.33.0 release." 1.33.0
+    $ git tag -a -m "FreeUnit 1.33.0 release." 1.33.0
 
 This should create a new tag object pointing to the "CHANGES" commit.
 
@@ -74,7 +74,7 @@ The tag can be pushed just as the branch is. E.g.
 # A new 'Release'
 
 After a while the new release should show up at
-<https://github.com/nginx/unit/releases>
+<https://github.com/freeunitorg/freeunit/releases>
 
 
 # Tarball
@@ -83,7 +83,7 @@ We need to publish an archive of the source and a checksum.
 
     $ cd pkg
     $ make dist
-    $ rsync -tv unit-X.Y.Z.tar.* dev:/data/www/unit.nginx.org/download/
+    $ rsync -tv unit-X.Y.Z.tar.* dev:/data/www/freeunit.org/download/
 
 
 # Docs

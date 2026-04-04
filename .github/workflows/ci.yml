@@ -119,6 +119,37 @@ jobs:
       - name: Install packages
         run: sudo apt-get -y install libbrotli-dev
 
+      - name: Cache OpenSSL 3.6
+        id: cache-openssl36
+        uses: actions/cache@v4
+        with:
+          path: /opt/openssl-3.6
+          key: openssl-3.6.0-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build OpenSSL 3.6
+        if: steps.cache-openssl36.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get -y install build-essential
+          cd /tmp
+          wget -q https://www.openssl.org/source/openssl-3.6.0.tar.gz
+          tar -xzf openssl-3.6.0.tar.gz
+          cd openssl-3.6.0
+          ./Configure --prefix=/opt/openssl-3.6 shared no-docs
+          make -j$(nproc)
+          sudo mkdir -p /opt/openssl-3.6
+          sudo make install_sw
+
+      - name: Set OpenSSL 3.6 build environment
+        # Keep OpenSSL 3.6 isolated in /opt/openssl-3.6.
+        # Mixing libssl.so.3 (3.3) with libcrypto.so.3 (3.6) breaks sudo,
+        # so we never overwrite system libraries.
+        # Export the two helper variables used in later steps.
+        run: |
+          OSSL=/opt/openssl-3.6
+          LIBDIR=$( [ -d "$OSSL/lib64" ] && echo "$OSSL/lib64" || echo "$OSSL/lib" )
+          echo "OPENSSL36_INCDIR=${OSSL}/include" >> $GITHUB_ENV
+          echo "OPENSSL36_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
+
       ##
       ## njs
       ##
@@ -141,6 +172,13 @@ jobs:
       ##
 
       - name: Configure unit
+        # LD_LIBRARY_PATH is set only for this step so that auto/feature
+        # test binaries load OpenSSL 3.6 at runtime.  It is NOT exported
+        # globally — doing so would break sudo (sudoers.so links against
+        # system libssl 3.3 which requires OPENSSL_3.3.0 from libcrypto,
+        # a symbol version that 3.6 does not export in the same slot).
+        env:
+          LD_LIBRARY_PATH: ${{ env.OPENSSL36_LIBDIR }}
         run: |
           ./configure \
             --tests \
@@ -150,8 +188,8 @@ jobs:
             --zstd \
             --brotli \
             --otel \
-            --cc-opt="-I njs/src/ -I njs/build"  \
-            --ld-opt="-L njs/build"
+            --cc-opt="-I${OPENSSL36_INCDIR} -I njs/src/ -I njs/build" \
+            --ld-opt="-L${OPENSSL36_LIBDIR} -Wl,-rpath,${OPENSSL36_LIBDIR} -L njs/build"
 
       - name: Make unit
         run: |

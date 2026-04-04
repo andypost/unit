@@ -12,7 +12,7 @@ RUN set -ex \
     && savedAptMark="$(apt-mark showmanual)" \
     && apt-get update \
     && apt-get install --no-install-recommends --no-install-suggests -y \
-         ca-certificates git build-essential libssl-dev libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev curl pkg-config pkgconf libclang-dev cmake \
+         ca-certificates git build-essential libssl-dev openssl libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev curl wget pkg-config pkgconf libclang-dev cmake \
     && export RUST_VERSION=1.89.0 \
     && export RUSTUP_HOME=/usr/src/unit/rustup \
     && export CARGO_HOME=/usr/src/unit/cargo \
@@ -80,7 +80,7 @@ RUN set -ex \
     && cd \
     && rm -rf /usr/src/unit \
     && for f in /usr/sbin/unitd /usr/lib/unit/modules/*.unit.so; do \
-        ldd $f | awk '/=>/{print $(NF-1)}' | while read n; do dpkg-query -S $n; done | sed 's/^\([^:]\+\):.*$/\1/' | sort | uniq >> /requirements.apt; \
+        ldd $f | awk '/=>/{print $(NF-1)}' | while read n; do dpkg-query -S $(realpath $n 2>/dev/null || echo $n) 2>/dev/null; done | grep -v '^diversion' | sed 's/^\([^:]\+\):.*$/\1/' | sort | uniq >> /requirements.apt; \
        done \
     && apt-mark showmanual | xargs apt-mark auto > /dev/null \
     && { [ -z "$savedAptMark" ] || apt-mark manual $savedAptMark; } \

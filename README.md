@@ -1,5 +1,10 @@
 # FreeUnit — Community LTS fork of Unit
 
+[![Project Status: Active – The project has reached a stable, usable state and is being actively developed.](https://www.repostatus.org/badges/latest/active.svg)](https://www.repostatus.org/#active)
+[![CI](https://github.com/freeunitorg/freeunit/actions/workflows/ci.yml/badge.svg)](https://github.com/freeunitorg/freeunit/actions/workflows/ci.yml "GitHub workflow CI")
+[![Docker](https://github.com/freeunitorg/freeunit/actions/workflows/docker.yml/badge.svg)](https://github.com/freeunitorg/freeunit/actions/workflows/docker.yml "Docker build")
+[![GitHub Discussions](https://img.shields.io/badge/GitHub-discussions-009639)](https://github.com/freeunitorg/freeunit/discussions "GitHub Discussions")
+
 **Free as in freedom.**
 
 Unit application server, continued by the community.
@@ -42,14 +47,34 @@ the most out of today's computing platforms.
 
 ### Docker
 
+Images are published to the GitHub Container Registry (GHCR) on every release
+and are available for `linux/amd64` and `linux/arm64`.
+
+| Variant | Image |
+|---------|-------|
+| minimal | `ghcr.io/freeunitorg/freeunit:latest-minimal` |
+| PHP 8.5 | `ghcr.io/freeunitorg/freeunit:latest-php8.5` |
+| PHP 8.4 | `ghcr.io/freeunitorg/freeunit:latest-php8.4` |
+| PHP 8.3 | `ghcr.io/freeunitorg/freeunit:latest-php8.3` |
+| Python 3.13 | `ghcr.io/freeunitorg/freeunit:latest-python3.13` |
+| Python 3.12 | `ghcr.io/freeunitorg/freeunit:latest-python3.12` |
+| Node.js 22 | `ghcr.io/freeunitorg/freeunit:latest-node22` |
+| Go 1.25 | `ghcr.io/freeunitorg/freeunit:latest-go1.25` |
+| Ruby 3.4 | `ghcr.io/freeunitorg/freeunit:latest-ruby3.4` |
+| WebAssembly | `ghcr.io/freeunitorg/freeunit:latest-wasm` |
+
+Full list of variants (including `python3.14`, `perl5.40`, `ruby3.3`, slim
+Python variants, etc.) is in the
+[docker workflow](.github/workflows/docker.yml).
+
 ```console
-$ docker pull freeunitorg/freeunit:latest
+$ docker pull ghcr.io/freeunitorg/freeunit:latest-minimal
 $ mkdir /tmp/unit-control
 $ docker run -d \
       --mount type=bind,src=/tmp/unit-control,dst=/var/run \
       --mount type=bind,src=.,dst=/www \
       --network host \
-      freeunitorg/freeunit
+      ghcr.io/freeunitorg/freeunit:latest-minimal
 ```
 
 ### Build from Source
@@ -103,8 +128,8 @@ Hello, PHP on FreeUnit!
 FreeUnit provides first-class PHP 8.4 and PHP 8.5 support — the primary motivation for this fork.
 
 ```console
-$ docker pull freeunitorg/freeunit:php8.5
-$ docker pull freeunitorg/freeunit:php8.4
+$ docker pull ghcr.io/freeunitorg/freeunit:latest-php8.5
+$ docker pull ghcr.io/freeunitorg/freeunit:latest-php8.4
 ```
 
 ## OpenTelemetry

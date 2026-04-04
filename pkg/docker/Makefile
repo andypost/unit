@@ -60,7 +60,7 @@ INSTALL_php ?=		php-install
 RUN_php ?=			ldconfig
 MODULE_PREBUILD_php ?= /bin/true
 
-VERSIONS_python ?=  3.12 3.13
+VERSIONS_python ?=  3.12 3.13 3.14
 VARIANT_python ?=	$(VARIANT)
 $(foreach pythonversion, $(VERSIONS_python), $(eval CONTAINER_python$(pythonversion) = python:$(pythonversion)-$(VARIANT_python)))
 $(foreach pythonversion, $(VERSIONS_python), $(eval CONTAINER_python$(pythonversion)-slim = python:$(pythonversion)-slim-$(VARIANT_python)))

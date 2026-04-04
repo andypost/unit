@@ -1,0 +1,165 @@
+# .github/workflows/docker.yml
+#
+# Builds multi-arch Docker images (amd64 + arm64) and pushes to GHCR.
+# Triggered on release tags (v*) or manually via workflow_dispatch.
+#
+# Language version support policy:
+#   Each image is supported for 1 year after the language/runtime EOL.
+#   EOL dates: https://endoflife.date
+#   To drop a variant: remove its entry from matrix.include and note it in CHANGES.
+#
+# EOL status (as of April 2026):
+#   go1.24      EOL ~Feb 2026  -> supported until Feb 2027
+#   go1.25      EOL ~Aug 2026  -> supported until Aug 2027
+#   jsc11       EOL Oct 2024   -> supported until Oct 2025  WARNING: drop soon
+#   node20      EOL Apr 2026   -> supported until Apr 2027
+#   node22      EOL Apr 2027   -> supported until Apr 2028
+#   perl5.38    EOL ~Jun 2025  -> supported until Jun 2026
+#   perl5.40    EOL ~Jun 2026  -> supported until Jun 2027
+#   php8.3      EOL Nov 2026   -> supported until Nov 2027
+#   php8.4      EOL Nov 2027   -> supported until Nov 2028
+#   php8.5      EOL Nov 2028   -> supported until Nov 2029
+#   python3.12  EOL Oct 2028   -> supported until Oct 2029
+#   python3.13  EOL Oct 2029   -> supported until Oct 2030
+#   python3.14  EOL Oct 2030   -> supported until Oct 2031
+#   ruby3.3     EOL Mar 2027   -> supported until Mar 2028
+#   ruby3.4     EOL Mar 2028   -> supported until Mar 2029
+#   wasm        no EOL
+#   minimal     no EOL
+
+name: Build and Push Docker Images
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. 1.35.0)'
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: freeunitorg/freeunit
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # -- minimal -------------------------------------------------------
+          - variant: minimal
+            dockerfile: pkg/docker/Dockerfile.minimal
+
+          # -- wasm ----------------------------------------------------------
+          - variant: wasm
+            dockerfile: pkg/docker/Dockerfile.wasm
+
+          # -- Go ------------------------------------------------------------
+          - variant: go1.24
+            dockerfile: pkg/docker/Dockerfile.go1.24
+          - variant: go1.25
+            dockerfile: pkg/docker/Dockerfile.go1.25
+
+          # -- JSC (Java / GraalVM) ------------------------------------------
+          # WARNING: jsc11 EOL Oct 2024 -> drop after Oct 2025
+          - variant: jsc11
+            dockerfile: pkg/docker/Dockerfile.jsc11
+
+          # -- Node.js -------------------------------------------------------
+          - variant: node20
+            dockerfile: pkg/docker/Dockerfile.node20
+          - variant: node22
+            dockerfile: pkg/docker/Dockerfile.node22
+
+          # -- Perl ----------------------------------------------------------
+          - variant: perl5.38
+            dockerfile: pkg/docker/Dockerfile.perl5.38
+          - variant: perl5.40
+            dockerfile: pkg/docker/Dockerfile.perl5.40
+
+          # -- PHP -----------------------------------------------------------
+          - variant: php8.3
+            dockerfile: pkg/docker/Dockerfile.php8.3
+          - variant: php8.4
+            dockerfile: pkg/docker/Dockerfile.php8.4
+          - variant: php8.5
+            dockerfile: pkg/docker/Dockerfile.php8.5
+
+          # -- Python --------------------------------------------------------
+          - variant: python3.12
+            dockerfile: pkg/docker/Dockerfile.python3.12
+          - variant: python3.12-slim
+            dockerfile: pkg/docker/Dockerfile.python3.12-slim
+          - variant: python3.13
+            dockerfile: pkg/docker/Dockerfile.python3.13
+          - variant: python3.13-slim
+            dockerfile: pkg/docker/Dockerfile.python3.13-slim
+          - variant: python3.14
+            dockerfile: pkg/docker/Dockerfile.python3.14
+          - variant: python3.14-slim
+            dockerfile: pkg/docker/Dockerfile.python3.14-slim
+
+          # -- Ruby ----------------------------------------------------------
+          - variant: ruby3.3
+            dockerfile: pkg/docker/Dockerfile.ruby3.3
+          - variant: ruby3.4
+            dockerfile: pkg/docker/Dockerfile.ruby3.4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Pin version in Dockerfile
+        # The committed Dockerfiles have the version hardcoded (e.g. 1.35.0).
+        # Replace it with the version being released so git clone fetches the
+        # correct tag.
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          sed -i \
+            -e "s|-b [0-9][0-9.]*\( https://github.com/freeunitorg/freeunit\)|-b ${VERSION}\1|" \
+            -e "s|image.version=\"[^\"]*\"|image.version=\"${VERSION}\"|" \
+            ${{ matrix.dockerfile }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: pkg/docker
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.variant }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-${{ matrix.variant }}
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}

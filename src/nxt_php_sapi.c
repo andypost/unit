@@ -816,6 +816,9 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
 }
 
 
+static u_char  nxt_php_index_default[] = "index.php";
+
+
 static nxt_int_t
 nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     nxt_conf_value_t *conf)
@@ -994,7 +997,8 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
             target->index.start = tmp;
 
         } else {
-            nxt_str_set(&target->index, "index.php");
+            target->index.start = nxt_php_index_default;
+            target->index.length = sizeof("index.php") - 1;
         }
     }
 
@@ -1029,9 +1033,9 @@ nxt_php_cleanup_targets(void)
             nxt_free(target->script_dirname.start);
         }
 
-        /* Free index if it's not the default "index.php" constant */
+        /* Free index if it was heap-allocated (not the static default) */
         if (target->index.start != NULL &&
-            target->index.start != (u_char *)"index.php") {
+            target->index.start != nxt_php_index_default) {
             nxt_free(target->index.start);
         }
     }
@@ -2622,7 +2626,7 @@ nxt_php_scope_populate_superglobals(zend_async_scope_t *scope)
             const char *content_type = nxt_unit_sptr_get(&f->value);
 
             /* Only parse if it's form-urlencoded (simple POST data) */
-            if (content_type && 
+            if (content_type &&
                 strncasecmp(content_type, "application/x-www-form-urlencoded", 33) == 0)
             {
                 /* Read POST body into memory */

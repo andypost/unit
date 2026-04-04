@@ -147,6 +147,7 @@ Before the OpenSSL 3.6 migration can be considered fully validated:
 
 ---
 
+
 ## PHP 8.5 Compatibility
 
 ### `disable_classes` removed (PHP 8.5)

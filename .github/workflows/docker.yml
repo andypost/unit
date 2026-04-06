@@ -11,7 +11,8 @@
 # EOL status (as of April 2026):
 #   go1.24      EOL ~Feb 2026  -> supported until Feb 2027
 #   go1.25      EOL ~Aug 2026  -> supported until Aug 2027
-#   jsc11       EOL Oct 2024   -> supported until Oct 2025  WARNING: drop soon
+#   jsc17       EOL Sep 2029   -> supported until Sep 2030
+#   jsc21       EOL Sep 2031   -> supported until Sep 2032
 #   node20      EOL Apr 2026   -> supported until Apr 2027
 #   node22      EOL Apr 2027   -> supported until Apr 2028
 #   perl5.38    EOL ~Jun 2025  -> supported until Jun 2026
@@ -26,6 +27,11 @@
 #   ruby3.4     EOL Mar 2028   -> supported until Mar 2029
 #   wasm        no EOL
 #   minimal     no EOL
+#
+# Rust toolchain (build-time dependency, embedded in every image):
+#   Rust has a rolling-stable release model; each minor is superseded in ~6 weeks.
+#   Policy: keep RUST_VERSION at current stable; update on every FreeUnit release.
+#   rust1.94.1  current stable (released 2026-03-26); update when 1.95 ships
 
 name: Build and Push Docker Images
 
@@ -69,9 +75,10 @@ jobs:
             dockerfile: pkg/docker/Dockerfile.go1.25
 
           # -- JSC (Java / GraalVM) ------------------------------------------
-          # WARNING: jsc11 EOL Oct 2024 -> drop after Oct 2025
-          - variant: jsc11
-            dockerfile: pkg/docker/Dockerfile.jsc11
+          - variant: jsc17
+            dockerfile: pkg/docker/Dockerfile.jsc17
+          - variant: jsc21
+            dockerfile: pkg/docker/Dockerfile.jsc21
 
           # -- Node.js -------------------------------------------------------
           - variant: node20

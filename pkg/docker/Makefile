@@ -28,8 +28,8 @@ INSTALL_go ?=		go-install-src libunit-install
 RUN_go ?=			/bin/true
 MODULE_PREBUILD_go ?= /bin/true
 
-VERSIONS_jsc ?=		11
-VARIANT_jsc ?=		jammy
+VERSIONS_jsc ?=		17 21
+VARIANT_jsc ?=		noble
 $(foreach jscversion, $(VERSIONS_jsc), $(eval CONTAINER_jsc$(jscversion) = eclipse-temurin:$(jscversion)-jdk-$(VARIANT_jsc)))
 CONFIGURE_jsc ?=	java --jars=/usr/share/unit-jsc-common/
 INSTALL_jsc ?=		java-shared-install java-install

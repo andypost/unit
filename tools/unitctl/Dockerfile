@@ -1,14 +1,13 @@
-FROM rust:slim-bullseye
+FROM rust:slim-trixie
 
-ADD https://unit.nginx.org/keys/nginx-keyring.gpg \
-    /usr/share/keyrings/nginx-keyring.gpg
+ADD https://raw.githubusercontent.com/freeunitorg/freeunit/main/keys/freeunit-keyring.gpg \
+    /usr/share/keyrings/freeunit-keyring.gpg
 
-RUN set -eux \
+RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
-    echo 'fc27fd284cceb4bf6c8ac2118dbb5e834590836f8d6ba3944da0e0451cbadeca  /usr/share/keyrings/nginx-keyring.gpg' |\
+    echo '5ac2cc2c7e1db042dfc173022de4f5e71114e2e5c7ed7af816b24cbfb687f618  /usr/share/keyrings/freeunit-keyring.gpg' | \
     sha256sum --check -; \
-    chmod 0644 /usr/share/keyrings/nginx-keyring.gpg; \
-    echo "deb [signed-by=/usr/share/keyrings/nginx-keyring.gpg] https://packages.nginx.org/unit/debian/ bullseye unit" > /etc/apt/sources.list.d/unit.list; \
+    chmod 0644 /usr/share/keyrings/freeunit-keyring.gpg; \
     apt-get -qq update; \
     apt-get -qq upgrade --yes; \
     apt-get -qq install --yes --no-install-recommends --no-install-suggests \
@@ -26,7 +25,6 @@ RUN set -eux \
         dpkg-dev \
         musl-dev \
         musl-tools \
-        unit \
         gcc-aarch64-linux-gnu \
         libc6-dev-arm64-cross \
         gcc-x86-64-linux-gnu \

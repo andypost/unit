@@ -10,7 +10,7 @@ PREFIX := $(abspath $(PREFIX))
 PKGS_ALL := $(patsubst $(SRC)/%/Makefile,%,$(wildcard $(SRC)/*/Makefile))
 
 # Common download locations
-CONTRIB_NGINX := https://packages.nginx.org/contrib
+CONTRIB_FREEUNIT := https://packages.freeunit.org
 
 #
 # Tools
@@ -41,8 +41,8 @@ else
 download = $(error Neither curl nor wget found)
 endif
 
-download_pkg = $(call download,$(CONTRIB_NGINX)/$(2)/$(lastword $(subst /, ,$(@)))) || \
-	( $(call download,$(1)) && echo "Please upload $(lastword $(subst /, ,$(@))) to $(CONTRIB_NGINX)" )
+download_pkg = $(call download,$(CONTRIB_FREEUNIT)/$(2)/$(lastword $(subst /, ,$(@)))) || \
+	( $(call download,$(1)) && echo "Please upload $(lastword $(subst /, ,$(@))) to $(CONTRIB_FREEUNIT)" )
 
 ifeq ($(shell which xz >/dev/null 2>&1 || echo FAIL),)
 XZ = xz

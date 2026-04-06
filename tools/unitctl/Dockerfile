@@ -1,6 +1,6 @@
 FROM rust:slim-trixie
 
-ADD https://raw.githubusercontent.com/freeunitorg/freeunit/main/keys/freeunit-keyring.gpg \
+ADD https://freeunit.org/media/keys/6C68B7AA.asc \
     /usr/share/keyrings/freeunit-keyring.gpg
 
 RUN set -eux; \

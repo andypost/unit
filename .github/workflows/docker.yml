@@ -11,7 +11,8 @@
 # EOL status (as of April 2026):
 #   go1.24      EOL ~Feb 2026  -> supported until Feb 2027
 #   go1.25      EOL ~Aug 2026  -> supported until Aug 2027
-#   jsc11       EOL Oct 2024   -> supported until Oct 2025  WARNING: drop soon
+#   jsc17       EOL Sep 2029 (OpenJDK 17 LTS, Eclipse Temurin) -> supported until Sep 2030
+#   jsc21       EOL Sep 2031 (OpenJDK 21 LTS, Eclipse Temurin) -> supported until Sep 2032
 #   node20      EOL Apr 2026   -> supported until Apr 2027
 #   node22      EOL Apr 2027   -> supported until Apr 2028
 #   perl5.38    EOL ~Jun 2025  -> supported until Jun 2026
@@ -44,7 +45,7 @@ env:
   IMAGE_NAME: freeunitorg/freeunit
 
 jobs:
-  build:
+  build-amd64:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -68,10 +69,15 @@ jobs:
           - variant: go1.25
             dockerfile: pkg/docker/Dockerfile.go1.25
 
-          # -- JSC (Java / GraalVM) ------------------------------------------
-          # WARNING: jsc11 EOL Oct 2024 -> drop after Oct 2025
-          - variant: jsc11
-            dockerfile: pkg/docker/Dockerfile.jsc11
+          # -- JSC (Java Servlet Container / OpenJDK) --------------------------------
+          #   Java support for .war/.jsp applications via Eclipse Temurin (OpenJDK)
+          #   Base image: eclipse-temurin:17-jdk-noble (Ubuntu 24.04, GPL v2)
+          - variant: jsc17
+            dockerfile: pkg/docker/Dockerfile.jsc17
+
+          #   Base image: eclipse-temurin:21-jdk-noble (Ubuntu 24.04, GPL v2)
+          - variant: jsc21
+            dockerfile: pkg/docker/Dockerfile.jsc21
 
           # -- Node.js -------------------------------------------------------
           - variant: node20
@@ -128,9 +134,6 @@ jobs:
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Pin version in Dockerfile
-        # The committed Dockerfiles have the version hardcoded (e.g. 1.35.0).
-        # Replace it with the version being released so git clone fetches the
-        # correct tag.
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
           sed -i \
@@ -145,30 +148,205 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push
+      - name: Build and push (AMD64)
         uses: docker/build-push-action@v6
         with:
           context: pkg/docker
           file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.variant }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-${{ matrix.variant }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.variant }}-amd64
           labels: |
             org.opencontainers.image.source=https://github.com/freeunitorg/freeunit
-          annotations: |
-            index:org.opencontainers.image.description=FreeUnit ${{ steps.version.outputs.VERSION }} (${{ matrix.variant }}) — community LTS fork of the NGINX Unit application server
-            index:org.opencontainers.image.title=FreeUnit (${{ matrix.variant }})
-            index:org.opencontainers.image.url=https://freeunit.org
-            index:org.opencontainers.image.source=https://github.com/freeunitorg/freeunit
-            index:org.opencontainers.image.vendor=FreeUnit Community
-            index:org.opencontainers.image.version=${{ steps.version.outputs.VERSION }}
-          cache-from: type=gha,scope=${{ matrix.variant }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
+          cache-from: type=gha,scope=amd64-${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=amd64-${{ matrix.variant }}
+
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # -- minimal -------------------------------------------------------
+          - variant: minimal
+            dockerfile: pkg/docker/Dockerfile.minimal
+
+          # -- wasm ----------------------------------------------------------
+          - variant: wasm
+            dockerfile: pkg/docker/Dockerfile.wasm
+
+          # -- Go ------------------------------------------------------------
+          - variant: go1.24
+            dockerfile: pkg/docker/Dockerfile.go1.24
+          - variant: go1.25
+            dockerfile: pkg/docker/Dockerfile.go1.25
+
+          # -- JSC (Java / GraalVM) ------------------------------------------
+          - variant: jsc17
+            dockerfile: pkg/docker/Dockerfile.jsc17
+          - variant: jsc21
+            dockerfile: pkg/docker/Dockerfile.jsc21
+
+          # -- Node.js -------------------------------------------------------
+          - variant: node20
+            dockerfile: pkg/docker/Dockerfile.node20
+          - variant: node22
+            dockerfile: pkg/docker/Dockerfile.node22
+
+          # -- Perl ----------------------------------------------------------
+          - variant: perl5.38
+            dockerfile: pkg/docker/Dockerfile.perl5.38
+          - variant: perl5.40
+            dockerfile: pkg/docker/Dockerfile.perl5.40
+
+          # -- PHP -----------------------------------------------------------
+          - variant: php8.3
+            dockerfile: pkg/docker/Dockerfile.php8.3
+          - variant: php8.4
+            dockerfile: pkg/docker/Dockerfile.php8.4
+          - variant: php8.5
+            dockerfile: pkg/docker/Dockerfile.php8.5
+
+          # -- Python --------------------------------------------------------
+          - variant: python3.12
+            dockerfile: pkg/docker/Dockerfile.python3.12
+          - variant: python3.12-slim
+            dockerfile: pkg/docker/Dockerfile.python3.12-slim
+          - variant: python3.13
+            dockerfile: pkg/docker/Dockerfile.python3.13
+          - variant: python3.13-slim
+            dockerfile: pkg/docker/Dockerfile.python3.13-slim
+          - variant: python3.14
+            dockerfile: pkg/docker/Dockerfile.python3.14
+          - variant: python3.14-slim
+            dockerfile: pkg/docker/Dockerfile.python3.14-slim
+
+          # -- Ruby ----------------------------------------------------------
+          - variant: ruby3.3
+            dockerfile: pkg/docker/Dockerfile.ruby3.3
+          - variant: ruby3.4
+            dockerfile: pkg/docker/Dockerfile.ruby3.4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Pin version in Dockerfile
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          sed -i \
+            -e "s|-b [0-9][0-9.]*\( https://github.com/freeunitorg/freeunit\)|-b ${VERSION}\1|" \
+            -e "s|image.version=\"[^\"]*\"|image.version=\"${VERSION}\"|" \
+            ${{ matrix.dockerfile }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (ARM64)
+        uses: docker/build-push-action@v6
+        with:
+          context: pkg/docker
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.variant }}-arm64
+          labels: |
+            org.opencontainers.image.source=https://github.com/freeunitorg/freeunit
+          cache-from: type=gha,scope=arm64-${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=arm64-${{ matrix.variant }}
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: [build-amd64, build-arm64]
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: minimal
+          - variant: wasm
+          - variant: go1.24
+          - variant: go1.25
+          # -- JSC (Java / GraalVM) ------------------------------------------
+          - variant: jsc17
+          - variant: jsc21
+          - variant: node20
+          - variant: node22
+          - variant: perl5.38
+          - variant: perl5.40
+          - variant: php8.3
+          - variant: php8.4
+          - variant: php8.5
+          - variant: python3.12
+          - variant: python3.12-slim
+          - variant: python3.13
+          - variant: python3.13-slim
+          - variant: python3.14
+          - variant: python3.14-slim
+          - variant: ruby3.3
+          - variant: ruby3.4
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Create and push multi-arch manifest
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          VARIANT="${{ matrix.variant }}"
+          REPO="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          docker buildx imagetools create \
+            --tag ${REPO}:${VERSION}-${VARIANT} \
+            --tag ${REPO}:latest-${VARIANT} \
+            --annotation "index:org.opencontainers.image.description=FreeUnit ${VERSION} (${VARIANT}) — community LTS fork of the NGINX Unit application server" \
+            --annotation "index:org.opencontainers.image.title=FreeUnit (${VARIANT})" \
+            --annotation "index:org.opencontainers.image.url=https://freeunit.org" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/freeunitorg/freeunit" \
+            --annotation "index:org.opencontainers.image.vendor=FreeUnit Community" \
+            --annotation "index:org.opencontainers.image.version=${VERSION}" \
+            ${REPO}:${VERSION}-${VARIANT}-amd64 \
+            ${REPO}:${VERSION}-${VARIANT}-arm64
+          docker buildx imagetools inspect ${REPO}:${VERSION}-${VARIANT}

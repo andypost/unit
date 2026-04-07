@@ -1,6 +1,6 @@
-FROM debian:trixie-slim
+FROM eclipse-temurin:17-jdk-noble
 
-LABEL org.opencontainers.image.title="FreeUnit (wasm)"
+LABEL org.opencontainers.image.title="FreeUnit (jsc17)"
 LABEL org.opencontainers.image.description="Community build of FreeUnit for Docker."
 LABEL org.opencontainers.image.url="https://freeunit.org"
 LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
@@ -69,15 +69,14 @@ RUN set -ex \
     && make -j $NCPU unitd \
     && install -pm755 build/sbin/unitd /usr/sbin/unitd \
     && make clean \
-    && make -C pkg/contrib .wasmtime \
-    && install -pm 755 pkg/contrib/wasmtime/artifacts/lib/libwasmtime.so /usr/lib/$(dpkg-architecture -q DEB_HOST_MULTIARCH)/ \
+    && /bin/true \
     && ./configure $CONFIGURE_ARGS_MODULES --cc-opt="$CC_OPT" --modulesdir=/usr/lib/unit/debug-modules --debug \
-    && ./configure wasm --include-path=`pwd`/pkg/contrib/wasmtime/artifacts/include --lib-path=/usr/lib/$(dpkg-architecture -q DEB_HOST_MULTIARCH)/ && ./configure wasm-wasi-component \
-    && make -j $NCPU wasm-install wasm-wasi-component-install \
+    && ./configure java --jars=/usr/share/unit-jsc-common/ \
+    && make -j $NCPU java-shared-install java-install \
     && make clean \
     && ./configure $CONFIGURE_ARGS_MODULES --cc-opt="$CC_OPT" --modulesdir=/usr/lib/unit/modules \
-    && ./configure wasm --include-path=`pwd`/pkg/contrib/wasmtime/artifacts/include --lib-path=/usr/lib/$(dpkg-architecture -q DEB_HOST_MULTIARCH)/ && ./configure wasm-wasi-component \
-    && make -j $NCPU wasm-install wasm-wasi-component-install \
+    && ./configure java --jars=/usr/share/unit-jsc-common/ \
+    && make -j $NCPU java-shared-install java-install \
     && cd \
     && rm -rf /usr/src/unit \
     && for f in /usr/sbin/unitd /usr/lib/unit/modules/*.unit.so; do \
@@ -85,7 +84,7 @@ RUN set -ex \
        done \
     && apt-mark showmanual | xargs apt-mark auto > /dev/null \
     && { [ -z "$savedAptMark" ] || apt-mark manual $savedAptMark; } \
-    && /bin/true \
+    && rm -rf /root/.m2 \
     && mkdir -p /var/lib/unit/ \
     && mkdir -p /docker-entrypoint.d/ \
     && groupadd --gid 999 unit \

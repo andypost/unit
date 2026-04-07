@@ -13,7 +13,7 @@ RUN set -ex \
     && apt-get update \
     && apt-get install --no-install-recommends --no-install-suggests -y \
          ca-certificates git build-essential libssl-dev openssl libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev curl wget pkg-config pkgconf libclang-dev cmake \
-    && export RUST_VERSION=1.89.0 \
+    && export RUST_VERSION=1.94.1 \
     && export RUSTUP_HOME=/usr/src/unit/rustup \
     && export CARGO_HOME=/usr/src/unit/cargo \
     && export PATH=/usr/src/unit/cargo/bin:$PATH \
@@ -39,8 +39,8 @@ RUN set -ex \
     && cd unit \
     && NCPU="$(getconf _NPROCESSORS_ONLN)" \
     && DEB_HOST_MULTIARCH="$(dpkg-architecture -q DEB_HOST_MULTIARCH)" \
-    && CC_OPT="$(DEB_BUILD_MAINT_OPTIONS="hardening=+all,-pie" DEB_CFLAGS_MAINT_APPEND="-Wp,-D_FORTIFY_SOURCE=2 -fPIC" dpkg-buildflags --get CFLAGS)" \
-    && LD_OPT="$(DEB_BUILD_MAINT_OPTIONS="hardening=+all,-pie" DEB_LDFLAGS_MAINT_APPEND="-Wl,--as-needed -pie" dpkg-buildflags --get LDFLAGS)" \
+    && CC_OPT="$(DEB_BUILD_MAINT_OPTIONS="hardening=+all,-pie" DEB_CFLAGS_MAINT_APPEND="-fPIC" dpkg-buildflags --get CFLAGS | tr ' ' '\n' | grep -v '^-specs=' | tr '\n' ' ')" \
+    && LD_OPT="$(DEB_BUILD_MAINT_OPTIONS="hardening=+all,-pie" DEB_LDFLAGS_MAINT_APPEND="-Wl,--as-needed -pie" dpkg-buildflags --get LDFLAGS | tr ' ' '\n' | grep -v '^-specs=' | tr '\n' ' ')" \
     && CONFIGURE_ARGS_MODULES="--prefix=/usr \
                 --statedir=/var/lib/unit \
                 --control=unix:/var/run/control.unit.sock \

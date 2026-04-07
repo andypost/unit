@@ -1,7 +1,7 @@
 # libunit-wasm
 
 include $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/version
-LIBUNIT_WASM_URL := https://github.com/nginx/unit-wasm.git
+LIBUNIT_WASM_URL := https://github.com/freeunitorg/freeunit-wasm.git
 
 PKGS += libunit-wasm
 

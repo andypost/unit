@@ -5,3 +5,4 @@ __pycache__/
 /.idea/
 /CLAUDE.md
 /.claude/
+/pkg/docker/build-logs/

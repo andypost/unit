@@ -14,7 +14,7 @@
  * for a next connection to avoid just dropping next accept()ed socket
  * if no more connections allowed.  If there are no available connections
  * an idle connection would be closed.  If there are no idle connections
- * then new connections will not be accept()ed for 1 second.
+ * then new connections will not be accept()ed for 100 milliseconds.
  */
 
 
@@ -289,25 +289,28 @@ nxt_conn_accept_close_idle_handler(nxt_task_t *task, void *obj, void *data)
          link != nxt_queue_head(idle);
          link = next)
     {
-        next = nxt_queue_next(link);
+        next = nxt_queue_prev(link);
 
         c = nxt_queue_link_data(link, nxt_conn_t, link);
 
         nxt_debug(c->socket.task, "idle connection: %d rdy:%d",
                   c->socket.fd, c->socket.read_ready);
 
-        if (!c->socket.read_ready) {
-            nxt_log_moderate(&nxt_idle_close_log_moderation, NXT_LOG_INFO,
-                             task->log, "no available connections, "
-                             "close idle connection");
+        /*
+         * Close regardless of read_ready: a pending FIN from the peer
+         * (CLOSE-WAIT) sets read_ready = 1 but the connection is still
+         * idle and must be reclaimed under fd pressure.
+         */
+        nxt_log_moderate(&nxt_idle_close_log_moderation, NXT_LOG_INFO,
+                         task->log, "no available connections, "
+                         "close idle connection");
 
-            c->read_state->close_handler(c->socket.task, c, c->socket.data);
+        c->read_state->close_handler(c->socket.task, c, c->socket.data);
 
-            times--;
+        times--;
 
-            if (times == 0) {
-                break;
-            }
+        if (times == 0) {
+            break;
         }
     }
 }

@@ -2,6 +2,7 @@
 Makefile
 *.pyc
 __pycache__/
+.pytest_cache/
 /.idea/
 /CLAUDE.md
 /.claude/
@@ -9,3 +10,8 @@ __pycache__/
 /QWEN.md
 /.qwen/settings.json
 /.qwen/settings.json.orig
+/njs/
+/pkg/contrib/njs/
+/pkg/contrib/.sum-*
+/pkg/contrib/.njs
+/pkg/contrib/local/

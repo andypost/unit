@@ -1,4 +1,15 @@
 
+Changes with FreeUnit 1.35.4                                     xx xxx 2026
+
+    *) Bugfix: fix router process CPU spin and connection hang under port
+       scanning load; CLOSE-WAIT sockets are now cleaned up properly on
+       client FIN, idle connection queue iteration fixed, systemd file
+       descriptor limit increased to 65535.
+
+    *) Change: default HTTP keep-alive idle_timeout reduced from 180 to 30
+       seconds.
+
+
 Changes with FreeUnit 1.35.3                                     07 Apr 2026
 
     *) Feature: migrate contrib package mirror from packages.nginx.org to

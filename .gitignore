@@ -6,3 +6,6 @@ __pycache__/
 /CLAUDE.md
 /.claude/
 /pkg/docker/build-logs/
+/QWEN.md
+/.qwen/settings.json
+/.qwen/settings.json.orig

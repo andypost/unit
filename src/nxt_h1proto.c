@@ -437,6 +437,18 @@ nxt_h1p_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
     if (n > 0) {
         c->read = b;
 
+    } else if (n == 0) {
+        /*
+         * Client sent FIN while in keep-alive.  Close immediately
+         * instead of waiting for idle_timeout to avoid CLOSE-WAIT
+         * accumulation under port scanning load (issue #28).
+         */
+        nxt_debug(task, "h1p idle: client closed connection");
+
+        c->read = NULL;
+        nxt_event_engine_buf_mem_free(task->thread->engine, b);
+        nxt_h1p_closing(task, c);
+
     } else {
         c->read = NULL;
         nxt_event_engine_buf_mem_free(task->thread->engine, b);

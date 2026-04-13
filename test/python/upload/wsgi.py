@@ -1,29 +1,30 @@
-import cgi
-from tempfile import TemporaryFile
-
-
-def read(environ):
-    length = int(environ.get('CONTENT_LENGTH', 0))
-
-    body = TemporaryFile(mode='w+b')
-    body.write(bytes(environ['wsgi.input'].read(length)))
-    body.seek(0)
-
-    environ['wsgi.input'] = body
-    return body
+import email
 
 
 def application(environ, start_response):
-    file = read(environ)
+    content_type = environ.get('CONTENT_TYPE', '')
+    content_length = int(environ.get('CONTENT_LENGTH', 0))
+    body = environ['wsgi.input'].read(content_length)
 
-    form = cgi.FieldStorage(fp=file, environ=environ, keep_blank_values=True)
+    msg_data = f"Content-Type: {content_type}\r\n\r\n".encode() + body
+    msg = email.message_from_bytes(msg_data)
 
-    filename = form['file'].filename
-    data = filename.encode() + form['file'].file.read()
+    filename = ""
+    file_data = b""
+
+    for part in msg.walk():
+        if part.get_content_disposition() == 'form-data':
+            name = part.get_param('name', header='content-disposition')
+            if name == 'file':
+                filename = part.get_filename() or ""
+                file_data = part.get_payload(decode=True) or b""
+                break
+
+    data = filename.encode() + file_data
 
     start_response(
         '200 OK',
         [('Content-Type', 'text/plain'), ('Content-Length', str(len(data)))],
     )
 
-    return data
+    return [data]

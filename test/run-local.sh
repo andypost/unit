@@ -9,9 +9,8 @@
 #   -m MODULE   Module to test (unit, python, php, go, java, node, perl,
 #               ruby, wasm, wasm-wasi-component)
 #               Default: unit (runs full test suite)
-#   -t TEST     Specific test file or test function to run
+#   -t TEST     Test path to run (repeatable)
 #               Examples: test_tls.py  test_tls.py::test_tls_certificate_change
-#   -v VERSION  Python version for tests (default: 3.12)
 #   -n          Dry-run — print commands, do not execute
 #   -h          Show this help
 #
@@ -21,6 +20,7 @@
 #   ./run-local.sh php                      # PHP tests only
 #   ./run-local.sh -t test_tls.py           # single test file
 #   ./run-local.sh -t test_tls.py::test_tls_certificate_change  # single test
+#   ./run-local.sh -t test_a.py -t test_b.py  # multiple test files
 #   ./run-local.sh unit python php          # multiple modules
 #
 # To force rebuild: docker rmi freeunit-test:local
@@ -34,9 +34,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 IMAGE_NAME="freeunit-test:local"
 DRY_RUN=false
+TMP_DIR=""
 
 # ---------------------------------------------------------------------------
-# Known modules and their test paths
+# Known modules and their test paths (glob patterns for pytest)
 # ---------------------------------------------------------------------------
 declare -A MODULE_TESTS=(
     [unit]="test"
@@ -56,7 +57,6 @@ declare -A MODULE_TESTS=(
 # ---------------------------------------------------------------------------
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 info() { log "INFO  $*"; }
-warn() { log "WARN  $*"; }
 err()  { log "ERROR $*" >&2; }
 
 usage() {
@@ -68,13 +68,12 @@ usage() {
 # Argument parsing
 # ---------------------------------------------------------------------------
 MODULES=()
-TEST_PATH=""
+TEST_ARGS=()
 
-while getopts ":m:t:v:nh" opt; do
+while getopts ":m:t:nh" opt; do
     case $opt in
         m) MODULES+=("$OPTARG") ;;
-        t) TEST_PATH="$OPTARG" ;;
-        v) PYTHON_VERSION="$OPTARG" ;;
+        t) TEST_ARGS+=("$OPTARG") ;;
         n) DRY_RUN=true ;;
         h) usage ;;
         :) err "Option -$OPTARG requires an argument."; exit 1 ;;
@@ -83,25 +82,46 @@ while getopts ":m:t:v:nh" opt; do
 done
 shift $((OPTIND - 1))
 
+# Positional args are module names
 MODULES+=("$@")
 
-if [[ ${#MODULES[@]} -eq 0 ]] && [[ -z "$TEST_PATH" ]]; then
-    TEST_PATH="test"
+# Defaults: no -t and no modules → run full unit test suite
+if [[ ${#TEST_ARGS[@]} -eq 0 ]] && [[ ${#MODULES[@]} -eq 0 ]]; then
     MODULES=("unit")
 fi
 
-if [[ -z "$TEST_PATH" ]] && [[ ${#MODULES[@]} -gt 0 ]]; then
-    PATHS=()
+# Expand modules → test path patterns (only when -t not given)
+if [[ ${#TEST_ARGS[@]} -eq 0 ]] && [[ ${#MODULES[@]} -gt 0 ]]; then
     for m in "${MODULES[@]}"; do
         if [[ -n "${MODULE_TESTS[$m]:-}" ]]; then
-            PATHS+=("${MODULE_TESTS[$m]}")
+            TEST_ARGS+=("${MODULE_TESTS[$m]}")
         else
             err "Unknown module: '$m'. Known: ${!MODULE_TESTS[*]}"
             exit 1
         fi
     done
-    TEST_PATH="${PATHS[*]}"
 fi
+
+# ---------------------------------------------------------------------------
+# Tmp copy — isolate source from live tree, avoid live-source mutation
+# ---------------------------------------------------------------------------
+prepare_tmp() {
+    TMP_DIR="$(mktemp -d /tmp/freeunit-test.XXXXXX)"
+    if $DRY_RUN; then
+        info "Dry-run: would copy project → $TMP_DIR (skipping)"
+        return 0
+    fi
+    info "Copying project → $TMP_DIR"
+    rsync -a --exclude='.git' --exclude='/build' "${PROJECT_DIR}/" "${TMP_DIR}/"
+}
+
+cleanup_tmp() {
+    if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+        info "Tmp dir left at $TMP_DIR (cleanup disabled)"
+        # rm -rf "$TMP_DIR"
+    fi
+}
+trap cleanup_tmp EXIT
 
 # ---------------------------------------------------------------------------
 # Pre-flight
@@ -112,8 +132,8 @@ fi
 
 info "============================================================"
 info "FreeUnit local test run"
-info "  Modules  : ${MODULES[*]:-all}"
-info "  Test path: ${TEST_PATH}"
+info "  Modules  : ${MODULES[*]:--}"
+info "  Test args: ${TEST_ARGS[*]}"
 info "  Dry-run  : ${DRY_RUN}"
 info "============================================================"
 
@@ -128,23 +148,22 @@ build_image() {
 
     info "Building test image: $IMAGE_NAME"
 
-    # Generate a temporary Dockerfile that mirrors template.Dockerfile.
-    # njs is built via `make -C pkg/contrib .njs` (same as production
-    # Dockerfiles).  Source code is mounted via volume at runtime.
     local DOCKERFILE
     DOCKERFILE="$(mktemp /tmp/Dockerfile.test.XXXXXX)"
 
+    # Note: <<'EOF' — no shell expansion; $@, $(...) are literal for Docker/bash
     cat > "$DOCKERFILE" <<'EOF'
 FROM python:3.14-slim-trixie
 
 LABEL org.opencontainers.image.title="FreeUnit (test)"
 LABEL org.opencontainers.image.vendor="FreeUnit Community <team@freeunit.org>"
 
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_HOME=/usr/src/unit/cargo \
+    RUSTUP_HOME=/usr/src/unit/rustup \
+    PATH=/usr/src/unit/cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# System deps + Rust (always required for otel/unitctl)
 RUN set -ex \
-    && savedAptMark="$(apt-mark showmanual)" \
     && apt-get update \
     && apt-get install --no-install-recommends --no-install-suggests -y \
          ca-certificates git build-essential libssl-dev openssl libpcre2-dev \
@@ -167,17 +186,18 @@ RUN set -ex \
     && ./rustup-init -y --no-modify-path --profile minimal --default-toolchain $RUST_VERSION --default-host ${rustArch} \
     && rm rustup-init \
     && rustup --version && cargo --version && rustc --version \
-    && mkdir -p /usr/lib/unit/modules /usr/lib/unit/debug-modules
+    && mkdir -p /usr/lib/unit/modules /usr/lib/unit/debug-modules \
+    && adduser --system --group --no-create-home unit
 
 WORKDIR /unit
 
-# Build entrypoint — source mounted via -v, built at runtime
+# Source is mounted via -v at runtime. Build happens here.
+# $@ receives test path args from `docker run IMAGE <args>`.
+# Unquoted $@ → word-split + glob-expand (handles test/test_go* patterns).
 ENTRYPOINT ["bash", "-c", "\
     set -ex && \
     NCPU=$(getconf _NPROCESSORS_ONLN) && \
     DEB_HOST_MULTIARCH=$(dpkg-architecture -q DEB_HOST_MULTIARCH) && \
-    CC_OPT=$(DEB_BUILD_MAINT_OPTIONS='hardening=+all,-pie' DEB_CFLAGS_MAINT_APPEND='-fPIC' dpkg-buildflags --get CFLAGS) && \
-    LD_OPT=$(DEB_BUILD_MAINT_OPTIONS='hardening=+all,-pie' DEB_LDFLAGS_MAINT_APPEND='-Wl,--as-needed -pie' dpkg-buildflags --get LDFLAGS) && \
     CONFIGURE_ARGS='--prefix=/usr \
                 --statedir=/var/lib/unit \
                 --control=unix:/var/run/control.unit.sock \
@@ -198,17 +218,19 @@ ENTRYPOINT ["bash", "-c", "\
     make -j $NCPU -C pkg/contrib .njs && \
     export PKG_CONFIG_PATH=$(pwd)/pkg/contrib/njs/build && \
     ./configure $CONFIGURE_ARGS \
-        --cc-opt=\"$CC_OPT\" \
-        --ld-opt=\"$LD_OPT\" \
+        --cc-opt=\"-fPIC\" \
         --tests \
         --modulesdir=/usr/lib/unit/debug-modules \
         --debug && \
-    make -j $NCPU unitd -k || make unitd && \
+    make -j $NCPU unitd && \
     ./configure python --config=/usr/local/bin/python3-config && \
+    printf 'NXT_INCS += -I%s/pkg/contrib/njs/src -I%s/pkg/contrib/njs/build\\n' \
+        $(pwd) $(pwd) >> build/Makefile && \
     make python3 && \
-    chmod -R +x /unit && \
-    sudo -E pytest-3 --print-log ${TEST_PATH:-test} \
-"]
+    exec pytest-3 --print-log $@ \
+", "bash"]
+
+CMD ["test"]
 EOF
 
     if $DRY_RUN; then
@@ -218,7 +240,7 @@ EOF
         return 0
     fi
 
-    docker build --file "$DOCKERFILE" --tag "$IMAGE_NAME" "$PROJECT_DIR"
+    docker build --file "$DOCKERFILE" --tag "$IMAGE_NAME" "${PROJECT_DIR}"
     rm -f "$DOCKERFILE"
 }
 
@@ -226,23 +248,24 @@ EOF
 # Run tests
 # ---------------------------------------------------------------------------
 run_tests() {
-    info "Running tests: ${TEST_PATH}"
+    info "Running: pytest-3 --print-log ${TEST_ARGS[*]}"
 
     if $DRY_RUN; then
         info "Dry-run: would execute:"
-        echo "  docker run --rm --privileged -v ${PROJECT_DIR}:/unit -w /unit -e TEST_PATH='${TEST_PATH}' ${IMAGE_NAME}"
+        echo "  docker run --rm --privileged -v ${TMP_DIR}:/unit -w /unit ${IMAGE_NAME} ${TEST_ARGS[*]}"
         return 0
     fi
 
     docker run --rm --privileged \
-        -v "${PROJECT_DIR}:/unit" \
+        -v "${TMP_DIR}:/unit" \
         -w /unit \
-        -e TEST_PATH="${TEST_PATH}" \
-        "${IMAGE_NAME}"
+        "${IMAGE_NAME}" \
+        "${TEST_ARGS[@]}"
 }
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+prepare_tmp
 build_image
 run_tests

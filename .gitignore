@@ -1,4 +1,4 @@
-/build/
+build/
 Makefile
 *.pyc
 __pycache__/
@@ -6,3 +6,6 @@ __pycache__/
 /CLAUDE.md
 /.claude/
 /pkg/docker/build-logs/
+/QWEN.md
+/FIX.md
+/CLAUDE.original.md

@@ -43,10 +43,12 @@ ALL_VARIANTS=(
     wasm
     go1.24
     go1.25
+    go1.26
     jsc17
     jsc21
     node20
     node22
+    node24
     perl5.38
     perl5.40
     php8.3

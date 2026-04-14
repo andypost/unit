@@ -32,19 +32,21 @@ jobs:
           - build: unit
             os: ubuntu-latest
           # Modules
-          - build: go-1.21
+          - build: go-1.24
             os: ubuntu-latest
-          - build: go-1.22
+          - build: go-1.25
+            os: ubuntu-latest
+          - build: go-1.26
             os: ubuntu-latest
           - build: java-17
             os: ubuntu-latest
           - build: java-18
             os: ubuntu-latest
-          - build: java-21
+          - build: java-20
             os: ubuntu-latest
-          - build: node-20
+          - build: node-22
             os: ubuntu-latest
-          - build: node-21
+          - build: node-24
             os: ubuntu-latest
           - build: perl
             os: ubuntu-latest
@@ -121,7 +123,7 @@ jobs:
 
       - name: Cache OpenSSL 3.6
         id: cache-openssl36
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /opt/openssl-3.6
           key: openssl-3.6.0-${{ runner.os }}-${{ runner.arch }}

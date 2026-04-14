@@ -11,15 +11,17 @@
 # EOL status (as of April 2026):
 #   go1.24      EOL ~Feb 2026  -> supported until Feb 2027
 #   go1.25      EOL ~Aug 2026  -> supported until Aug 2027
+#   go1.26      EOL ~Feb 2027  -> supported until Feb 2028
 #   jsc17       EOL Sep 2029 (OpenJDK 17 LTS, Eclipse Temurin) -> supported until Sep 2030
 #   jsc21       EOL Sep 2031 (OpenJDK 21 LTS, Eclipse Temurin) -> supported until Sep 2032
 #   node20      EOL Apr 2026   -> supported until Apr 2027
 #   node22      EOL Apr 2027   -> supported until Apr 2028
-#   perl5.38    EOL ~Jun 2025  -> supported until Jun 2026
-#   perl5.40    EOL ~Jun 2026  -> supported until Jun 2027
-#   php8.3      EOL Nov 2026   -> supported until Nov 2027
-#   php8.4      EOL Nov 2027   -> supported until Nov 2028
-#   php8.5      EOL Nov 2028   -> supported until Nov 2029
+#   node24      EOL Apr 2028   -> supported until Apr 2029
+#   perl5.38    EOL ~Jul 2026  -> supported until Jul 2027
+#   perl5.40    EOL ~Jul 2028  -> supported until Jul 2029
+#   php8.3      EOL Dec 2027   -> supported until Dec 2028
+#   php8.4      EOL Dec 2028   -> supported until Dec 2029
+#   php8.5      EOL Dec 2029   -> supported until Dec 2030
 #   python3.12  EOL Oct 2028   -> supported until Oct 2029
 #   python3.13  EOL Oct 2029   -> supported until Oct 2030
 #   python3.14  EOL Oct 2030   -> supported until Oct 2031
@@ -68,7 +70,8 @@ jobs:
             dockerfile: pkg/docker/Dockerfile.go1.24
           - variant: go1.25
             dockerfile: pkg/docker/Dockerfile.go1.25
-
+          - variant: go1.26
+            dockerfile: pkg/docker/Dockerfile.go1.26
           # -- JSC (Java Servlet Container / OpenJDK) --------------------------------
           #   Java support for .war/.jsp applications via Eclipse Temurin (OpenJDK)
           #   Base image: eclipse-temurin:17-jdk-noble (Ubuntu 24.04, GPL v2)
@@ -84,6 +87,8 @@ jobs:
             dockerfile: pkg/docker/Dockerfile.node20
           - variant: node22
             dockerfile: pkg/docker/Dockerfile.node22
+          - variant: node24
+            dockerfile: pkg/docker/Dockerfile.node24
 
           # -- Perl ----------------------------------------------------------
           - variant: perl5.38
@@ -142,17 +147,17 @@ jobs:
             ${{ matrix.dockerfile }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build and push (AMD64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: pkg/docker
           file: ${{ matrix.dockerfile }}
@@ -188,6 +193,8 @@ jobs:
             dockerfile: pkg/docker/Dockerfile.go1.24
           - variant: go1.25
             dockerfile: pkg/docker/Dockerfile.go1.25
+          - variant: go1.26
+            dockerfile: pkg/docker/Dockerfile.go1.26
 
           # -- JSC (Java / GraalVM) ------------------------------------------
           - variant: jsc17
@@ -200,6 +207,8 @@ jobs:
             dockerfile: pkg/docker/Dockerfile.node20
           - variant: node22
             dockerfile: pkg/docker/Dockerfile.node22
+          - variant: node24
+            dockerfile: pkg/docker/Dockerfile.node24
 
           # -- Perl ----------------------------------------------------------
           - variant: perl5.38
@@ -258,17 +267,17 @@ jobs:
             ${{ matrix.dockerfile }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build and push (ARM64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: pkg/docker
           file: ${{ matrix.dockerfile }}
@@ -296,11 +305,13 @@ jobs:
           - variant: wasm
           - variant: go1.24
           - variant: go1.25
+          - variant: go1.26
           # -- JSC (Java / GraalVM) ------------------------------------------
           - variant: jsc17
           - variant: jsc21
           - variant: node20
           - variant: node22
+          - variant: node24
           - variant: perl5.38
           - variant: perl5.40
           - variant: php8.3
@@ -317,7 +328,7 @@ jobs:
 
     steps:
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}

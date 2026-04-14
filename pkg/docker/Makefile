@@ -20,7 +20,7 @@ INSTALL_minimal ?=	version
 RUN_minimal ?=		/bin/true
 MODULE_PREBUILD_minimal ?= /bin/true
 
-VERSIONS_go ?=		1.24 1.25
+VERSIONS_go ?=		1.24 1.25 1.26
 VARIANT_go ?=		$(VARIANT)
 $(foreach goversion, $(VERSIONS_go), $(eval CONTAINER_go$(goversion) = golang:$(goversion)-$(VARIANT_go)))
 CONFIGURE_go ?=		go --go-path=$$GOPATH
@@ -36,7 +36,7 @@ INSTALL_jsc ?=		java-shared-install java-install
 RUN_jsc ?=	 		rm -rf /root/.m2
 MODULE_PREBUILD_jsc ?= /bin/true
 
-VERSIONS_node ?=	20 22
+VERSIONS_node ?=	20 22 24
 VARIANT_node ?=		$(VARIANT)
 $(foreach nodeversion, $(VERSIONS_node), $(eval CONTAINER_node$(nodeversion) = node:$(nodeversion)-$(VARIANT_node)))
 CONFIGURE_node ?=	nodejs --node-gyp=/usr/local/bin/node-gyp
@@ -162,5 +162,6 @@ all: $(addprefix Dockerfile., $(MODVERSIONS))
 clean:
 	rm -f Dockerfile.*
 	rm -f build-*
+	rm -rf build-logs
 
 .PHONY: default build dockerfiles clean library

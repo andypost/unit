@@ -1,4 +1,4 @@
-/build/
+build/
 Makefile
 *.pyc
 __pycache__/
@@ -15,3 +15,5 @@ __pycache__/
 /pkg/contrib/.sum-*
 /pkg/contrib/.njs
 /pkg/contrib/local/
+/FIX.md
+/CLAUDE.original.md

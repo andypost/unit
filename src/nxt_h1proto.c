@@ -438,6 +438,10 @@ nxt_h1p_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
         c->read = b;
 
     } else {
+        if (n == 0) {
+            nxt_debug(task, "h1p idle: client closed connection (FIN)");
+        }
+
         c->read = NULL;
         nxt_event_engine_buf_mem_free(task->thread->engine, b);
     }

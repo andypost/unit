@@ -20,6 +20,7 @@ Environment="UNITD_OPTIONS=--log /var/log/unit/unit.log --pid /var/run/unit/unit
 ExecStart=/usr/sbin/unitd $UNITD_OPTIONS
 ExecReload=
 RuntimeDirectory=unit
+LimitNOFILE=65535
 RuntimeDirectoryMode=0755
 PIDFile=/run/unit/unit.pid
 

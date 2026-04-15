@@ -2029,7 +2029,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             skcf->proxy_header_buffer_size = 64 * 1024;
             skcf->proxy_buffer_size = 4096;
             skcf->proxy_buffers = 256;
-            skcf->idle_timeout = 180 * 1000;
+            skcf->idle_timeout = 30 * 1000;
             skcf->header_read_timeout = 30 * 1000;
             skcf->body_read_timeout = 30 * 1000;
             skcf->send_timeout = 30 * 1000;

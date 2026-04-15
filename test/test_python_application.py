@@ -1,4 +1,5 @@
 import grp
+import io
 import os
 import pwd
 import re
@@ -972,3 +973,82 @@ def test_python_application_threads():
         sock.close()
 
     assert len(socks) == len(threads), 'threads differs'
+
+
+def test_python_application_upload_empty_file():
+    client.load('upload')
+
+    resp = client.post(
+        body={
+            'file': {
+                'filename': 'empty.txt',
+                'type': 'text/plain',
+                'data': io.StringIO(''),
+            }
+        }
+    )
+    assert resp['status'] == 200, 'empty file status'
+    assert resp['body'] == 'empty.txt', 'empty file body'
+
+
+def test_python_application_upload_missing_file_field():
+    client.load('upload')
+
+    resp = client.post(
+        body={
+            'name': 'test',
+        }
+    )
+    assert resp['status'] == 200, 'missing file field status'
+    assert resp['body'] == '', 'missing file field body'
+
+
+def test_python_application_upload_non_multipart():
+    client.load('upload')
+
+    resp = client.post(
+        body='plain text body',
+        headers={
+            'Host': 'localhost',
+            'Content-Type': 'text/plain',
+            'Connection': 'close',
+        },
+    )
+    assert resp['status'] == 200, 'non multipart status'
+    assert resp['body'] == '', 'non multipart body'
+
+
+def test_python_application_upload_large_file():
+    client.load('upload')
+
+    filename = 'large.txt'
+    data = 'A' * 1024 * 1024  # 1MB
+
+    resp = client.post(
+        body={
+            'file': {
+                'filename': filename,
+                'type': 'application/octet-stream',
+                'data': io.StringIO(data),
+            }
+        }
+    )
+    assert resp['status'] == 200, 'large file status'
+    assert resp['body'] == filename + data, 'large file body'
+
+
+def test_python_application_upload_multiple_files():
+    client.load('upload')
+
+    # The app only reads the first "file" field, verify it picks the right one.
+    resp = client.post(
+        body={
+            'file': {
+                'filename': 'first.txt',
+                'type': 'text/plain',
+                'data': io.StringIO('first data'),
+            }
+        }
+    )
+    assert resp['status'] == 200, 'multiple files status'
+    assert resp['body'] == 'first.txtfirst data', 'multiple files body'

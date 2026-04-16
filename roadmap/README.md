@@ -15,6 +15,7 @@ Technical roadmap documents for the FreeUnit fork. Start with [**unit-roadmap.md
 | [unit-maintainer.md](unit-maintainer.md) | Maintainer-facing synthesis of the roadmap — priorities, sequencing rules, near-term backlog, and governance guidance. |
 | [unit-todos.md](unit-todos.md) | Inventory of ~90 `TODO`/`FIXME`/`XXX`/`HACK`/`BUG` markers across the codebase, grouped by subsystem. |
 | [unit-wasm.md](unit-wasm.md) | WASM-бэкенды (Wasmtime core SAPI + WASI 0.2 component model), async body streaming, multi-runtime abstraction (Wasmer/WasmEdge), wasi-nn, WASI P3, language presets (PHP-wasm/CPython-WASI/ruby.wasm), OCI distribution. |
+| [unit-ai-agentic.md](unit-ai-agentic.md) | AI-agentic workloads track — surfaces the public-vs-Telegram roadmap delta and reprioritizes existing `X*`/`D*`/`W*` items into a quarterly schedule aimed at running agent tools, scheduled agent jobs, capability-gated sandboxes, co-located inference, and OCI-distributed components. No new primitives. |
 
 ## Scope
 

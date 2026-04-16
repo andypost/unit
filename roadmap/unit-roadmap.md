@@ -8,6 +8,7 @@ Per-language detail lives in:
 - [unit-ruby.md](unit-ruby.md) — Rack, threads, Fiber scheduler, Ractors
 - [unit-cron.md](unit-cron.md) — scheduler/cron primitive (drush, Celery, Sidekiq)
 - [unit-arm32.md](unit-arm32.md) — armv7 SIGBUS / alignment investigation
+- [unit-ai-agentic.md](unit-ai-agentic.md) — AI-agentic workloads track; reuses `X*`/`D*`/`W*` items on a quarterly schedule, adds no new primitives
 
 ---
 
@@ -253,7 +254,7 @@ Published policy document (`SUPPORT.md`) stating:
 
 ## Consolidated timeline
 
-Grouped to show parallelizable streams. Rows are calendar months from "today."
+Grouped to show parallelizable streams. Rows are calendar months from "today." An additional AI-agentic stream ([unit-ai-agentic.md](unit-ai-agentic.md)) runs in parallel; it reprioritizes a subset of the `X*` / `D*` / `W*` items below into quarterly milestones and adds no new work.
 
 | Month | Core / platform | Cross-cutting | PHP | Python | Ruby | Governance |
 |---|---|---|---|---|---|---|

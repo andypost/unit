@@ -4,6 +4,8 @@ Aggregated from a codebase sweep across `src/`, `auto/`, `test/`, `tools/`, `.gi
 
 **Last re-swept** against upstream master `7c9c5d96` (includes issue #28 CLOSE-WAIT fix, Go 1.26 / Node 24 docker variants, WASMTIME 43.0.1 bump). No new source-level TODOs introduced between `142560e0..7c9c5d96`; only line-number shifts in `nxt_h1proto.c`. `nxt_conn_accept.c` is clean after the #28 fix.
 
+**Issue #28 follow-up (PR #54, `freeunitorg/freeunit#54`).** The accept-side CLOSE-WAIT fix landed upstream; the *write-side* counterpart — TLS `SSL_write` busy-loop on peer-initiated half-close — is fixed in `nxt_openssl_conn_test_error()` by treating `SSL_ERROR_SYSCALL`/`SSL_ERROR_ZERO_RETURN` on the write path as fatal write errors instead of graceful EOF. This is the model contract for the broader graceful-shutdown work (Pattern D) and a hard prerequisite for the drain phase of X3 (graceful reload).
+
 Format: `path:line — <classification> — <comment, summarized>`
 
 Classifications: **BUG** (known defect), **PERF** (perf issue), **FEATURE** (missing functionality), **CLEANUP** (refactor/tech debt), **PORTABILITY** (OS/arch), **VERSION** (version-guard compat), **SECURITY**, **CI**, **UNKNOWN** (unclear intent).
@@ -64,6 +66,7 @@ Counts at a glance: ~60 source TODOs in core daemon, ~5 in PHP tests, 0 in Pytho
 
 - `src/nxt_openssl.c:393` — CLEANUP — verify callback implementation needed
 - `src/nxt_openssl.c:396` — CLEANUP — verify depth implementation needed
+- `src/nxt_openssl.c` — **CONTRACT** (PR #54, issue #28) — `nxt_openssl_conn_test_error()` write path: `SSL_ERROR_SYSCALL` (errno==0, lib_err==0) and `SSL_ERROR_ZERO_RETURN` are fatal write errors, not graceful EOF. Mirror this contract in any new write paths added by D2 (HTTP/2) and D3 (body streaming) so a peer-initiated half-close cannot pin a router worker at 100% CPU.
 - `src/nxt_gnutls.c:98` — CLEANUP — `gnutls_global_deinit` missing
 - `src/nxt_gnutls.c:155` — CLEANUP — mem_pool cleanup for credentials and priorities
 - `src/nxt_cyassl.c:86` — CLEANUP — `CyaSSL_Cleanup()` missing
@@ -229,6 +232,11 @@ PHP has ~12 version guards; Python has ~9. Both modules support officially-EOL l
 ### Pattern D — Graceful shutdown
 `nxt_lib.c:149`, `nxt_main_process.c:841,855`, `nxt_event_engine.c:459`, `nxt_unit.c:6015` all reference an unimplemented graceful-shutdown path. This blocks `unit-roadmap.md` X3 (graceful reload) from being done correctly. Landing router graceful shutdown first removes 5 TODOs and unblocks the reload work.
 
+**Reference contract (already merged):** PR #54 / issue #28 hardened the TLS write path so that a peer-initiated half-close (`SSL_ERROR_SYSCALL` with errno==0, or `SSL_ERROR_ZERO_RETURN` while writing) returns `NXT_ERROR` instead of falling through to "graceful EOF". Use this as the canonical shape for the rest of Pattern D — every server-initiated drain decision needs the same "is this connection writable?" answer the TLS code now returns.
+
+### Pattern D′ — Silent fall-through on write paths
+Adjacent to Pattern D: `src/nxt_router.c:5898,5914` (`get_mmap_handler` and app response handler return success on incomplete state), `src/nxt_port_socket.c:749,892` (PERF — should disable event on buffer alloc failure rather than re-arming), `src/nxt_port_socket.c:1345` (port error handler incomplete). Same family of bug as the original issue #28 spin: a non-success condition is reported as success and the event loop re-arms forever. PR #54's fix in `nxt_openssl.c` is the simplest example of the correct pattern; these sites should be audited together.
+
 ### Pattern E — Java WebSocket TODOs
 Cluster of UNKNOWN/FEATURE/PERF in `src/java/**/websocket/` suggests the Java WebSocket implementation was ported from an external source (Tomcat-flavored WsRemoteEndpointImplBase names are telling) and not fully adapted. Needs an owner review.
 
@@ -244,8 +252,9 @@ Cluster of UNKNOWN/FEATURE/PERF in `src/java/**/websocket/` suggests the Java We
 | A. TLS backend cleanup | D4 (TLS modernization) |
 | B. HTTP filter chain | D3 (body streaming) + D2 (HTTP/2 requires filter design) |
 | C. Version-guard debt | G1 (support matrix publishing forces a decision) |
-| D. Graceful shutdown | X3 (graceful reload) — **prerequisite** |
+| D. Graceful shutdown | X3 (graceful reload) — **prerequisite**; TLS write contract from PR #54 is the reference shape |
+| D′. Silent fall-through on writes | D2 (HTTP/2), D3 (body streaming) — apply the PR #54 contract to all new write paths |
 | E. Java WebSocket | Not in roadmap; needs owner — file as separate tracking issue |
 | F. WASM async | D3 (body streaming) — rev the libunit body API once, both benefit |
 
-**First three merges to drain this list fast:** (1) drop EOL PHP/Python minors, (2) remove dead TLS backends, (3) land graceful shutdown in core. Each is self-contained and each deletes debt in multiple places.
+**First three merges to drain this list fast:** (1) drop EOL PHP/Python minors, (2) remove dead TLS backends, (3) land graceful shutdown in core (modelled on the TLS write-path contract from PR #54). Each is self-contained and each deletes debt in multiple places.

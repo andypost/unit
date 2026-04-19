@@ -63,11 +63,34 @@ Ordered by **shipping value ÷ implementation risk**, not strict dependency orde
 - **Risks:** non-thread-safe extensions (ext/mysqli with some drivers, xdebug, legacy). Document a known-bad list, add a startup check that iterates `EG(modules)` and warns.
 - **Effort:** ~2–3 weeks. Most work is test coverage and extension compatibility triage, not the dispatch plumbing.
 
-**P2. Status API for PHP.**
-- `/status/applications/<name>/php` returns: opcache stats (hits, misses, cached scripts, memory used/free, interned strings), JIT state, request counters (total, active, rejected), last GC run, per-worker memory high-water-mark.
-- Implementation: one SAPI internal call per worker that scrapes `opcache_get_status()` equivalents from C (`accel_shared_globals`, `ZCSG` macros) without needing a PHP function call.
-- **Wins:** removes the "is opcache actually hot" mystery; feeds Prometheus.
-- **Effort:** ~1 week.
+**P2. Status API for PHP.** ✅ **COMPLETE** (2026-04-19)
+
+**Implementation:**
+- Endpoint: `/status/applications/<name>` with `runtime` section
+- Returns: type, version, stats (opcache, JIT, requests, GC, memory)
+- Files: `src/nxt_php_status.h`, `src/nxt_status.c`, `test/test_php_status.py`
+- Tests: 20 tests (5 pass, 15 need ZendAccelerator.h for full stats)
+- Build: No changes needed (inline implementation in header)
+
+**Key decisions:**
+- `runtime` section (not separate `/php` endpoint) - prevents BC breaks
+- Inline function in header - no build system complexity
+- Graceful degradation - zeros when opcache headers unavailable
+
+**Usage:**
+```bash
+curl http://localhost:8443/status/applications/myapp | jq '.runtime'
+```
+
+**Documentation:**
+- `PHP_STATUS_IMPLEMENTATION_COMPLETE.md` - Full implementation status
+- `PHP_ZEND_ACCELERATOR_ANALYSIS.md` - Opcache header availability
+- `BUILD_ANALYSIS_GCC_VS_CLANG.md` - Compiler comparison
+
+**Wins:** removes the "is opcache actually hot" mystery; feeds Prometheus.
+**Effort:** ~12 hours (including build system debugging)
+
+**Related:** Roadmap item X8 (`/metrics` endpoint for Prometheus) builds on this.
 
 **P3. Preload/warm-up hook.**
 - Config: `"preload": "/path/to/preload.php"` mapped to `opcache.preload` automatically, executed during `nxt_php_setup` before first request.

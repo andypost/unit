@@ -1694,6 +1694,82 @@ nxt_conf_vldt_type(nxt_conf_validation_t *vldt, const nxt_str_t *name,
 }
 
 
+/*
+ * Serialize vldt->path into vldt->pointer as an RFC 6901 JSON Pointer.
+ * Root is the empty string "". Segments are separated by '/'. Within each
+ * segment, '~' is encoded as "~0" and '/' as "~1" (in that order).
+ *
+ * Never fails validation: on allocation failure the pointer is left empty.
+ */
+static void
+nxt_conf_vldt_render_pointer(nxt_conf_validation_t *vldt)
+{
+    u_char                *p;
+    size_t                size, n;
+    u_char                c;
+    nxt_conf_vldt_path_t  *node;
+
+    static u_char  empty[1] = "";
+
+    /*
+     * Always produce a non-NULL pointer: the empty string "" is the
+     * RFC 6901 pointer to the document root. Callers distinguish
+     * "validation error, pointer available" from "no pointer" via
+     * start != NULL.
+     */
+    vldt->pointer.length = 0;
+    vldt->pointer.start = empty;
+
+    if (vldt->path == NULL) {
+        return;
+    }
+
+    size = 0;
+    for (node = vldt->path; node != NULL; node = node->prev) {
+        if (nxt_slow_path(size == NXT_SIZE_T_MAX)) {
+            vldt->pointer.start = NULL;
+            return;
+        }
+        size += 1;  /* leading '/' */
+        for (n = 0; n < node->seg.length; n++) {
+            c = node->seg.start[n];
+            if (nxt_slow_path(size >= NXT_SIZE_T_MAX - 1)) {
+                vldt->pointer.start = NULL;
+                return;
+            }
+            size += (c == '~' || c == '/') ? 2 : 1;
+        }
+    }
+
+    p = nxt_mp_nget(vldt->pool, size);
+    if (p == NULL) {
+        vldt->pointer.start = NULL;
+        return;
+    }
+
+    vldt->pointer.start = p;
+    vldt->pointer.length = size;
+
+    p += size;
+
+    for (node = vldt->path; node != NULL; node = node->prev) {
+        for (n = node->seg.length; n > 0; n--) {
+            c = node->seg.start[n - 1];
+            if (c == '~') {
+                *--p = '0';
+                *--p = '~';
+            } else if (c == '/') {
+                *--p = '1';
+                *--p = '~';
+            } else {
+                *--p = c;
+            }
+        }
+        *--p = '/';
+    }
+}
+
+
 static nxt_int_t
 nxt_conf_vldt_error(nxt_conf_validation_t *vldt, const char *fmt, ...)
 {
@@ -1718,7 +1794,130 @@ nxt_conf_vldt_error(nxt_conf_validation_t *vldt, const char *fmt, ...)
     vldt->error.length = size;
     vldt->error.start = p;
 
+    nxt_conf_vldt_render_pointer(vldt);
+
     return NXT_DECLINED;
+}
+
+
+/*
+ * Damerau-Levenshtein distance between two byte strings. Rejects inputs
+ * that would overflow the stack buffer by returning SIZE_MAX.
+ *
+ * Used only inside validation error paths; input lengths are bounded by
+ * configuration member-name lengths.
+ */
+#define NXT_CONF_VLDT_EDIT_MAX  64
+
+static size_t
+nxt_conf_vldt_edit_distance(const nxt_str_t *a, const nxt_str_t *b)
+{
+    size_t  i, j, cost, above, left, diag, ins, del, sub, tr, min;
+    size_t  prev2[NXT_CONF_VLDT_EDIT_MAX + 1];
+    size_t  prev[NXT_CONF_VLDT_EDIT_MAX + 1];
+    size_t  curr[NXT_CONF_VLDT_EDIT_MAX + 1];
+
+    if (a->length > NXT_CONF_VLDT_EDIT_MAX
+        || b->length > NXT_CONF_VLDT_EDIT_MAX)
+    {
+        return (size_t) -1;
+    }
+
+    for (j = 0; j <= b->length; j++) {
+        prev[j] = j;
+        prev2[j] = 0;
+    }
+
+    for (i = 1; i <= a->length; i++) {
+        curr[0] = i;
+
+        for (j = 1; j <= b->length; j++) {
+            cost = (a->start[i - 1] == b->start[j - 1]) ? 0 : 1;
+            above = curr[j - 1] + 1;                /* insertion */
+            left = prev[j] + 1;                     /* deletion */
+            diag = prev[j - 1] + cost;              /* substitution */
+
+            ins = above;
+            del = left;
+            sub = diag;
+
+            min = ins < del ? ins : del;
+            if (sub < min) {
+                min = sub;
+            }
+
+            if (i > 1 && j > 1
+                && a->start[i - 1] == b->start[j - 2]
+                && a->start[i - 2] == b->start[j - 1])
+            {
+                tr = prev2[j - 2] + 1;
+                if (tr < min) {
+                    min = tr;
+                }
+            }
+
+            curr[j] = min;
+        }
+
+        for (j = 0; j <= b->length; j++) {
+            prev2[j] = prev[j];
+            prev[j] = curr[j];
+        }
+    }
+
+    return prev[b->length];
+}
+
+
+/*
+ * Emit "Unknown parameter" error for a member not present in the schema
+ * table. If a sufficiently-close, uniquely-best candidate exists, store
+ * its name in vldt->suggestion so the response body can surface it.
+ *
+ * Does NOT modify the legacy error-message wording.
+ */
+static nxt_int_t
+nxt_conf_vldt_unknown_member(nxt_conf_validation_t *vldt,
+    const nxt_str_t *name, nxt_conf_vldt_object_t *vals)
+{
+    size_t                  d, best, second;
+    size_t                  threshold;
+    nxt_conf_vldt_object_t  *v, *best_v;
+
+    best = (size_t) -1;
+    second = (size_t) -1;
+    best_v = NULL;
+
+    v = vals;
+
+    for ( ;; ) {
+        if (v->name.length == 0) {
+            if (v->u.members != NULL) {
+                v = v->u.members;
+                continue;
+            }
+            break;
+        }
+
+        d = nxt_conf_vldt_edit_distance(name, &v->name);
+        if (d < best) {
+            second = best;
+            best = d;
+            best_v = v;
+        } else if (d < second) {
+            second = d;
+        }
+
+        v++;
+    }
+
+    threshold = nxt_max((size_t) 2, name->length / 3);
+
+    if (best_v != NULL && best <= threshold && best < second) {
+        vldt->suggestion = best_v->name;
+    }
+
+    return nxt_conf_vldt_error(vldt, "Unknown parameter \"%V\".", name);
 }
 
 
@@ -3011,6 +3210,7 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     nxt_str_t               name, var;
     nxt_conf_value_t        *member;
     nxt_conf_vldt_object_t  *vals;
+    nxt_conf_vldt_path_t    seg;
 
     vals = data;
 
@@ -3029,8 +3229,17 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
             member = nxt_conf_get_object_member(value, &vals->name, NULL);
 
             if (member == NULL) {
-                return nxt_conf_vldt_error(vldt, "Required parameter \"%V\" "
-                                           "is missing.", &vals->name);
+                seg.prev = vldt->path;
+                seg.seg = vals->name;
+                seg.is_index = 0;
+                vldt->path = &seg;
+
+                ret = nxt_conf_vldt_error(vldt, "Required parameter \"%V\" "
+                                          "is missing.", &vals->name);
+
+                vldt->path = seg.prev;
+
+                return ret;
             }
         }
 
@@ -3056,8 +3265,7 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
                     continue;
                 }
 
-                return nxt_conf_vldt_error(vldt, "Unknown parameter \"%V\".",
-                                           &name);
+                return nxt_conf_vldt_unknown_member(vldt, &name, data);
             }
 
             if (!nxt_strstr_eq(&vals->name, &name)) {
@@ -3071,7 +3279,15 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
                 nxt_conf_get_string(member, &var);
 
                 if (nxt_is_tstr(&var)) {
+                    seg.prev = vldt->path;
+                    seg.seg = name;
+                    seg.is_index = 0;
+                    vldt->path = &seg;
+
                     ret = nxt_conf_vldt_var(vldt, &name, &var);
+
+                    vldt->path = seg.prev;
+
                     if (ret != NXT_OK) {
                         return ret;
                     }
@@ -3080,8 +3296,14 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
                 }
             }
 
+            seg.prev = vldt->path;
+            seg.seg = name;
+            seg.is_index = 0;
+            vldt->path = &seg;
+
             ret = nxt_conf_vldt_type(vldt, &name, member, vals->type);
             if (ret != NXT_OK) {
+                vldt->path = seg.prev;
                 return ret;
             }
 
@@ -3089,10 +3311,12 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
                 ret = vals->validator(vldt, member, vals->u.members);
 
                 if (ret != NXT_OK) {
+                    vldt->path = seg.prev;
                     return ret;
                 }
             }
 
+            vldt->path = seg.prev;
             break;
         }
     }
@@ -3215,6 +3439,7 @@ nxt_conf_vldt_object_iterator(nxt_conf_validation_t *vldt,
     nxt_int_t               ret;
     nxt_str_t               name;
     nxt_conf_value_t        *member;
+    nxt_conf_vldt_path_t    seg;
     nxt_conf_vldt_member_t  validator;
 
     validator = (nxt_conf_vldt_member_t) data;
@@ -3226,7 +3451,15 @@ nxt_conf_vldt_object_iterator(nxt_conf_validation_t *vldt,
             return NXT_OK;
         }
 
+        seg.prev = vldt->path;
+        seg.seg = name;
+        seg.is_index = 0;
+        vldt->path = &seg;
+
         ret = validator(vldt, &name, member);
+
+        vldt->path = seg.prev;
+
         if (ret != NXT_OK) {
             return ret;
         }
@@ -3238,10 +3471,13 @@ static nxt_int_t
 nxt_conf_vldt_array_iterator(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data)
 {
+    u_char                   *p;
     uint32_t                 index;
     nxt_int_t                ret;
     nxt_conf_value_t         *element;
+    nxt_conf_vldt_path_t     seg;
     nxt_conf_vldt_element_t  validator;
+    u_char                   buf[NXT_INT_T_LEN];
 
     validator = (nxt_conf_vldt_element_t) data;
 
@@ -3252,7 +3488,17 @@ nxt_conf_vldt_array_iterator(nxt_conf_validation_t *vldt,
             return NXT_OK;
         }
 
+        p = nxt_sprintf(buf, buf + sizeof(buf), "%uD", index);
+
+        seg.prev = vldt->path;
+        seg.seg.start = buf;
+        seg.seg.length = p - buf;
+        seg.is_index = 1;
+        vldt->path = &seg;
+
         ret = validator(vldt, element);
+
+        vldt->path = seg.prev;
 
         if (ret != NXT_OK) {
             return ret;

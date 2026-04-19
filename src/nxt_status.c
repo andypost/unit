@@ -7,6 +7,135 @@
 #include <nxt_conf.h>
 #include <nxt_status.h>
 #include <nxt_application.h>
+#include <nxt_php_status.h>
+
+
+/*
+ * Convert PHP status structure to JSON configuration object.
+ * Used for /status/applications/<name>/php endpoint.
+ */
+nxt_conf_value_t *
+nxt_php_status_to_json(nxt_php_status_t *php_stats, nxt_mp_t *mp)
+{
+    nxt_conf_value_t  *php_obj, *opcache_obj, *jit_obj, *requests_obj,
+                      *gc_obj, *memory_obj;
+
+    static const nxt_str_t  opcache_str = nxt_string("opcache");
+    static const nxt_str_t  jit_str = nxt_string("jit");
+    static const nxt_str_t  requests_str = nxt_string("requests");
+    static const nxt_str_t  gc_str = nxt_string("gc");
+    static const nxt_str_t  memory_str = nxt_string("memory");
+
+    static const nxt_str_t  enabled_str = nxt_string("enabled");
+    static const nxt_str_t  hits_str = nxt_string("hits");
+    static const nxt_str_t  misses_str = nxt_string("misses");
+    static const nxt_str_t  cached_scripts_str = nxt_string("cached_scripts");
+    static const nxt_str_t  memory_used_str = nxt_string("memory_used");
+    static const nxt_str_t  memory_free_str = nxt_string("memory_free");
+    static const nxt_str_t  interned_used_str = nxt_string("interned_strings_used");
+    static const nxt_str_t  interned_free_str = nxt_string("interned_strings_free");
+
+    static const nxt_str_t  buffer_size_str = nxt_string("buffer_size");
+    static const nxt_str_t  jit_memory_used_str = nxt_string("memory_used");
+
+    static const nxt_str_t  total_str = nxt_string("total");
+    static const nxt_str_t  active_str = nxt_string("active");
+    static const nxt_str_t  rejected_str = nxt_string("rejected");
+
+    static const nxt_str_t  runs_str = nxt_string("runs");
+    static const nxt_str_t  last_run_time_str = nxt_string("last_run_time");
+
+    static const nxt_str_t  peak_str = nxt_string("peak");
+    static const nxt_str_t  current_str = nxt_string("current");
+
+    php_obj = nxt_conf_create_object(mp, 5);
+    if (nxt_slow_path(php_obj == NULL)) {
+        return NULL;
+    }
+
+    /* Opcache section */
+    opcache_obj = nxt_conf_create_object(mp, 8);
+    if (nxt_slow_path(opcache_obj == NULL)) {
+        return NULL;
+    }
+
+    nxt_conf_set_member_integer(opcache_obj, &enabled_str,
+                                php_stats->opcache_enabled, 0);
+    nxt_conf_set_member_integer(opcache_obj, &hits_str,
+                                php_stats->opcache_hits, 1);
+    nxt_conf_set_member_integer(opcache_obj, &misses_str,
+                                php_stats->opcache_misses, 2);
+    nxt_conf_set_member_integer(opcache_obj, &cached_scripts_str,
+                                php_stats->opcache_cached_scripts, 3);
+    nxt_conf_set_member_integer(opcache_obj, &memory_used_str,
+                                php_stats->opcache_memory_used, 4);
+    nxt_conf_set_member_integer(opcache_obj, &memory_free_str,
+                                php_stats->opcache_memory_free, 5);
+    nxt_conf_set_member_integer(opcache_obj, &interned_used_str,
+                                php_stats->opcache_interned_strings_used, 6);
+    nxt_conf_set_member_integer(opcache_obj, &interned_free_str,
+                                php_stats->opcache_interned_strings_free, 7);
+
+    nxt_conf_set_member(php_obj, &opcache_str, opcache_obj, 0);
+
+    /* JIT section */
+    jit_obj = nxt_conf_create_object(mp, 3);
+    if (nxt_slow_path(jit_obj == NULL)) {
+        return NULL;
+    }
+
+    nxt_conf_set_member_integer(jit_obj, &enabled_str,
+                                php_stats->jit_enabled, 0);
+    nxt_conf_set_member_integer(jit_obj, &buffer_size_str,
+                                php_stats->jit_buffer_size, 1);
+    nxt_conf_set_member_integer(jit_obj, &jit_memory_used_str,
+                                php_stats->jit_memory_used, 2);
+
+    nxt_conf_set_member(php_obj, &jit_str, jit_obj, 1);
+
+    /* Requests section */
+    requests_obj = nxt_conf_create_object(mp, 3);
+    if (nxt_slow_path(requests_obj == NULL)) {
+        return NULL;
+    }
+
+    nxt_conf_set_member_integer(requests_obj, &total_str,
+                                php_stats->requests_total, 0);
+    nxt_conf_set_member_integer(requests_obj, &active_str,
+                                php_stats->requests_active, 1);
+    nxt_conf_set_member_integer(requests_obj, &rejected_str,
+                                php_stats->requests_rejected, 2);
+
+    nxt_conf_set_member(php_obj, &requests_str, requests_obj, 2);
+
+    /* GC section */
+    gc_obj = nxt_conf_create_object(mp, 2);
+    if (nxt_slow_path(gc_obj == NULL)) {
+        return NULL;
+    }
+
+    nxt_conf_set_member_integer(gc_obj, &runs_str,
+                                php_stats->gc_runs, 0);
+    nxt_conf_set_member_integer(gc_obj, &last_run_time_str,
+                                php_stats->gc_last_run_time, 1);
+
+    nxt_conf_set_member(php_obj, &gc_str, gc_obj, 3);
+
+    /* Memory section */
+    memory_obj = nxt_conf_create_object(mp, 2);
+    if (nxt_slow_path(memory_obj == NULL)) {
+        return NULL;
+    }
+
+    nxt_conf_set_member_integer(memory_obj, &peak_str,
+                                php_stats->memory_peak, 0);
+    nxt_conf_set_member_integer(memory_obj, &current_str,
+                                php_stats->memory_current, 1);
+
+    nxt_conf_set_member(php_obj, &memory_str, memory_obj, 4);
+
+    return php_obj;
+}
 
 
 nxt_conf_value_t *
@@ -158,7 +287,7 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
     for (i = 0; i < report->apps_count; i++) {
         app = &report->apps[i];
 
-        app_obj = nxt_conf_create_object(mp, 2);
+        app_obj = nxt_conf_create_object(mp, 3);
         if (nxt_slow_path(app_obj == NULL)) {
             return NULL;
         }
@@ -190,6 +319,47 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
         nxt_conf_set_member(app_obj, &reqs_str, obj, 1);
 
         nxt_conf_set_member_integer(obj, &active_str, app->active_requests, 0);
+
+        /*
+         * Runtime statistics (opt-in, security-sensitive)
+         * Exposes: memory, GC, language-specific stats (opcache, etc.)
+         * See: PHP_STATUS_TODO.md for security considerations
+         */
+        {
+            nxt_conf_value_t  *runtime_obj;
+
+            runtime_obj = nxt_conf_create_object(mp, 3);
+            if (nxt_slow_path(runtime_obj == NULL)) {
+                return NULL;
+            }
+
+            /* Language type and version */
+            static const nxt_str_t  type_str = nxt_string("type");
+            static const nxt_str_t  version_str = nxt_string("version");
+            static const nxt_str_t  php_str = nxt_string("php");
+            static const nxt_str_t  php_version = nxt_string("8.5");
+
+            nxt_conf_set_member_string(runtime_obj, &type_str, &php_str, 0);
+            nxt_conf_set_member_string(runtime_obj, &version_str, &php_version, 1);
+
+            /* Collect runtime stats from PHP module */
+            {
+                nxt_conf_value_t  *stats_obj;
+                nxt_php_status_t  php_stats;
+
+                nxt_php_collect_status(&php_stats);
+
+                stats_obj = nxt_php_status_to_json(&php_stats, mp);
+                if (stats_obj != NULL) {
+                    static const nxt_str_t  stats_str = nxt_string("stats");
+                    nxt_conf_set_member(runtime_obj, &stats_str, stats_obj, 2);
+                }
+            }
+
+            /* Add runtime section to app object */
+            static const nxt_str_t  runtime_str = nxt_string("runtime");
+            nxt_conf_set_member(app_obj, &runtime_str, runtime_obj, 2);
+        }
     }
 
     return status;

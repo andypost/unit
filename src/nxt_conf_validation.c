@@ -1707,7 +1707,7 @@ nxt_conf_vldt_render_pointer(nxt_conf_validation_t *vldt)
     u_char                *p;
     size_t                size, n;
     u_char                c;
-    nxt_conf_vldt_path_t  *node, *rev, *next;
+    nxt_conf_vldt_path_t  *node;
 
     static u_char  empty[1] = "";
 
@@ -1724,60 +1724,49 @@ nxt_conf_vldt_render_pointer(nxt_conf_validation_t *vldt)
         return;
     }
 
-    /* Reverse linked list so we walk root -> leaf. */
-    rev = NULL;
-    next = NULL;
-    for (node = vldt->path; node != NULL; node = next) {
-        next = node->prev;
-        node->prev = rev;
-        rev = node;
-    }
-
     size = 0;
-    for (node = rev; node != NULL; node = node->prev) {
+    for (node = vldt->path; node != NULL; node = node->prev) {
+        if (nxt_slow_path(size == NXT_SIZE_T_MAX)) {
+            vldt->pointer.start = NULL;
+            return;
+        }
         size += 1;  /* leading '/' */
         for (n = 0; n < node->seg.length; n++) {
             c = node->seg.start[n];
+            if (nxt_slow_path(size >= NXT_SIZE_T_MAX - 1)) {
+                vldt->pointer.start = NULL;
+                return;
+            }
             size += (c == '~' || c == '/') ? 2 : 1;
         }
     }
 
     p = nxt_mp_nget(vldt->pool, size);
     if (p == NULL) {
-        goto restore;
+        vldt->pointer.start = NULL;
+        return;
     }
 
     vldt->pointer.start = p;
+    vldt->pointer.length = size;
 
-    for (node = rev; node != NULL; node = node->prev) {
-        *p++ = '/';
-        for (n = 0; n < node->seg.length; n++) {
-            c = node->seg.start[n];
+    p += size;
+
+    for (node = vldt->path; node != NULL; node = node->prev) {
+        for (n = node->seg.length; n > 0; n--) {
+            c = node->seg.start[n - 1];
             if (c == '~') {
-                *p++ = '~';
-                *p++ = '0';
+                *--p = '0';
+                *--p = '~';
             } else if (c == '/') {
-                *p++ = '~';
-                *p++ = '1';
+                *--p = '1';
+                *--p = '~';
             } else {
-                *p++ = c;
+                *--p = c;
             }
         }
+        *--p = '/';
     }
-
-    vldt->pointer.length = p - vldt->pointer.start;
-
-restore:
-
-    /* Restore original tail->head orientation so pops still work. */
-    node = NULL;
-    while (rev != NULL) {
-        next = rev->prev;
-        rev->prev = node;
-        node = rev;
-        rev = next;
-    }
-    vldt->path = node;
 }
 
 
@@ -3240,8 +3229,17 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
             member = nxt_conf_get_object_member(value, &vals->name, NULL);
 
             if (member == NULL) {
-                return nxt_conf_vldt_error(vldt, "Required parameter \"%V\" "
-                                           "is missing.", &vals->name);
+                seg.prev = vldt->path;
+                seg.seg = vals->name;
+                seg.is_index = 0;
+                vldt->path = &seg;
+
+                ret = nxt_conf_vldt_error(vldt, "Required parameter \"%V\" "
+                                          "is missing.", &vals->name);
+
+                vldt->path = seg.prev;
+
+                return ret;
             }
         }
 
@@ -3281,7 +3279,15 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
                 nxt_conf_get_string(member, &var);
 
                 if (nxt_is_tstr(&var)) {
+                    seg.prev = vldt->path;
+                    seg.seg = name;
+                    seg.is_index = 0;
+                    vldt->path = &seg;
+
                     ret = nxt_conf_vldt_var(vldt, &name, &var);
+
+                    vldt->path = seg.prev;
+
                     if (ret != NXT_OK) {
                         return ret;
                     }

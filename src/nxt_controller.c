@@ -2593,16 +2593,7 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
         if (have_offset || have_pointer) {
             n++;
 
-            loc_n = 0;
-            if (have_offset) {
-                loc_n += 1;
-                if (resp->line != 0) {
-                    loc_n += 2;  /* line + column */
-                }
-            }
-            if (have_pointer) {
-                loc_n += 1;
-            }
+            loc_n = (have_offset ? (resp->line != 0 ? 3 : 1) : 0) + have_pointer;
 
             location = nxt_conf_create_object(c->mem_pool, loc_n);
 

@@ -38,7 +38,7 @@ See `true-async.md`. Enabled by `async: true` + `entrypoint`. Uses the Zend Asyn
 
 1. **No thread-per-request mode.** ZTS is loaded but idle. Concurrency only via more processes.
 2. **Cold bootstrap every request.** No persistent worker mode (FrankenPHP-style) outside of TrueAsync.
-3. **Opcache not shared across processes.** Each worker fills its own opcache; preloading is possible but not primed by Unit.
+3. **Opcache not shared across processes.** Each worker fills its own opcache; preloading is primed by Unit via the `preload` config key (P3 shipped).
 4. **No JIT tuning defaults.** Users set `opcache.jit_buffer_size` etc. via `options` — Unit does nothing to help.
 5. **No per-target php.ini.** `options` are app-global, not target-scoped.
 6. **No status surface.** Unit doesn't expose opcache stats, interned-strings memory, accelerator hit rate, or per-request timing. PHP-FPM's `pm.status_path` equivalent is missing for PHP specifically.
@@ -151,7 +151,7 @@ Every roadmap item should update the status API under `/status/applications/<nam
 |---|------|--------|-------------|
 | P1 | ZTS thread-per-request worker pool | 2–3w | Near |
 | P2 | PHP status API (opcache/JIT/counters) | 1w | Near |
-| P3 | Preload/warmup hook | 3d | Near |
+| P3 | Preload/warmup hook | 3d | Shipped |
 | P4 | Persistent worker mode (Octane-style) | 4–6w | Mid |
 | P5 | Per-target ini / env | 1w | Mid |
 | P6 | Graceful code reload | 2w | Mid |

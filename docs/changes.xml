@@ -50,6 +50,13 @@ if building with njs, version 0.9.0 or later is now required.
 
 <change type="feature">
 <para>
+PHP application: new <literal>preload</literal> and <literal>warmup</literal>
+configuration keys for eager opcache priming at worker startup (roadmap P3).
+</para>
+</change>
+
+<change type="feature">
+<para>
 HTTP compression.
 </para>
 </change>

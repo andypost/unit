@@ -180,3 +180,9 @@ inside a chroot/rootfs-isolated Unit application.
 1. Run `ldd $(which php)` with PHP 8.5 and compare against the rootfs fixture contents
 2. Check `unit.log` for the full path that caused the segfault (needs core dump or `strace`)
 3. Check if `php 8.5 --define open_basedir=...` reproduces outside of Unit
+
+---
+
+## PHP preload/warmup follow-ups (P7)
+
+- P7 follow-up: on-demand warmup endpoint (POST /control/applications/<name>/warmup) + NXT_PORT_MSG_APP_WARMUP port RPC. Deferred from P3; see roadmap/plan-php-preload-warmup.md §"Shared with Scheduler / /run".

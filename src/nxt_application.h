@@ -62,6 +62,8 @@ typedef struct {
 typedef struct {
     nxt_conf_value_t           *targets;
     nxt_conf_value_t           *options;
+    nxt_conf_value_t           *preload;
+    nxt_conf_value_t           *warmup;
 } nxt_php_app_conf_t;
 
 

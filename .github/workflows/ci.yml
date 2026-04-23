@@ -355,15 +355,15 @@ jobs:
 
       - name: Install wasmtime c-api
         run: |
-          wget -qO- https://github.com/bytecodealliance/wasmtime/releases/download/v43.0.1/wasmtime-v43.0.1-x86_64-linux-c-api.tar.xz \
+          wget -qO- https://github.com/bytecodealliance/wasmtime/releases/download/v44.0.0/wasmtime-v44.0.0-x86_64-linux-c-api.tar.xz \
             | tar -xJf -
         if: steps.metadata.outputs.module == 'wasm'
 
       - name: Configure wasm
         run: |
           ./configure wasm \
-            --include-path=wasmtime-v43.0.1-x86_64-linux-c-api/include \
-            --lib-path=wasmtime-v43.0.1-x86_64-linux-c-api/lib
+            --include-path=wasmtime-v44.0.0-x86_64-linux-c-api/include \
+            --lib-path=wasmtime-v44.0.0-x86_64-linux-c-api/lib
         if: steps.metadata.outputs.module == 'wasm'
 
       - name: Make wasm

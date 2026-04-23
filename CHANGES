@@ -1,6 +1,9 @@
 
 Changes with FreeUnit 1.35.4                                     xx xxx 2026
 
+    *) Feature: PHP application: new preload and warmup configuration keys
+       for eager opcache priming at worker startup (roadmap P3).
+
     *) Bugfix: fix router process CPU spin and connection hang under port
        scanning load; CLOSE-WAIT sockets are now cleaned up properly on
        client FIN, idle connection queue iteration fixed, systemd file

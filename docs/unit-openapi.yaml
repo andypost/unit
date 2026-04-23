@@ -6958,6 +6958,38 @@ components:
                     description: "Filename of a `root`-based PHP script that
                       serves all requests to the target."
 
+            preload:
+              type: string
+              description: "Absolute path to a PHP script used for opcache
+                preloading (maps to the PHP `opcache.preload` ini directive).
+                Resolved inside the app's `working_directory` or
+                `isolation.rootfs`. Requires PHP 7.4+ and the opcache
+                extension. If the resolved `opcache.preload_user` would be
+                root, Unit skips the injection and emits a warning."
+
+            warmup:
+              type: array
+              items:
+                type: string
+              description: "List of PHP script paths to eagerly compile via
+                `opcache_compile_file()` when each worker starts, before any
+                request is served. Relative paths resolve against the first
+                target's root. Soft-fails per entry; a syntax error or
+                missing file logs a warning and skips only that entry."
+
+          example:
+            type: "php"
+            root: "/var/www/hot"
+            preload: "/var/www/hot/bootstrap/preload.php"
+            warmup:
+              - "/var/www/hot/src/Kernel.php"
+              - "/var/www/hot/src/Router.php"
+              - "vendor/autoload.php"
+            options:
+              admin:
+                opcache.enable: "1"
+                opcache.memory_consumption: "256"
+
     configApplicationPython:
       description: "Python application on Unit."
       allOf:

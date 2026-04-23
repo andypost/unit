@@ -249,3 +249,9 @@ Cluster of UNKNOWN/FEATURE/PERF in `src/java/**/websocket/` suggests the Java We
 | F. WASM async | D3 (body streaming) — rev the libunit body API once, both benefit |
 
 **First three merges to drain this list fast:** (1) drop EOL PHP/Python minors, (2) remove dead TLS backends, (3) land graceful shutdown in core. Each is self-contained and each deletes debt in multiple places.
+
+---
+
+## Cross-references
+
+- P3 PHP preload/warmup → see roadmap/plan-php-preload-warmup.md; PR #4 on branch claude/php-preload-warmup-EA2PX.

@@ -9,6 +9,7 @@
 #include "php_main.h"
 #include "php_variables.h"
 #include "ext/standard/php_standard.h"
+#include "zend_exceptions.h"
 
 #include <nxt_main.h>
 #include <nxt_router.h>
@@ -83,6 +84,17 @@ static nxt_int_t nxt_php_setup(nxt_task_t *task, nxt_process_t *process,
     nxt_common_app_conf_t *conf);
 static nxt_int_t nxt_php_start(nxt_task_t *task, nxt_process_data_t *data);
 static void nxt_php_cleanup_targets(void);
+#if (PHP_VERSION_ID >= 70400)
+static void nxt_php_build_ini_entries(nxt_task_t *task, nxt_php_app_conf_t *c,
+    char *workdir, nxt_str_t *user);
+#endif
+static void nxt_php_warmup_targets(nxt_task_t *task, nxt_php_app_conf_t *c);
+
+/* Buffer for dynamically synthesized ini entries (opcache.preload=...).
+ * Owned by this module; freed in nxt_php_cleanup_targets() after
+ * php_module_shutdown(). */
+static u_char  *nxt_php_ini_entries_buf;
+
 #if NXT_PHP_TRUEASYNC
 static nxt_int_t nxt_php_async_load_entrypoint(nxt_task_t *task, nxt_str_t *entrypoint);
 static bool nxt_php_activate_true_async(nxt_task_t *task);
@@ -457,6 +469,10 @@ nxt_php_setup(nxt_task_t *task, nxt_process_t *process,
         }
     }
 
+#if (PHP_VERSION_ID >= 70400)
+    nxt_php_build_ini_entries(task, c, conf->working_directory, &conf->user);
+#endif
+
     if (nxt_slow_path(nxt_php_startup(&nxt_php_sapi_module) == FAILURE)) {
         nxt_alert(task, "failed to initialize SAPI module and extension");
         return NXT_ERROR;
@@ -733,6 +749,8 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
             return NXT_ERROR;
         }
     }
+
+    nxt_php_warmup_targets(task, c);
 
     ret = nxt_unit_default_init(task, &php_init, conf);
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -1043,6 +1061,14 @@ nxt_php_cleanup_targets(void)
     nxt_free(nxt_php_targets);
     nxt_php_targets = NULL;
     nxt_php_targets_count = 0;
+
+    /* Free the preload ini_entries blob (if any) after
+     * php_module_shutdown() has consumed it. */
+    if (nxt_php_ini_entries_buf != NULL) {
+        nxt_free(nxt_php_ini_entries_buf);
+        nxt_php_ini_entries_buf = NULL;
+        nxt_php_sapi_module.ini_entries = NULL;
+    }
 }
 
 
@@ -1083,6 +1109,322 @@ nxt_php_set_ini_path(nxt_task_t *task, nxt_str_t *ini_path, char *workdir)
     nxt_php_sapi_module.php_ini_path_override = (char *) start;
 
     return NXT_OK;
+}
+
+
+#if (PHP_VERSION_ID >= 70400)
+
+static void
+nxt_php_build_ini_entries(nxt_task_t *task, nxt_php_app_conf_t *c,
+    char *workdir, nxt_str_t *user)
+{
+    size_t            path_len, user_len, wdlen, blob_len;
+    u_char            *path_buf, *p, *blob;
+    const char        *user_name;
+    char              uidbuf[32];
+    nxt_str_t         preload_str;
+    nxt_conf_value_t  *file_value;
+    struct passwd     *pw;
+
+    static const nxt_str_t  file_str = nxt_string("file");
+    static const char       prefix_preload[] = "opcache.preload=";
+    static const char       prefix_user[] = "opcache.preload_user=";
+
+    if (c->preload == NULL) {
+        return;
+    }
+
+    nxt_conf_get_string(c->preload, &preload_str);
+
+    if (preload_str.length == 0) {
+        return;
+    }
+
+    /* Resolve preload path relative to working_directory if not absolute;
+     * mirrors nxt_php_set_ini_path(). */
+    if (preload_str.start[0] == '/' || workdir == NULL) {
+        path_buf = nxt_malloc(preload_str.length + 1);
+        if (nxt_slow_path(path_buf == NULL)) {
+            return;
+        }
+
+        p = path_buf;
+
+    } else {
+        wdlen = nxt_strlen(workdir);
+
+        path_buf = nxt_malloc(wdlen + preload_str.length + 2);
+        if (nxt_slow_path(path_buf == NULL)) {
+            return;
+        }
+
+        p = path_buf;
+        p = nxt_cpymem(p, workdir, wdlen);
+
+        if (workdir[wdlen - 1] != '/') {
+            *p++ = '/';
+        }
+    }
+
+    p = nxt_cpymem(p, preload_str.start, preload_str.length);
+    *p = '\0';
+
+    path_len = p - path_buf;
+
+    /* Resolve preload_user. */
+    if (user != NULL && user->length > 0) {
+        user_name = (const char *) user->start;
+        user_len = user->length;
+
+    } else {
+        pw = getpwuid(getuid());
+        if (pw != NULL && pw->pw_name != NULL) {
+            user_name = pw->pw_name;
+            user_len = nxt_strlen(pw->pw_name);
+
+        } else {
+            (void) snprintf(uidbuf, sizeof(uidbuf), "%u",
+                            (unsigned) getuid());
+            user_name = uidbuf;
+            user_len = nxt_strlen(uidbuf);
+        }
+    }
+
+    /* Refuse root — PHP would hard-fail at startup. */
+    if (getuid() == 0
+        && (user_len == 4 && memcmp(user_name, "root", 4) == 0))
+    {
+        nxt_log(task, NXT_LOG_WARN,
+                "opcache.preload disabled: resolved user would be root");
+        nxt_free(path_buf);
+        return;
+    }
+
+    if (user != NULL && user->length > 0
+        && user->length == 4
+        && memcmp(user->start, "root", 4) == 0)
+    {
+        nxt_log(task, NXT_LOG_WARN,
+                "opcache.preload disabled: resolved user would be root");
+        nxt_free(path_buf);
+        return;
+    }
+
+    /* If no explicit user and effective uid is 0 refuse too. */
+    if ((user == NULL || user->length == 0) && getuid() == 0) {
+        nxt_log(task, NXT_LOG_WARN,
+                "opcache.preload disabled: resolved user would be root");
+        nxt_free(path_buf);
+        return;
+    }
+
+    /* Best-effort INFO when options.file is also present: our key wins. */
+    if (c->options != NULL) {
+        file_value = nxt_conf_get_object_member(c->options, &file_str, NULL);
+        if (file_value != NULL) {
+            nxt_log(task, NXT_LOG_INFO,
+                    "`preload` key overrides any `opcache.preload` "
+                    "in options.file");
+        }
+    }
+
+    blob_len = sizeof(prefix_preload) - 1 + path_len + 1
+             + sizeof(prefix_user) - 1 + user_len + 1
+             + 1;
+
+    blob = nxt_malloc(blob_len);
+    if (nxt_slow_path(blob == NULL)) {
+        nxt_free(path_buf);
+        return;
+    }
+
+    p = blob;
+    p = nxt_cpymem(p, prefix_preload, sizeof(prefix_preload) - 1);
+    p = nxt_cpymem(p, path_buf, path_len);
+    *p++ = '\n';
+    p = nxt_cpymem(p, prefix_user, sizeof(prefix_user) - 1);
+    p = nxt_cpymem(p, user_name, user_len);
+    *p++ = '\n';
+    *p = '\0';
+
+    nxt_free(path_buf);
+
+    /* Free any prior blob from a previous setup (re-init path). */
+    if (nxt_php_ini_entries_buf != NULL) {
+        nxt_free(nxt_php_ini_entries_buf);
+    }
+
+    nxt_php_ini_entries_buf = blob;
+    nxt_php_sapi_module.ini_entries = (char *) nxt_php_ini_entries_buf;
+}
+
+#endif /* PHP_VERSION_ID >= 70400 */
+
+
+static void
+nxt_php_warmup_targets(nxt_task_t *task, nxt_php_app_conf_t *c)
+{
+    void        *compile_ptr;
+    u_char      * volatile path_buf;
+    u_char      *p;
+    size_t      rootlen, entry_len, buf_size;
+    uint32_t    i, n;
+    char        cwd[PATH_MAX];
+    int         have_cwd, chdired;
+    zval        fn_param, fn_retval;
+    nxt_str_t   entry;
+    nxt_str_t   *root;
+    zend_function         *compile_fn;
+    zend_fcall_info       fci;
+    zend_fcall_info_cache fcc;
+    nxt_conf_value_t      *element;
+
+    static const nxt_str_t  compile_name = nxt_string("opcache_compile_file");
+
+    if (c->warmup == NULL) {
+        return;
+    }
+
+    n = nxt_conf_array_elements_count(c->warmup);
+    if (n == 0) {
+        return;
+    }
+
+    compile_ptr = zend_hash_str_find_ptr(CG(function_table),
+                                         (const char *) compile_name.start,
+                                         compile_name.length);
+    if (compile_ptr == NULL) {
+        nxt_log(task, NXT_LOG_WARN,
+                "warmup: opcache_compile_file not found — opcache disabled? "
+                "skipping warmup list");
+        return;
+    }
+
+    compile_fn = (zend_function *) compile_ptr;
+
+    root = NULL;
+    if (nxt_php_targets != NULL && nxt_php_targets_count > 0) {
+        root = &nxt_php_targets[0].root;
+    }
+
+    /* Save cwd once; restore at the bottom. */
+    have_cwd = (getcwd(cwd, sizeof(cwd)) != NULL) ? 1 : 0;
+
+    chdired = 0;
+    if (root != NULL && root->start != NULL && root->length > 0) {
+        /* root is NUL-terminated (allocated by nxt_realpath). */
+        if (chdir((const char *) root->start) == 0) {
+            chdired = 1;
+        }
+    }
+
+    /* opcache_compile_file() executes PHP bytecode and needs an active
+     * request context (EG/SG state, executor globals). Wrap the whole
+     * warmup loop in a minimal request-startup so the compile actually
+     * primes the opcache instead of silently returning FALSE. */
+    SG(server_context) = NULL;
+    SG(request_info).request_method = NULL;
+    SG(request_info).query_string = NULL;
+    SG(request_info).content_type = NULL;
+    SG(request_info).content_length = 0;
+    SG(sapi_headers).http_response_code = 200;
+
+    if (php_request_startup() == FAILURE) {
+        nxt_log(task, NXT_LOG_WARN,
+                "warmup: php_request_startup() failed, skipping list");
+        if (chdired && have_cwd && chdir(cwd) != 0) {
+            /* best-effort restore; nothing sensible to do on failure */
+        }
+        return;
+    }
+
+    for (i = 0; i < n; i++) {
+        element = nxt_conf_get_array_element(c->warmup, i);
+        if (element == NULL) {
+            continue;
+        }
+
+        nxt_conf_get_string(element, &entry);
+        if (entry.length == 0) {
+            continue;
+        }
+
+        /* Build absolute path: if already absolute, use verbatim. Else
+         * prepend first target's root. */
+        if (entry.start[0] == '/' || root == NULL || root->length == 0) {
+            buf_size = entry.length + 1;
+            path_buf = nxt_malloc(buf_size);
+            if (path_buf == NULL) {
+                continue;
+            }
+
+            p = nxt_cpymem(path_buf, entry.start, entry.length);
+            *p = '\0';
+            entry_len = entry.length;
+
+        } else {
+            rootlen = root->length;
+            buf_size = rootlen + entry.length + 2;
+            path_buf = nxt_malloc(buf_size);
+            if (path_buf == NULL) {
+                continue;
+            }
+
+            p = nxt_cpymem(path_buf, root->start, rootlen);
+            if (rootlen == 0 || root->start[rootlen - 1] != '/') {
+                *p++ = '/';
+            }
+            p = nxt_cpymem(p, entry.start, entry.length);
+            *p = '\0';
+            entry_len = p - path_buf;
+        }
+
+        ZVAL_STRINGL(&fn_param, (const char *) path_buf, entry_len);
+        ZVAL_UNDEF(&fn_retval);
+
+        memset(&fci, 0, sizeof(fci));
+        memset(&fcc, 0, sizeof(fcc));
+
+        fci.size = sizeof(fci);
+        fci.retval = &fn_retval;
+        fci.param_count = 1;
+        fci.params = &fn_param;
+        ZVAL_UNDEF(&fci.function_name);
+
+        fcc.function_handler = compile_fn;
+
+        zend_try {
+            if (zend_call_function(&fci, &fcc) != SUCCESS
+                || Z_TYPE(fn_retval) == IS_FALSE)
+            {
+                nxt_log(task, NXT_LOG_WARN,
+                        "warmup: failed to compile \"%s\"", path_buf);
+            }
+        } zend_catch {
+            nxt_log(task, NXT_LOG_WARN,
+                    "warmup: bailout while compiling \"%s\" — skipped",
+                    path_buf);
+            if (EG(exception) != NULL) {
+                zend_clear_exception();
+            }
+        } zend_end_try();
+
+        zval_ptr_dtor(&fn_param);
+        if (Z_TYPE(fn_retval) != IS_UNDEF) {
+            zval_ptr_dtor(&fn_retval);
+        }
+
+        nxt_free(path_buf);
+    }
+
+    php_request_shutdown(NULL);
+
+    if (chdired && have_cwd) {
+        if (chdir(cwd) != 0) {
+            nxt_log(task, NXT_LOG_WARN,
+                    "warmup: failed to restore cwd to \"%s\"", cwd);
+        }
+    }
 }
 
 

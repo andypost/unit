@@ -245,6 +245,18 @@ static nxt_conf_map_t  nxt_php_app_conf[] = {
         NXT_CONF_MAP_PTR,
         offsetof(nxt_common_app_conf_t, u.php.options),
     },
+
+    {
+        nxt_string("preload"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, u.php.preload),
+    },
+
+    {
+        nxt_string("warmup"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, u.php.warmup),
+    },
 };
 
 

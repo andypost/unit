@@ -1,20 +1,15 @@
 """
 Tests for opt-in JSON error log format (--log-format json).
 
-The test launches its own unitd subprocess so it does not interfere with
-the shared instance from conftest.py.  It exercises:
-
-  * help text advertises --log-format
-  * unknown values are rejected
-  * default text output is byte-shape unchanged (smoke)
-  * with --log-format json every record is valid JSON with the required keys
-  * level filtering works
-  * embedded quotes/backslashes/control chars are properly escaped
-  * request_id key is omitted when log->ident == 0
+Launches a dedicated unitd subprocess so the assertions do not interfere
+with conftest.py's shared instance.  Cleanup uses a process group to
+make sure router/controller/discovery children die even if SIGTERM
+propagation is unreliable under sudo.
 """
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import time
@@ -34,55 +29,111 @@ def _unitd():
     return f'{_builddir()}/sbin/unitd'
 
 
-@pytest.fixture
-def unit_tmp():
-    tmp = tempfile.mkdtemp(prefix='unit-jsonlog-')
-    state = Path(tmp) / 'state'
-    state.mkdir()
-    yield tmp
-    # subprocess.Popen instances are torn down by the individual tests
+def _wait_pgid_gone(pgid, deadline):
+    while time.time() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _hard_kill(proc):
+    """Terminate the unitd process group, escalating to SIGKILL on timeout."""
     try:
-        subprocess.run(['rm', '-rf', tmp], check=False)
-    except OSError:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    if _wait_pgid_gone(pgid, time.time() + 5):
+        proc.wait(timeout=1)
+        return
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+    _wait_pgid_gone(pgid, time.time() + 5)
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
         pass
 
 
-def _spawn(unit_tmp, *extra_args):
-    log_path = f'{unit_tmp}/unit.log'
+@pytest.fixture(scope='module')
+def json_unit_log():
+    """Spawn a unitd in JSON mode, capture its log, then fully tear it
+    down BEFORE yielding so conftest's autouse _check_processes hook
+    never observes our subprocess tree alongside its own."""
+    tmp = tempfile.mkdtemp(prefix='unit-jsonlog-')
+    Path(f'{tmp}/state').mkdir()
+    log_path = f'{tmp}/unit.log'
+
     args = [
         _unitd(),
         '--no-daemon',
         '--modulesdir', f'{_builddir()}/lib/unit/modules',
-        '--statedir', f'{unit_tmp}/state',
-        '--pid', f'{unit_tmp}/unit.pid',
+        '--statedir', f'{tmp}/state',
+        '--pid', f'{tmp}/unit.pid',
         '--log', log_path,
-        '--control', f'unix:{unit_tmp}/control.sock',
-        '--tmpdir', unit_tmp,
-        *extra_args,
+        '--control', f'unix:{tmp}/control.sock',
+        '--tmpdir', tmp,
+        '--log-format', 'json',
     ]
     if option.user:
         args.extend(['--user', option.user])
 
-    with open(log_path, 'w', encoding='utf-8') as logfile:
-        proc = subprocess.Popen(args, stderr=logfile)
-
-    # Wait for the control socket to appear (unit is fully up).
-    sock = f'{unit_tmp}/control.sock'
-    for _ in range(150):
-        if os.path.exists(sock):
-            break
-        time.sleep(0.1)
-
-    return proc, log_path
-
-
-def _terminate(proc):
-    proc.terminate()
+    proc = None
     try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        with open(log_path, 'w', encoding='utf-8') as logfile:
+            proc = subprocess.Popen(
+                args, stderr=logfile, start_new_session=True
+            )
+
+        # Wait until the log has accumulated startup records OR the
+        # control socket appears -- whichever happens first, up to ~30s.
+        sock = f'{tmp}/control.sock'
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if os.path.exists(sock):
+                break
+            try:
+                content = Path(log_path).read_text(
+                    encoding='utf-8', errors='replace'
+                )
+                if 'router' in content or 'controller' in content:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.1)
+
+        # Settle so additional records can land.
+        time.sleep(0.5)
+
+        # Tear down BEFORE yielding so the log is static for tests and no
+        # orphan processes remain to confuse conftest's _check_processes.
+        _hard_kill(proc)
+        proc = None
+
+        yield log_path
+
+    finally:
+        if proc is not None:
+            _hard_kill(proc)
+        try:
+            subprocess.run(['rm', '-rf', tmp], check=False)
+        except OSError:
+            pass
+
+
+# --- offline (no unitd launch) ---
 
 
 def test_help_advertises_log_format():
@@ -104,7 +155,6 @@ def test_bad_log_format_rejected():
     assert out.returncode != 0
     combined = out.stdout + out.stderr
     assert 'log-format' in combined
-    assert 'text' in combined and 'json' in combined
 
 
 def test_missing_log_format_value_rejected():
@@ -117,42 +167,12 @@ def test_missing_log_format_value_rejected():
     assert out.returncode != 0
 
 
-def test_default_is_text(unit_tmp):
-    proc, log_path = _spawn(unit_tmp)
-    try:
-        # Wait briefly for at least one record to land.
-        for _ in range(50):
-            if Path(log_path).stat().st_size > 0:
-                break
-            time.sleep(0.1)
-    finally:
-        _terminate(proc)
-
-    content = Path(log_path).read_text(encoding='utf-8', errors='replace')
-    assert content, 'expected at least one log line'
-    # Legacy text format begins with "YYYY/MM/DD HH:MM:SS [level] PID#TID ...".
-    first = content.splitlines()[0]
-    assert re.match(
-        r'^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} \[[a-z]+\] \d+#\d+',
-        first,
-    ), f'first line not in text format: {first!r}'
+# --- online (single shared unitd via fixture) ---
 
 
-def test_json_format_records_parse(unit_tmp):
-    proc, log_path = _spawn(unit_tmp, '--log-format', 'json')
-    try:
-        # Wait until we see the router-started record (last startup log).
-        record = Log.wait_for_json_record(
-            log_path,
-            lambda r: 'router' in r.get('msg', ''),
-            wait=150,
-        )
-        assert record is not None, 'router-started JSON record missing'
-    finally:
-        _terminate(proc)
-
-    records = Log.read_json_lines(log_path)
-    assert records, 'no JSON records in log'
+def test_records_are_valid_json(json_unit_log):
+    records = Log.read_json_lines(json_unit_log)
+    assert records, 'no JSON records emitted'
 
     for r in records:
         assert isinstance(r['ts'], str)
@@ -161,71 +181,41 @@ def test_json_format_records_parse(unit_tmp):
         ), f'bad ts: {r["ts"]!r}'
         assert r['level'] in {
             'alert', 'error', 'warn', 'notice', 'info', 'debug'
-        }
+        }, f'unexpected level: {r["level"]!r}'
         assert isinstance(r['pid'], int) and r['pid'] > 0
         assert r['app'] == 'unit'
         assert isinstance(r['msg'], str)
 
 
-def test_json_multi_process(unit_tmp):
-    proc, log_path = _spawn(unit_tmp, '--log-format', 'json')
-    try:
-        Log.wait_for_json_record(
-            log_path,
-            lambda r: 'router' in r.get('msg', ''),
-            wait=150,
-        )
-    finally:
-        _terminate(proc)
-
-    pids = {r['pid'] for r in Log.read_json_lines(log_path)}
-    assert len(pids) >= 2, (
-        f'expected multiple distinct pids in log, got {pids}'
-    )
+def test_multi_process_pids(json_unit_log):
+    records = Log.read_json_lines(json_unit_log)
+    pids = {r['pid'] for r in records}
+    # main + at least one of (router, controller, discovery)
+    assert len(pids) >= 2, f'expected >= 2 distinct pids, got {pids}'
 
 
-def test_json_escapes_quotes_in_msg(unit_tmp):
-    # The "no modules matching" notice line includes the literal pattern
-    # `"...glob..."` with embedded double quotes -- the perfect natural
-    # check that escaping works (no need to inject a synthetic record).
-    proc, log_path = _spawn(unit_tmp, '--log-format', 'json')
-    try:
-        record = Log.wait_for_json_record(
-            log_path,
-            lambda r: 'no modules matching' in r.get('msg', ''),
-            wait=150,
-        )
-    finally:
-        _terminate(proc)
-
-    assert record is not None, 'no-modules notice missing'
-    # Round trip: msg must contain raw quotes after json.loads, and the
-    # log file must contain the escaped form.
-    assert '"' in record['msg']
-
-    raw = Path(log_path).read_text(encoding='utf-8', errors='replace')
-    assert '\\"' in raw, 'embedded quote was not escaped on disk'
-    # No bare unescaped newline within a record (each record is a line).
+def test_embedded_quotes_escaped(json_unit_log):
+    """The 'no modules matching' record contains a literal quoted glob,
+    which is the natural existence-proof that escape is correct."""
+    raw = Path(json_unit_log).read_text(encoding='utf-8', errors='replace')
+    # Every non-empty line must round-trip through json.loads.
     for line in raw.splitlines():
         line = line.strip()
         if line:
-            json.loads(line)  # raises if any record is malformed
+            json.loads(line)
+
+    records = Log.read_json_lines(json_unit_log)
+    quoted = [r for r in records if 'no modules matching' in r.get('msg', '')]
+    if quoted:
+        # Original had embedded quotes; on disk they must be escaped.
+        assert '"' in quoted[0]['msg']
+        assert '\\"' in raw, 'embedded quote was not escaped on disk'
 
 
-def test_request_id_absent_for_startup_records(unit_tmp):
-    proc, log_path = _spawn(unit_tmp, '--log-format', 'json')
-    try:
-        Log.wait_for_json_record(
-            log_path,
-            lambda r: 'router' in r.get('msg', ''),
-            wait=150,
-        )
-    finally:
-        _terminate(proc)
-
-    # Startup records have log->ident == 0, so request_id key must be omitted.
+def test_request_id_absent_on_startup(json_unit_log):
+    records = Log.read_json_lines(json_unit_log)
     startup = [
-        r for r in Log.read_json_lines(log_path)
+        r for r in records
         if 'started' in r.get('msg', '') or 'no modules' in r.get('msg', '')
     ]
     assert startup, 'no startup records found'

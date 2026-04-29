@@ -17,7 +17,8 @@ static u_char *nxt_log_debug_time(u_char *buf, nxt_realtime_t *now,
 static nxt_time_string_t  nxt_log_iso_time_cache;
 static u_char *nxt_log_iso_time(u_char *buf, nxt_realtime_t *now,
     struct tm *tm, size_t size, const char *format);
-static u_char *nxt_log_json_escape(u_char *dst, const u_char *src, size_t size);
+static u_char *nxt_log_json_escape(u_char *dst, u_char *end,
+    const u_char *src, size_t size);
 
 
 void nxt_cdecl
@@ -166,28 +167,40 @@ nxt_log_iso_time(u_char *buf, nxt_realtime_t *now, struct tm *tm, size_t size,
 
 /*
  * Escape a UTF-8 string for embedding inside a JSON string literal.
- * Worst-case expansion is six bytes per input byte ("\u00XX") so callers
- * must size the destination buffer accordingly.  Logic mirrors
- * nxt_conf_json_escape() in src/nxt_conf.c so JSON output stays consistent
- * with the access-log JSON formatter.
+ * Stops cleanly at `end` so the caller can rely on never overflowing,
+ * even on pathological input (each escaped control char can expand to
+ * six bytes "\u00XX").  Logic mirrors nxt_conf_json_escape() in
+ * src/nxt_conf.c so JSON output stays consistent with the access-log
+ * JSON formatter.
  */
 static u_char *
-nxt_log_json_escape(u_char *dst, const u_char *src, size_t size)
+nxt_log_json_escape(u_char *dst, u_char *end, const u_char *src, size_t size)
 {
     u_char  ch;
 
-    while (size) {
-        ch = *src++;
+    while (size != 0 && dst < end) {
+        ch = *src;
 
         if (ch > 0x1F) {
 
             if (ch == '\\' || ch == '"') {
+                if (dst + 2 > end) {
+                    break;
+                }
                 *dst++ = '\\';
+
+            } else if (dst + 1 > end) {
+                break;
             }
 
             *dst++ = ch;
 
         } else {
+            /* Worst case "\u00XX" needs six bytes. */
+            if (dst + 6 > end) {
+                break;
+            }
+
             *dst++ = '\\';
 
             switch (ch) {
@@ -221,6 +234,7 @@ nxt_log_json_escape(u_char *dst, const u_char *src, size_t size)
             }
         }
 
+        src++;
         size--;
     }
 
@@ -231,17 +245,21 @@ nxt_log_json_escape(u_char *dst, const u_char *src, size_t size)
 void nxt_cdecl
 nxt_log_json_handler(nxt_uint_t level, nxt_log_t *log, const char *fmt, ...)
 {
-    u_char        *p, *q, *qend;
+    u_char        *p, *q, *qend, *qmax;
     size_t        msg_len;
     va_list       args;
     nxt_thread_t  *thr;
     u_char        raw[NXT_MAX_ERROR_STR];
     /*
-     * JSON line buffer.  Worst-case msg expansion is 6x; reserve room
-     * for the framing fields ("ts", "level", "pid", "app", "request_id"
-     * keys plus quotes/commas) on top.
+     * JSON line buffer.  Sized for one fully-populated text-format
+     * record plus framing overhead -- the escape pass below truncates
+     * cleanly when expansion would otherwise overflow.  Total stack
+     * footprint stays under ~5 KiB even on fibers.
      */
-    u_char        out[NXT_MAX_ERROR_STR * 6 + 256];
+    u_char        out[NXT_MAX_ERROR_STR + 256];
+    /* Worst-case trailer: closing msg quote + ",\"request_id\":<u32>}\n". */
+    static const size_t  trailer_max =
+        sizeof("\",\"request_id\":4294967295}\n") - 1;
 
     thr = nxt_thread();
 
@@ -257,20 +275,21 @@ nxt_log_json_handler(nxt_uint_t level, nxt_log_t *log, const char *fmt, ...)
 
     msg_len = p - raw;
 
-    /* Build the JSON line into out[]. */
+    /* Build the JSON line into out[].  qmax preserves room for the
+     * trailer so a successful nxt_log_json_escape() leaves enough
+     * space for the closing fields no matter how the message escapes. */
     q = out;
     qend = out + sizeof(out);
+    qmax = qend - trailer_max;
 
     q = nxt_cpymem(q, "{\"ts\":\"", 7);
     q = nxt_thread_time_string(thr, &nxt_log_iso_time_cache, q);
 
-    q = nxt_cpymem(q, "\",\"level\":\"", 11);
-    q = nxt_cpymem(q, nxt_log_levels[level].start, nxt_log_levels[level].length);
+    q = nxt_sprintf(q, qmax,
+                    "\",\"level\":\"%V\",\"pid\":%PI,\"app\":\"unit\",\"msg\":\"",
+                    &nxt_log_levels[level], nxt_pid);
 
-    q = nxt_sprintf(q, qend, "\",\"pid\":%PI,\"app\":\"unit\",\"msg\":\"",
-                    nxt_pid);
-
-    q = nxt_log_json_escape(q, raw, msg_len);
+    q = nxt_log_json_escape(q, qmax, raw, msg_len);
 
     *q++ = '"';
 

@@ -55,6 +55,7 @@ struct nxt_runtime_s {
     uint8_t                batch;
     uint8_t                status;
     uint8_t                is_pid_isolated;
+    uint8_t                log_format;
 
     const char             *engine;
     uint32_t               engine_connections;
@@ -138,6 +139,8 @@ nxt_file_t *nxt_runtime_log_file_add(nxt_runtime_t *rt, nxt_str_t *name);
 
 /* STUB */
 void nxt_cdecl nxt_log_time_handler(nxt_uint_t level, nxt_log_t *log,
+    const char *fmt, ...);
+void nxt_cdecl nxt_log_json_handler(nxt_uint_t level, nxt_log_t *log,
     const char *fmt, ...);
 
 void nxt_stream_connection_init(nxt_task_t *task, void *obj, void *data);

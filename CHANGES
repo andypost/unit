@@ -1,6 +1,12 @@
 
 Changes with FreeUnit 1.35.4                                     xx xxx 2026
 
+    *) Feature: opt-in JSON format for the unit error log via the
+       "--log-format json" command-line flag.  Each record is emitted as a
+       single line with stable fields {ts, level, pid, app, msg,
+       request_id}; "request_id" is omitted on records with no
+       connection-scoped ident.  The default text format is unchanged.
+
     *) Bugfix: fix router process CPU spin and connection hang under port
        scanning load; CLOSE-WAIT sockets are now cleaned up properly on
        client FIN, idle connection queue iteration fixed, systemd file

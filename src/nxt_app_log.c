@@ -242,6 +242,26 @@ nxt_log_json_escape(u_char *dst, u_char *end, const u_char *src, size_t size)
 }
 
 
+/*
+ * The optional request_id field at the tail of the JSON line.  The
+ * format string and the byte-count bound below are derived from the
+ * same literal so that renaming the key (or any other shape change)
+ * touches both the bound and the emit site at once.  uint32_t prints
+ * to at most 10 decimal characters.
+ */
+#define NXT_LOG_JSON_REQID_KEY  ",\"request_id\":"
+#define NXT_LOG_JSON_REQID_FMT  NXT_LOG_JSON_REQID_KEY "%uD"
+#define NXT_LOG_JSON_REQID_MAX  (sizeof(NXT_LOG_JSON_REQID_KEY) - 1 + 10)
+/*
+ * Trailer bytes reserved at the end of out[] beyond the message body:
+ *   1  closing quote of "msg"
+ *   .  optional request_id field
+ *   1  closing brace of the object
+ *   1  trailing newline
+ */
+#define NXT_LOG_JSON_TRAILER_MAX  (1 + NXT_LOG_JSON_REQID_MAX + 1 + 1)
+
+
 void nxt_cdecl
 nxt_log_json_handler(nxt_uint_t level, nxt_log_t *log, const char *fmt, ...)
 {
@@ -257,9 +277,6 @@ nxt_log_json_handler(nxt_uint_t level, nxt_log_t *log, const char *fmt, ...)
      * footprint stays under ~5 KiB even on fibers.
      */
     u_char        out[NXT_MAX_ERROR_STR + 256];
-    /* Worst-case trailer: closing msg quote + ",\"request_id\":<u32>}\n". */
-    static const size_t  trailer_max =
-        sizeof("\",\"request_id\":4294967295}\n") - 1;
 
     thr = nxt_thread();
 
@@ -280,7 +297,7 @@ nxt_log_json_handler(nxt_uint_t level, nxt_log_t *log, const char *fmt, ...)
      * space for the closing fields no matter how the message escapes. */
     q = out;
     qend = out + sizeof(out);
-    qmax = qend - trailer_max;
+    qmax = qend - NXT_LOG_JSON_TRAILER_MAX;
 
     q = nxt_cpymem(q, "{\"ts\":\"", 7);
     q = nxt_thread_time_string(thr, &nxt_log_iso_time_cache, q);
@@ -294,7 +311,7 @@ nxt_log_json_handler(nxt_uint_t level, nxt_log_t *log, const char *fmt, ...)
     *q++ = '"';
 
     if (log->ident != 0) {
-        q = nxt_sprintf(q, qend, ",\"request_id\":%uD", log->ident);
+        q = nxt_sprintf(q, qend, NXT_LOG_JSON_REQID_FMT, log->ident);
     }
 
     *q++ = '}';

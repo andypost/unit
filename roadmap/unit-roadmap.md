@@ -157,6 +157,9 @@ See [unit-arm32.md](unit-arm32.md). Active CI failure today. Three-stage fix:
 
 - `unit.log` is free-form text. Add `log_format: "json"` option with stable field names (`ts`, `level`, `pid`, `app`, `msg`, `request_id`).
 - **Effort:** ~1 week.
+- **Status:** v1 landed — opt-in JSON via `--log-format json` CLI flag, text default unchanged.
+  Follow-ups: `settings.log.format` config schema, distributed `request_id` propagation,
+  per-process `app` role string ("main"/"router"/"controller").
 
 ### D9. systemd socket activation
 

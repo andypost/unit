@@ -16,6 +16,10 @@
 #define NXT_LOG_DEBUG      5
 
 
+#define NXT_LOG_FORMAT_TEXT  0
+#define NXT_LOG_FORMAT_JSON  1
+
+
 #define NXT_MAX_ERROR_STR  2048
 
 

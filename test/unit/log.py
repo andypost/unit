@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sys
@@ -111,3 +112,26 @@ class Log:
                 time.sleep(0.1)
 
         return found
+
+    @staticmethod
+    def read_json_lines(path):
+        records = []
+        with open(path, 'r', encoding='utf-8', errors='replace') as file:
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+        return records
+
+    @staticmethod
+    def wait_for_json_record(path, predicate, wait=150):
+        for _ in range(wait):
+            try:
+                for record in Log.read_json_lines(path):
+                    if predicate(record):
+                        return record
+            except (OSError, json.JSONDecodeError):
+                pass
+            time.sleep(0.1)
+        return None

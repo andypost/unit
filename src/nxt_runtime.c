@@ -785,6 +785,7 @@ nxt_runtime_conf_init(nxt_task_t *task, nxt_runtime_t *rt)
     rt->group = NXT_GROUP;
     rt->pid = NXT_PID;
     rt->log = NXT_LOG;
+    rt->log_format = NXT_LOG_FORMAT_TEXT;
     rt->modules = NXT_MODULESDIR;
     rt->state = NXT_STATEDIR;
     rt->control = NXT_CONTROL_SOCK;
@@ -794,6 +795,10 @@ nxt_runtime_conf_init(nxt_task_t *task, nxt_runtime_t *rt)
 
     if (nxt_runtime_conf_read_cmd(task, rt) != NXT_OK) {
         return NXT_ERROR;
+    }
+
+    if (rt->log_format == NXT_LOG_FORMAT_JSON) {
+        nxt_main_log.handler = nxt_log_json_handler;
     }
 
     if (nxt_capability_set(task, &rt->capabilities) != NXT_OK) {
@@ -964,6 +969,10 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
     static const char  no_group[] = "option \"--group\" requires group name\n";
     static const char  no_pid[] = "option \"--pid\" requires filename\n";
     static const char  no_log[] = "option \"--log\" requires filename\n";
+    static const char  no_log_format[] =
+                       "option \"--log-format\" requires \"text\" or \"json\"\n";
+    static const char  bad_log_format[] =
+                       "option \"--log-format\" accepts \"text\" or \"json\" only\n";
     static const char  no_modules[] =
                        "option \"--modulesdir\" requires directory\n";
     static const char  no_state[] =
@@ -1000,6 +1009,9 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
         "\n"
         "  --log FILE           set log filename\n"
         "                       default: \"" NXT_LOG "\"\n"
+        "\n"
+        "  --log-format FMT     log format: \"text\" or \"json\"\n"
+        "                       default: \"text\"\n"
         "\n"
         "  --modulesdir DIR     set modules directory name\n"
         "                       default: \"" NXT_MODULESDIR "\"\n"
@@ -1133,6 +1145,28 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
             p = *argv++;
 
             rt->log = p;
+
+            continue;
+        }
+
+        if (nxt_strcmp(p, "--log-format") == 0) {
+            if (*argv == NULL) {
+                write(STDERR_FILENO, no_log_format, nxt_length(no_log_format));
+                return NXT_ERROR;
+            }
+
+            p = *argv++;
+
+            if (nxt_strcmp(p, "text") == 0) {
+                rt->log_format = NXT_LOG_FORMAT_TEXT;
+
+            } else if (nxt_strcmp(p, "json") == 0) {
+                rt->log_format = NXT_LOG_FORMAT_JSON;
+
+            } else {
+                write(STDERR_FILENO, bad_log_format, nxt_length(bad_log_format));
+                return NXT_ERROR;
+            }
 
             continue;
         }

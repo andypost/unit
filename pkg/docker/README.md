@@ -4,6 +4,56 @@ This directory contains Dockerfiles for all FreeUnit language variants and
 a helper script (`build-local.sh`) for building them locally — mirroring
 the behavior of `.github/workflows/docker.yml`.
 
+## Security: CVE-2026-31431 (AF_ALG privilege escalation)
+
+All FreeUnit images ship `/usr/share/unit/seccomp-no-af-alg.json` — a seccomp
+profile that blocks `socket(AF_ALG, ...)` (domain 38), mitigating kernel
+privilege escalation via the `algif_aead` / `AF_ALG` interface.
+
+**Note:** the profile uses `defaultAction: SCMP_ACT_ALLOW` with explicit deny
+rules. This is intentional — libseccomp ORs multiple `NE` conditions on the
+same argument index, making an `ERRNO`-default + `NE`-allowlist approach
+unreliable for blocking specific socket domains. Do not change to
+`SCMP_ACT_ERRNO` without re-running `test/security/seccomp/test-af-alg.sh`.
+
+Apply at runtime (path must be on the **host** filesystem):
+
+```bash
+# Option 1: use the profile from this repo directly
+docker run --security-opt seccomp=pkg/docker/seccomp-no-af-alg.json \
+    ghcr.io/freeunitorg/freeunit:latest-php8.4
+
+# Option 2: extract from a pulled image
+CNAME=$(docker create --rm ghcr.io/freeunitorg/freeunit:latest-minimal)
+docker cp "$CNAME":/usr/share/unit/seccomp-no-af-alg.json ./seccomp-no-af-alg.json
+docker rm "$CNAME"
+docker run --security-opt seccomp=./seccomp-no-af-alg.json \
+    ghcr.io/freeunitorg/freeunit:latest-php8.4
+```
+
+Verify the profile is active (AF_ALG socket must be denied):
+
+```bash
+# Should exit with "Operation not permitted" — confirms AF_ALG is blocked
+docker run --rm --security-opt seccomp=pkg/docker/seccomp-no-af-alg.json \
+    ghcr.io/freeunitorg/freeunit:latest-minimal \
+    python3 -c "import socket; socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET)"
+# Expected: PermissionError: [Errno 1] Operation not permitted
+
+# Normal TCP socket must still work — confirms no regression
+docker run --rm --security-opt seccomp=pkg/docker/seccomp-no-af-alg.json \
+    ghcr.io/freeunitorg/freeunit:latest-minimal \
+    python3 -c "import socket; s = socket.socket(); s.close(); print('OK')"
+# Expected: OK
+```
+
+Host-level workaround (unpatched kernels):
+
+```bash
+echo "install algif_aead /bin/false" | sudo tee /etc/modprobe.d/disable-algif.conf
+sudo rmmod algif_aead 2>/dev/null || true
+```
+
 ## Prerequisites (Ubuntu 24.04 LTS)
 
 ### Docker Engine

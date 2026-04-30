@@ -1,0 +1,34 @@
+name: seccomp-test
+
+on:
+  push:
+    paths:
+      - 'pkg/docker/seccomp-no-af-alg.json'
+      - 'pkg/docker/Dockerfile.*'
+      - 'test/security/seccomp/**'
+  pull_request:
+    paths:
+      - 'pkg/docker/seccomp-no-af-alg.json'
+      - 'pkg/docker/Dockerfile.*'
+      - 'test/security/seccomp/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  seccomp-af-alg:
+    name: Verify AF_ALG seccomp mitigation
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull test image
+        run: docker pull python:3.13-slim-trixie
+
+      - name: Validate JSON profile
+        run: python3 -m json.tool pkg/docker/seccomp-no-af-alg.json > /dev/null
+
+      - name: Run seccomp tests
+        run: bash test/security/seccomp/test-af-alg.sh python:3.13-slim-trixie

@@ -30,5 +30,11 @@ jobs:
       - name: Validate JSON profile
         run: python3 -m json.tool pkg/docker/seccomp-no-af-alg.json > /dev/null
 
-      - name: Run seccomp tests
+      - name: Run seccomp tests (python base image)
         run: bash test/security/seccomp/test-af-alg.sh python:3.13-slim-trixie
+
+      - name: Pull FreeUnit python3.13-slim image
+        run: docker pull ghcr.io/freeunitorg/freeunit:latest-python3.13-slim
+
+      - name: Run seccomp tests (FreeUnit image)
+        run: bash test/security/seccomp/test-af-alg.sh ghcr.io/freeunitorg/freeunit:latest-python3.13-slim

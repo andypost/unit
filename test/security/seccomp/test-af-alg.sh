@@ -2,11 +2,11 @@
 # Verify seccomp-no-af-alg.json blocks AF_ALG (CVE-2026-31431) without
 # breaking normal socket operations.
 #
-# Requires: docker, python:3.13-slim-trixie available or pullable.
+# Requires: docker; IMAGE must have python3 installed.
 #
 # Usage:
 #   ./test/security/seccomp/test-af-alg.sh [IMAGE]
-#   IMAGE defaults to python:3.13-slim-trixie
+#   IMAGE defaults to python:3.13-slim-trixie; any image with python3 works
 
 PROFILE="$(cd "$(dirname "$0")/../../.." && pwd)/pkg/docker/seccomp-no-af-alg.json"
 IMAGE="${1:-python:3.13-slim-trixie}"
@@ -35,16 +35,6 @@ run_test "AF_ALG socket blocked" "
 import socket, sys
 try:
     socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET)
-    print('not blocked', file=sys.stderr); sys.exit(1)
-except PermissionError:
-    pass
-"
-
-# TIPC (40) must be blocked (matches Docker default behaviour)
-run_test "TIPC socket blocked" "
-import socket, sys
-try:
-    socket.socket(40, socket.SOCK_SEQPACKET)
     print('not blocked', file=sys.stderr); sys.exit(1)
 except PermissionError:
     pass

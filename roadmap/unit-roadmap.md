@@ -60,6 +60,8 @@ These items live in the **core daemon** (`src/nxt_router.c`, `src/nxt_controller
 - `POST /control/applications/<name>/reload` → spawn a new generation with fresh code/state, drain old workers after `graceful_timeout`, flip routing atomically.
 - Watch-file convention: `reload_on_touch: "tmp/restart.txt"` (Rails-native, also useful for PHP deploys).
 - Integrates with OpenTelemetry to annotate the reload boundary as a span event.
+- **Prerequisite contract (merged):** PR #54 / issue #28 made the TLS write path return a fatal error on peer-initiated half-close instead of busy-looping. The drain phase of X3 depends on this — without it, asking the old generation to stop accepting and finish in-flight requests could pin a router worker at 100% CPU on any TLS connection the client tore down mid-response.
+- **Open work:** generalise the same contract to non-TLS writes (`nxt_h1proto.c` write loop, port-socket writes — see `unit-todos.md` Pattern D′) and add the server-initiated drain primitive in `nxt_main_process.c` / `nxt_event_engine.c` (`unit-todos.md` Pattern D).
 - **Enables:** PHP P6, Python P7, Ruby P7.
 - **Effort:** ~2 weeks.
 
@@ -135,6 +137,7 @@ See [unit-arm32.md](unit-arm32.md). Active CI failure today. Three-stage fix:
   - OCSP stapling (not currently supported).
   - ECH / Encrypted Client Hello (future).
   - Post-quantum KEMs via OpenSSL 3.x providers (X25519MLKEM768 is already widely deployed at CDN edge).
+- Error-path correctness on writes already addressed by PR #54 / issue #28 (see `unit-todos.md` TLS section); treat it as the contract any new TLS-adjacent code must respect.
 - **Effort:** ~2 weeks for OCSP stapling; rest is ongoing.
 
 ### D5. Config validation / error messages

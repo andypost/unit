@@ -55,6 +55,8 @@ struct nxt_runtime_s {
     uint8_t                batch;
     uint8_t                status;
     uint8_t                is_pid_isolated;
+    /* See nxt_port_quit_mode_t in nxt_port.h. */
+    uint8_t                quit_mode;
 
     const char             *engine;
     uint32_t               engine_connections;
@@ -118,6 +120,14 @@ nxt_port_t *nxt_runtime_process_port_create(nxt_task_t *task, nxt_runtime_t *rt,
 
 void nxt_runtime_port_remove(nxt_task_t *task, nxt_port_t *port);
 void nxt_runtime_stop_app_processes(nxt_task_t *task, nxt_runtime_t *rt);
+
+/*
+ * Allocate a NXT_PORT_MSG_QUIT body byte carrying quit_param.  Returns
+ * NULL when quit_param == NXT_PORT_QUIT_NORMAL (no allocation; libunit
+ * defaults to NORMAL when the QUIT message arrives without a payload)
+ * or when allocation fails (degrades to NORMAL under memory pressure).
+ */
+nxt_buf_t *nxt_runtime_quit_buf(nxt_task_t *task, uint8_t quit_param);
 
 NXT_EXPORT nxt_port_t *nxt_runtime_port_find(nxt_runtime_t *rt, nxt_pid_t pid,
     nxt_port_id_t port_id);

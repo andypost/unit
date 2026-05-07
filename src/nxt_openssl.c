@@ -16,6 +16,9 @@
 #include <openssl/x509v3.h>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
+#if (NXT_HAVE_OPENSSL_OCSP)
+#include <openssl/ocsp.h>
+#endif
 
 
 typedef struct {
@@ -65,6 +68,11 @@ static nxt_int_t nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
     nxt_tls_init_t *tls_init, nxt_bool_t last);
 static nxt_int_t nxt_openssl_chain_file(nxt_task_t *task, SSL_CTX *ctx,
     nxt_tls_conf_t *conf, nxt_mp_t *mp, nxt_bool_t single);
+#if (NXT_HAVE_OPENSSL_OCSP)
+static nxt_int_t nxt_openssl_ocsp_load(nxt_task_t *task, nxt_mp_t *mp,
+    nxt_tls_bundle_conf_t *bundle);
+static int nxt_openssl_ocsp_status_cb(SSL *s, void *arg);
+#endif
 #if (NXT_HAVE_OPENSSL_CONF_CMD)
 static nxt_int_t nxt_ssl_conf_commands(nxt_task_t *task, SSL_CTX *ctx,
     nxt_conf_value_t *value, nxt_mp_t *mp);
@@ -350,6 +358,19 @@ nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
     {
         goto fail;
     }
+
+#if (NXT_HAVE_OPENSSL_OCSP)
+    if (tls_init->ocsp_staple) {
+        if (nxt_openssl_ocsp_load(task, mp, bundle) != NXT_OK) {
+            goto fail;
+        }
+
+        if (bundle->ocsp_staple.length != 0) {
+            SSL_CTX_set_tlsext_status_cb(ctx, nxt_openssl_ocsp_status_cb);
+            SSL_CTX_set_tlsext_status_arg(ctx, bundle);
+        }
+    }
+#endif
 /*
     key = conf->certificate_key;
 
@@ -468,6 +489,8 @@ nxt_openssl_chain_file(nxt_task_t *task, SSL_CTX *ctx, nxt_tls_conf_t *conf,
     bundle = conf->bundle;
 
     BIO_set_fd(bio, bundle->chain_file, BIO_CLOSE);
+    /* BIO owns the fd now (BIO_CLOSE) and BIO_free below closes it. */
+    bundle->chain_file = -1;
 
     cert = PEM_read_bio_X509_AUX(bio, NULL, NULL, NULL);
     if (cert == NULL) {
@@ -539,6 +562,196 @@ clean:
 
     return ret;
 }
+
+
+#if (NXT_HAVE_OPENSSL_OCSP)
+
+#define NXT_OPENSSL_OCSP_MAX_SIZE  (64 * 1024)
+
+
+static nxt_int_t
+nxt_openssl_ocsp_validate(nxt_task_t *task, nxt_tls_bundle_conf_t *bundle,
+    const u_char *der, size_t len)
+{
+    int               status;
+    OCSP_RESPONSE     *resp;
+    OCSP_BASICRESP    *basic;
+    OCSP_SINGLERESP   *single;
+    ASN1_GENERALIZEDTIME  *this_upd, *next_upd;
+    const u_char      *p;
+
+    p = der;
+    resp = d2i_OCSP_RESPONSE(NULL, &p, len);
+    if (resp == NULL) {
+        nxt_alert(task, "ocsp_staple: \"%V\" is not a valid OCSP response "
+                        "(d2i_OCSP_RESPONSE failed)", &bundle->name);
+        return NXT_ERROR;
+    }
+
+    status = OCSP_response_status(resp);
+    if (status != OCSP_RESPONSE_STATUS_SUCCESSFUL) {
+        nxt_alert(task, "ocsp_staple: \"%V\" has non-successful status %d "
+                        "(%s)", &bundle->name, status,
+                        OCSP_response_status_str(status));
+        OCSP_RESPONSE_free(resp);
+        return NXT_ERROR;
+    }
+
+    basic = OCSP_response_get1_basic(resp);
+    if (basic == NULL) {
+        nxt_alert(task, "ocsp_staple: \"%V\" missing basic response",
+                  &bundle->name);
+        OCSP_RESPONSE_free(resp);
+        return NXT_ERROR;
+    }
+
+    if (OCSP_resp_count(basic) < 1) {
+        nxt_alert(task, "ocsp_staple: \"%V\" carries no SingleResponses",
+                  &bundle->name);
+        OCSP_BASICRESP_free(basic);
+        OCSP_RESPONSE_free(resp);
+        return NXT_ERROR;
+    }
+
+    single = OCSP_resp_get0(basic, 0);
+    this_upd = NULL;
+    next_upd = NULL;
+
+    if (OCSP_single_get0_status(single, NULL, NULL, &this_upd, &next_upd)
+        == -1)
+    {
+        nxt_alert(task, "ocsp_staple: \"%V\" SingleResponse has no status",
+                  &bundle->name);
+        OCSP_BASICRESP_free(basic);
+        OCSP_RESPONSE_free(resp);
+        return NXT_ERROR;
+    }
+
+    /*
+     * OCSP_check_validity() applies the freshness/skew rules: a non-NULL
+     * nextUpdate must lie in the future (with default 5 min skew).  A
+     * missing nextUpdate is allowed by the API; we still log a warning.
+     */
+    if (next_upd == NULL) {
+        nxt_log(task, NXT_LOG_WARN,
+                "ocsp_staple: \"%V\" has no nextUpdate; clients may reject "
+                "or refetch on every connection", &bundle->name);
+
+    } else if (OCSP_check_validity(this_upd, next_upd, 300, -1) != 1) {
+        nxt_alert(task, "ocsp_staple: \"%V\" is expired or not yet valid; "
+                        "refresh the .ocsp file", &bundle->name);
+        ERR_clear_error();
+        OCSP_BASICRESP_free(basic);
+        OCSP_RESPONSE_free(resp);
+        return NXT_ERROR;
+    }
+
+    OCSP_BASICRESP_free(basic);
+    OCSP_RESPONSE_free(resp);
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_openssl_ocsp_load(nxt_task_t *task, nxt_mp_t *mp,
+    nxt_tls_bundle_conf_t *bundle)
+{
+    u_char         *buf;
+    size_t         total;
+    ssize_t        n;
+    nxt_file_t     file;
+    nxt_file_info_t  fi;
+
+    if (bundle->ocsp_file == -1) {
+        /* No .ocsp sibling for this certificate. */
+        bundle->ocsp_staple.length = 0;
+        bundle->ocsp_staple.start = NULL;
+        return NXT_OK;
+    }
+
+    nxt_memzero(&file, sizeof(nxt_file_t));
+    file.fd = bundle->ocsp_file;
+
+    if (nxt_file_info(&file, &fi) != NXT_OK) {
+        nxt_alert(task, "ocsp_staple: stat failed for \"%V\"", &bundle->name);
+        goto fail;
+    }
+
+    total = nxt_file_size(&fi);
+
+    if (total == 0 || total > NXT_OPENSSL_OCSP_MAX_SIZE) {
+        nxt_alert(task, "ocsp_staple: \"%V\" has invalid size %uz "
+                        "(must be 1..%d bytes)",
+                        &bundle->name, total, NXT_OPENSSL_OCSP_MAX_SIZE);
+        goto fail;
+    }
+
+    buf = nxt_mp_nget(mp, total);
+    if (buf == NULL) {
+        goto fail;
+    }
+
+    n = nxt_file_read(&file, buf, total, 0);
+    if (n < (ssize_t) total) {
+        nxt_alert(task, "ocsp_staple: short read on \"%V\"", &bundle->name);
+        goto fail;
+    }
+
+    if (nxt_openssl_ocsp_validate(task, bundle, buf, total) != NXT_OK) {
+        goto fail;
+    }
+
+    bundle->ocsp_staple.start = buf;
+    bundle->ocsp_staple.length = total;
+
+    nxt_file_close(task, &file);
+    bundle->ocsp_file = -1;
+
+    return NXT_OK;
+
+fail:
+
+    nxt_file_close(task, &file);
+    bundle->ocsp_file = -1;
+    return NXT_ERROR;
+}
+
+
+static int
+nxt_openssl_ocsp_status_cb(SSL *s, void *arg)
+{
+    u_char                 *copy;
+    nxt_tls_bundle_conf_t  *bundle;
+
+    bundle = arg;
+
+    if (bundle->ocsp_staple.length == 0) {
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+
+    /*
+     * SSL_set_tlsext_status_ocsp_resp() takes ownership of the buffer and
+     * frees it with OPENSSL_free(); allocate a fresh copy per handshake.
+     */
+    copy = OPENSSL_malloc(bundle->ocsp_staple.length);
+    if (copy == NULL) {
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+
+    nxt_memcpy(copy, bundle->ocsp_staple.start, bundle->ocsp_staple.length);
+
+    if (SSL_set_tlsext_status_ocsp_resp(s, copy, bundle->ocsp_staple.length)
+        != 1)
+    {
+        OPENSSL_free(copy);
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+
+    return SSL_TLSEXT_ERR_OK;
+}
+
+#endif
 
 
 #if (NXT_HAVE_OPENSSL_CONF_CMD)

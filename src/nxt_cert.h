@@ -24,9 +24,13 @@ void nxt_cert_store_release(nxt_array_t *certs);
 
 void nxt_cert_store_get(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp,
     nxt_port_rpc_handler_t handler, void *ctx);
+void nxt_cert_store_get_ocsp(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp,
+    nxt_port_rpc_handler_t handler, void *ctx);
 void nxt_cert_store_delete(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp);
 
 void nxt_cert_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
+void nxt_cert_store_get_ocsp_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
 void nxt_cert_store_delete_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 
 #endif /* _NXT_CERT_INCLUDED_ */

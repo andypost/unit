@@ -234,8 +234,12 @@ PHP has ~12 version guards; Python has ~9. Both modules support officially-EOL l
 
 **Reference contract (already merged):** PR #54 / issue #28 hardened the TLS write path so that a peer-initiated half-close (`SSL_ERROR_SYSCALL` with errno==0, or `SSL_ERROR_ZERO_RETURN` while writing) returns `NXT_ERROR` instead of falling through to "graceful EOF". Use this as the canonical shape for the rest of Pattern D — every server-initiated drain decision needs the same "is this connection writable?" answer the TLS code now returns.
 
+**Implementation plan:** see [plan-graceful-shutdown.md](plan-graceful-shutdown.md). Phases P1 (signal split), P2 (listener drain), P4 (engine teardown), and P5 (connection drain with timeout escalation) close every TODO listed above; P6 (the X3 reload endpoint) consumes them.
+
 ### Pattern D′ — Silent fall-through on write paths
 Adjacent to Pattern D: `src/nxt_router.c:5898,5914` (`get_mmap_handler` and app response handler return success on incomplete state), `src/nxt_port_socket.c:749,892` (PERF — should disable event on buffer alloc failure rather than re-arming), `src/nxt_port_socket.c:1345` (port error handler incomplete). Same family of bug as the original issue #28 spin: a non-success condition is reported as success and the event loop re-arms forever. PR #54's fix in `nxt_openssl.c` is the simplest example of the correct pattern; these sites should be audited together.
+
+**Implementation plan:** see [plan-graceful-shutdown.md](plan-graceful-shutdown.md) phase P3 — generalises the PR #54 contract to all five sites above, mirrored against `nxt_openssl_conn_test_error()` at `src/nxt_openssl.c:1592-1616`.
 
 ### Pattern E — Java WebSocket TODOs
 Cluster of UNKNOWN/FEATURE/PERF in `src/java/**/websocket/` suggests the Java WebSocket implementation was ported from an external source (Tomcat-flavored WsRemoteEndpointImplBase names are telling) and not fully adapted. Needs an owner review.

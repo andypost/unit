@@ -62,8 +62,9 @@ These items live in the **core daemon** (`src/nxt_router.c`, `src/nxt_controller
 - Integrates with OpenTelemetry to annotate the reload boundary as a span event.
 - **Prerequisite contract (merged):** PR #54 / issue #28 made the TLS write path return a fatal error on peer-initiated half-close instead of busy-looping. The drain phase of X3 depends on this — without it, asking the old generation to stop accepting and finish in-flight requests could pin a router worker at 100% CPU on any TLS connection the client tore down mid-response.
 - **Open work:** generalise the same contract to non-TLS writes (`nxt_h1proto.c` write loop, port-socket writes — see `unit-todos.md` Pattern D′) and add the server-initiated drain primitive in `nxt_main_process.c` / `nxt_event_engine.c` (`unit-todos.md` Pattern D).
+- **Detailed plan:** see [plan-graceful-shutdown.md](plan-graceful-shutdown.md) — 7-phase delivery (signal split → listener drain → write-path D′ → engine teardown → connection drain → reload endpoint → per-language hooks) with mermaid diagrams, file:line edits, and per-phase tests. Effort revised to **~7–8 weeks total** (the ~2 weeks below is just the endpoint phase).
 - **Enables:** PHP P6, Python P7, Ruby P7.
-- **Effort:** ~2 weeks.
+- **Effort:** ~2 weeks for the endpoint phase alone; ~7–8 weeks for the full lifecycle (see plan).
 
 ### X4. Persistent-worker contract
 

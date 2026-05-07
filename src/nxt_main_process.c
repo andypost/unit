@@ -679,6 +679,7 @@ static nxt_port_handlers_t  nxt_main_process_port_handlers = {
     .conf_store       = nxt_main_port_conf_store_handler,
 #if (NXT_TLS)
     .cert_get         = nxt_cert_store_get_handler,
+    .cert_ocsp_get    = nxt_cert_store_get_ocsp_handler,
     .cert_delete      = nxt_cert_store_delete_handler,
 #endif
 #if (NXT_HAVE_NJS)

@@ -1,6 +1,12 @@
 
 Changes with FreeUnit 1.35.4                                     xx xxx 2026
 
+    *) Feature: TLS OCSP stapling. Setting "ocsp_staple": true on a listener's
+       "tls" object enables stapling; the OCSP response (DER) is loaded from
+       <name>.ocsp alongside the certificate in the certificate store and
+       served in the TLS handshake.  Operator refreshes the response file
+       out-of-band (e.g. via cron + openssl ocsp).
+
     *) Bugfix: fix router process CPU spin and connection hang under port
        scanning load; CLOSE-WAIT sockets are now cleaned up properly on
        client FIN, idle connection queue iteration fixed, systemd file

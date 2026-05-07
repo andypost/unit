@@ -154,6 +154,8 @@ static void nxt_router_listen_socket_ready(nxt_task_t *task,
 static void nxt_router_listen_socket_error(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 #if (NXT_TLS)
+static void nxt_router_tls_ocsp_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
 static void nxt_router_tls_rpc_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 static nxt_int_t nxt_router_conf_tls_insert(nxt_router_temp_conf_t *tmcf,
@@ -1674,6 +1676,8 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     static const nxt_str_t  conf_timeout_path =
                                 nxt_string("/tls/session/timeout");
     static const nxt_str_t  conf_tickets = nxt_string("/tls/session/tickets");
+    static const nxt_str_t  conf_ocsp_staple =
+                                nxt_string("/tls/ocsp_staple");
 #endif
 #if (NXT_HAVE_NJS)
     static const nxt_str_t  js_module_path = nxt_string("/settings/js_module");
@@ -2126,6 +2130,13 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
                 tls_init->tickets_conf = nxt_conf_get_path(listener,
                                                            &conf_tickets);
+
+                tls_init->ocsp_staple = 0;
+
+                value = nxt_conf_get_path(listener, &conf_ocsp_staple);
+                if (value != NULL) {
+                    tls_init->ocsp_staple = nxt_conf_get_boolean(value);
+                }
 
                 n = nxt_conf_array_elements_count_or_1(certificate);
 
@@ -3031,25 +3042,54 @@ nxt_router_listen_socket_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
 #if (NXT_TLS)
 
+typedef struct {
+    nxt_router_tlssock_t    *tls;
+    nxt_tls_bundle_conf_t   *bundle;
+} nxt_router_tls_ocsp_ctx_t;
+
+
 static void
 nxt_router_tls_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
-    nxt_mp_t                *mp;
-    nxt_int_t               ret;
-    nxt_tls_conf_t          *tlscf;
-    nxt_router_tlssock_t    *tls;
-    nxt_tls_bundle_conf_t   *bundle;
-    nxt_router_temp_conf_t  *tmcf;
+    nxt_mp_t                   *mp;
+    nxt_fd_t                   cert_fd;
+    nxt_tls_conf_t             *tlscf;
+    nxt_router_tlssock_t       *tls;
+    nxt_tls_bundle_conf_t      *bundle;
+    nxt_router_temp_conf_t     *tmcf;
+    nxt_router_tls_ocsp_ctx_t  *ctx;
 
     nxt_debug(task, "tls rpc handler");
 
     tls = data;
     tmcf = tls->temp_conf;
+    cert_fd = -1;
 
-    if (msg == NULL || msg->port_msg.type == _NXT_PORT_MSG_RPC_ERROR) {
+    if (msg == NULL) {
         goto fail;
     }
+
+    if (msg->port_msg.type == _NXT_PORT_MSG_RPC_ERROR) {
+        /*
+         * RPC_ERROR carries no fd by contract, but defensively close any
+         * fd that did slip through to avoid an FD leak.
+         */
+        if (msg->fd[0] != -1) {
+            nxt_fd_close(msg->fd[0]);
+            msg->fd[0] = -1;
+        }
+
+        goto fail;
+    }
+
+    /*
+     * Take ownership of the cert fd up front so every early failure path
+     * below can release it via the fail label.  Once it is parked on the
+     * bundle, the bundle's fail-path closer keeps it covered until
+     * nxt_openssl_chain_file() consumes it (BIO_CLOSE).
+     */
+    cert_fd = msg->fd[0];
 
     mp = tmcf->router_conf->mem_pool;
 
@@ -3068,16 +3108,116 @@ nxt_router_tls_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     tls->tls_init->conf = tlscf;
 
-    bundle = nxt_mp_get(mp, sizeof(nxt_tls_bundle_conf_t));
+    bundle = nxt_mp_zget(mp, sizeof(nxt_tls_bundle_conf_t));
     if (nxt_slow_path(bundle == NULL)) {
         goto fail;
     }
+
+    /*
+     * nxt_mp_zget() leaves fds at 0 (== stdin); -1 is the conventional
+     * invalid sentinel.  Set both before any path that might cleanup.
+     */
+    bundle->chain_file = -1;
+    bundle->ocsp_file = -1;
 
     if (nxt_slow_path(nxt_str_dup(mp, &bundle->name, &tls->name) == NULL)) {
         goto fail;
     }
 
-    bundle->chain_file = msg->fd[0];
+    bundle->chain_file = cert_fd;
+    cert_fd = -1;
+
+    /*
+     * Bundle is intentionally NOT inserted into tlscf->bundle yet.
+     * nxt_openssl_server_init() reads conf->bundle as the bundle to
+     * initialise; with multiple certificates per listener and async OCSP
+     * fetches, inserting at the head here would race other listeners'
+     * cert RPCs and cause the OCSP handler to attach a response to the
+     * wrong bundle.  The OCSP handler links the bundle just before
+     * calling server_init() so the head invariant holds.
+     */
+
+    ctx = nxt_mp_get(mp, sizeof(nxt_router_tls_ocsp_ctx_t));
+    if (nxt_slow_path(ctx == NULL)) {
+        if (bundle->chain_file != -1) {
+            nxt_fd_close(bundle->chain_file);
+            bundle->chain_file = -1;
+        }
+        goto fail;
+    }
+
+    ctx->tls = tls;
+    ctx->bundle = bundle;
+
+#if (NXT_HAVE_OPENSSL_OCSP)
+    if (tls->tls_init->ocsp_staple) {
+        nxt_cert_store_get_ocsp(task, &tls->name, mp,
+                                nxt_router_tls_ocsp_handler, ctx);
+        return;
+    }
+#endif
+
+    nxt_router_tls_ocsp_handler(task, NULL, ctx);
+    return;
+
+fail:
+
+    if (cert_fd != -1) {
+        nxt_fd_close(cert_fd);
+    }
+
+    nxt_router_conf_error(task, tmcf);
+}
+
+
+static void
+nxt_router_tls_ocsp_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_mp_t                   *mp;
+    nxt_int_t                  ret;
+    nxt_tls_conf_t             *tlscf;
+    nxt_router_tlssock_t       *tls;
+    nxt_tls_bundle_conf_t      *bundle;
+    nxt_router_temp_conf_t     *tmcf;
+    nxt_router_tls_ocsp_ctx_t  *ctx;
+
+    ctx = data;
+    tls = ctx->tls;
+    bundle = ctx->bundle;
+    tmcf = tls->temp_conf;
+    mp = tmcf->router_conf->mem_pool;
+    tlscf = tls->tls_init->conf;
+
+#if (NXT_HAVE_OPENSSL_OCSP)
+    if (msg != NULL) {
+        if (msg->port_msg.type == _NXT_PORT_MSG_RPC_ERROR) {
+            /*
+             * RPC_ERROR carries no fd by contract, but defensively close
+             * any fd that did slip through to avoid an FD leak.
+             */
+            if (msg->fd[0] != -1) {
+                nxt_fd_close(msg->fd[0]);
+                msg->fd[0] = -1;
+            }
+
+            goto fail;
+        }
+
+        /* fd may be -1 when the .ocsp sibling is absent. */
+        bundle->ocsp_file = msg->fd[0];
+    }
+#else
+    (void) msg;
+#endif
+
+    /*
+     * Link the bundle as the head right before server_init() so that
+     * conf->bundle reads back the bundle this RPC was initiated for.
+     * This is also what nxt_openssl_chain_file() and
+     * nxt_openssl_cert_get_names() rely on when registering the
+     * SNI hash entries for the multi-certificate case.
+     */
     bundle->next = tlscf->bundle;
     tlscf->bundle = bundle;
 
@@ -3092,6 +3232,16 @@ nxt_router_tls_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     return;
 
 fail:
+
+    if (bundle->ocsp_file != -1) {
+        nxt_fd_close(bundle->ocsp_file);
+        bundle->ocsp_file = -1;
+    }
+
+    if (bundle->chain_file != -1) {
+        nxt_fd_close(bundle->chain_file);
+        bundle->chain_file = -1;
+    }
 
     nxt_router_conf_error(task, tmcf);
 }

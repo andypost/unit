@@ -612,6 +612,15 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_tls_members[] = {
         .type       = NXT_CONF_VLDT_OBJECT,
         .validator  = nxt_conf_vldt_object,
         .u.members  = nxt_conf_vldt_session_members,
+    }, {
+        .name       = nxt_string("ocsp_staple"),
+        .type       = NXT_CONF_VLDT_BOOLEAN,
+#if (NXT_HAVE_OPENSSL_OCSP)
+        .validator  = NULL,
+#else
+        .validator  = nxt_conf_vldt_unsupported,
+        .u.string   = "ocsp_staple",
+#endif
     },
 
     NXT_CONF_VLDT_END

@@ -1230,6 +1230,142 @@ error:
 
 
 void
+nxt_cert_store_get_ocsp(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp,
+    nxt_port_rpc_handler_t handler, void *ctx)
+{
+    uint32_t       stream;
+    nxt_int_t      ret;
+    nxt_buf_t      *b;
+    nxt_port_t     *main_port, *recv_port;
+    nxt_runtime_t  *rt;
+
+    b = nxt_buf_mem_alloc(mp, name->length + 1, 0);
+    if (nxt_slow_path(b == NULL)) {
+        goto fail;
+    }
+
+    b->completion_handler = nxt_cert_buf_completion;
+
+    nxt_buf_cpystr(b, name);
+    *b->mem.free++ = '\0';
+
+    rt = task->thread->runtime;
+    main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+    recv_port = rt->port_by_type[rt->type];
+
+    stream = nxt_port_rpc_register_handler(task, recv_port, handler, handler,
+                                           -1, ctx);
+    if (nxt_slow_path(stream == 0)) {
+        goto fail;
+    }
+
+    ret = nxt_port_socket_write(task, main_port, NXT_PORT_MSG_CERT_OCSP_GET, -1,
+                                stream, recv_port->id, b);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_rpc_cancel(task, recv_port, stream);
+        goto fail;
+    }
+
+    /*
+     * Retain only after the buffer has been handed off to the port
+     * machinery; the failure paths above otherwise leave the pool with a
+     * refcount that the completion handler can never release.
+     */
+    nxt_mp_retain(mp);
+
+    return;
+
+fail:
+
+    handler(task, NULL, ctx);
+}
+
+
+void
+nxt_cert_store_get_ocsp_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    u_char               *p;
+    nxt_int_t            ret;
+    nxt_str_t            name;
+    nxt_file_t           file;
+    nxt_port_t           *port;
+    nxt_runtime_t        *rt;
+    nxt_port_msg_type_t  type;
+    static const char    ocsp_suffix[] = ".ocsp";
+
+    port = nxt_runtime_port_find(task->thread->runtime, msg->port_msg.pid,
+                                 msg->port_msg.reply_port);
+
+    if (nxt_slow_path(port == NULL)) {
+        nxt_alert(task, "process port not found (pid %PI, reply_port %d)",
+                  msg->port_msg.pid, msg->port_msg.reply_port);
+        return;
+    }
+
+    if (nxt_slow_path(port->type != NXT_PROCESS_ROUTER)) {
+        nxt_alert(task, "process %PI cannot fetch OCSP responses",
+                  msg->port_msg.pid);
+        return;
+    }
+
+    nxt_memzero(&file, sizeof(nxt_file_t));
+
+    file.fd = -1;
+    /*
+     * RPC_READY_LAST with fd == -1 signals "no OCSP file present"
+     * to the router; missing siblings are not errors.
+     */
+    type = NXT_PORT_MSG_RPC_READY_LAST;
+
+    rt = task->thread->runtime;
+
+    if (nxt_slow_path(rt->certs.start == NULL)) {
+        goto reply;
+    }
+
+    name.start = msg->buf->mem.pos;
+    name.length = nxt_strlen(name.start);
+
+    file.name = nxt_malloc(rt->certs.length + name.length
+                           + sizeof(ocsp_suffix));
+
+    if (nxt_slow_path(file.name == NULL)) {
+        goto reply;
+    }
+
+    p = nxt_cpymem(file.name, rt->certs.start, rt->certs.length);
+    p = nxt_cpymem(p, name.start, name.length);
+    nxt_memcpy(p, ocsp_suffix, sizeof(ocsp_suffix));
+
+    ret = nxt_file_open(task, &file, NXT_FILE_RDONLY, NXT_FILE_OPEN,
+                        NXT_FILE_OWNER_ACCESS);
+
+    nxt_free(file.name);
+
+    if (ret == NXT_OK) {
+        type = NXT_PORT_MSG_RPC_READY_LAST | NXT_PORT_MSG_CLOSE_FD;
+    }
+
+reply:
+
+    if (nxt_port_socket_write(task, port, type, file.fd,
+                              msg->port_msg.stream, 0, NULL)
+        != NXT_OK
+        && file.fd != -1)
+    {
+        /*
+         * On send failure (e.g. malloc failure inside the port machinery)
+         * the port layer never takes ownership of the fd, so close it
+         * here to avoid leaking an open file descriptor in the privileged
+         * main process.
+         */
+        nxt_fd_close(file.fd);
+    }
+}
+
+
+void
 nxt_cert_store_delete(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp)
 {
     nxt_buf_t      *b;

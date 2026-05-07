@@ -20,6 +20,7 @@ struct nxt_port_handlers_s {
     nxt_port_handler_t  modules;
     nxt_port_handler_t  conf_store;
     nxt_port_handler_t  cert_get;
+    nxt_port_handler_t  cert_ocsp_get;
     nxt_port_handler_t  cert_delete;
     nxt_port_handler_t  script_get;
     nxt_port_handler_t  script_delete;
@@ -88,6 +89,7 @@ typedef enum {
     _NXT_PORT_MSG_MODULES         = nxt_port_handler_idx(modules),
     _NXT_PORT_MSG_CONF_STORE      = nxt_port_handler_idx(conf_store),
     _NXT_PORT_MSG_CERT_GET        = nxt_port_handler_idx(cert_get),
+    _NXT_PORT_MSG_CERT_OCSP_GET   = nxt_port_handler_idx(cert_ocsp_get),
     _NXT_PORT_MSG_CERT_DELETE     = nxt_port_handler_idx(cert_delete),
     _NXT_PORT_MSG_SCRIPT_GET      = nxt_port_handler_idx(script_get),
     _NXT_PORT_MSG_SCRIPT_DELETE   = nxt_port_handler_idx(script_delete),
@@ -132,6 +134,7 @@ typedef enum {
     NXT_PORT_MSG_MODULES          = nxt_msg_last(_NXT_PORT_MSG_MODULES),
     NXT_PORT_MSG_CONF_STORE       = nxt_msg_last(_NXT_PORT_MSG_CONF_STORE),
     NXT_PORT_MSG_CERT_GET         = nxt_msg_last(_NXT_PORT_MSG_CERT_GET),
+    NXT_PORT_MSG_CERT_OCSP_GET    = nxt_msg_last(_NXT_PORT_MSG_CERT_OCSP_GET),
     NXT_PORT_MSG_CERT_DELETE      = nxt_msg_last(_NXT_PORT_MSG_CERT_DELETE),
     NXT_PORT_MSG_SCRIPT_GET       = nxt_msg_last(_NXT_PORT_MSG_SCRIPT_GET),
     NXT_PORT_MSG_SCRIPT_DELETE    = nxt_msg_last(_NXT_PORT_MSG_SCRIPT_DELETE),

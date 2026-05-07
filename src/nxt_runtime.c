@@ -491,9 +491,46 @@ nxt_runtime_close_idle_connections(nxt_event_engine_t *engine)
 }
 
 
+/*
+ * Allocate a one-byte port-message body carrying a nxt_port_quit_mode_t
+ * byte for NXT_PORT_MSG_QUIT.  libunit and the prototype handler both
+ * parse this byte and fall back to NXT_PORT_QUIT_NORMAL when the
+ * message arrives without a payload, so the fast-exit path needs no
+ * payload at all: callers receive NULL and pass it straight to
+ * nxt_port_socket_write().
+ *
+ * Allocation failure under GRACEFUL intentionally degrades to the
+ * NORMAL fast exit -- a sane behaviour under memory pressure -- but
+ * the degradation is logged so the operator knows a SIGQUIT did not
+ * actually drain in-flight requests on at least one cascade leg.
+ */
+nxt_buf_t *
+nxt_runtime_quit_buf(nxt_task_t *task, uint8_t quit_param)
+{
+    nxt_buf_t  *b;
+
+    if (quit_param == NXT_PORT_QUIT_NORMAL) {
+        return NULL;
+    }
+
+    b = nxt_buf_mem_alloc(task->thread->engine->mem_pool, 1, 0);
+    if (nxt_slow_path(b == NULL)) {
+        nxt_log(task, NXT_LOG_WARN,
+                "graceful quit payload allocation failed; "
+                "this cascade leg falls back to fast exit");
+        return NULL;
+    }
+
+    *b->mem.free++ = quit_param;
+
+    return b;
+}
+
+
 void
 nxt_runtime_stop_app_processes(nxt_task_t *task, nxt_runtime_t *rt)
 {
+    nxt_buf_t           *b;
     nxt_port_t          *port;
     nxt_process_t       *process;
     nxt_process_init_t  *init;
@@ -508,8 +545,21 @@ nxt_runtime_stop_app_processes(nxt_task_t *task, nxt_runtime_t *rt)
 
             nxt_process_port_each(process, port) {
 
-                (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT, -1,
-                                             0, 0, NULL);
+                b = nxt_runtime_quit_buf(task, rt->quit_mode);
+
+                if (nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT, -1,
+                                          0, 0, b)
+                        != NXT_OK
+                    && b != NULL)
+                {
+                    /*
+                     * Port layer never took ownership of the GRACEFUL
+                     * payload buffer; release it explicitly so it does
+                     * not leak from the engine memory pool.  Same shape
+                     * as PR #8 (port IPC completion leaks).
+                     */
+                    b->completion_handler(task, b, b->parent);
+                }
 
             } nxt_process_port_loop;
         }
@@ -521,6 +571,7 @@ nxt_runtime_stop_app_processes(nxt_task_t *task, nxt_runtime_t *rt)
 static void
 nxt_runtime_stop_all_processes(nxt_task_t *task, nxt_runtime_t *rt)
 {
+    nxt_buf_t      *b;
     nxt_port_t     *port;
     nxt_process_t  *process;
 
@@ -530,8 +581,16 @@ nxt_runtime_stop_all_processes(nxt_task_t *task, nxt_runtime_t *rt)
 
             nxt_debug(task, "%d sending quit to %PI", rt->type, port->pid);
 
-            (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT, -1, 0,
-                                         0, NULL);
+            b = nxt_runtime_quit_buf(task, rt->quit_mode);
+
+            if (nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT, -1, 0,
+                                      0, b)
+                    != NXT_OK
+                && b != NULL)
+            {
+                /* Same cleanup as nxt_runtime_stop_app_processes() above. */
+                b->completion_handler(task, b, b->parent);
+            }
 
         } nxt_process_port_loop;
 

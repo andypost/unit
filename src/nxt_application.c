@@ -59,7 +59,7 @@ static void nxt_proto_start_process_handler(nxt_task_t *task,
 static void nxt_proto_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 static void nxt_proto_process_created_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
-static void nxt_proto_quit_children(nxt_task_t *task);
+static void nxt_proto_quit_children(nxt_task_t *task, uint8_t quit_param);
 static nxt_process_t *nxt_proto_process_find(nxt_task_t *task, nxt_pid_t pid);
 static void nxt_proto_process_add(nxt_task_t *task, nxt_process_t *process);
 static nxt_process_t *nxt_proto_process_remove(nxt_task_t *task, nxt_pid_t pid);
@@ -680,9 +680,36 @@ failed:
 static void
 nxt_proto_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
-    nxt_debug(task, "prototype quit handler");
+    uint8_t  quit_param;
 
-    nxt_proto_quit_children(task);
+    /*
+     * The QUIT message from main carries a single nxt_port_quit_mode_t
+     * byte (see nxt_runtime_quit_buf() in src/nxt_runtime.c).  Forward
+     * it to the children unchanged so SIGQUIT to main results in
+     * NXT_PORT_QUIT_GRACEFUL reaching every libunit context, not just
+     * the children main contacts directly.  Empty body (legacy senders,
+     * or main's NORMAL fast-exit path which omits the payload) is
+     * treated as NXT_PORT_QUIT_NORMAL.
+     *
+     * Unknown payload values (anything other than 0 or 1) are also
+     * normalised to NORMAL: internal senders should only emit the two
+     * defined nxt_port_quit_mode_t values, but a malformed or
+     * future-incompatible sender must not be allowed to propagate a
+     * bogus byte through the whole worker pool.
+     */
+    quit_param = NXT_PORT_QUIT_NORMAL;
+
+    if (msg->buf != NULL && nxt_buf_mem_used_size(&msg->buf->mem) >= 1) {
+        quit_param = msg->buf->mem.pos[0];
+
+        if (quit_param != NXT_PORT_QUIT_GRACEFUL) {
+            quit_param = NXT_PORT_QUIT_NORMAL;
+        }
+    }
+
+    nxt_debug(task, "prototype quit handler (quit_param=%d)", quit_param);
+
+    nxt_proto_quit_children(task, quit_param);
 
     nxt_proto_exiting = 1;
 
@@ -693,16 +720,30 @@ nxt_proto_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
 
 static void
-nxt_proto_quit_children(nxt_task_t *task)
+nxt_proto_quit_children(nxt_task_t *task, uint8_t quit_param)
 {
+    nxt_buf_t      *b;
     nxt_port_t     *port;
     nxt_process_t  *process;
 
     nxt_queue_each(process, &nxt_proto_children, nxt_process_t, link) {
         port = nxt_process_port_first(process);
 
-        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT,
-                                     -1, 0, 0, NULL);
+        b = nxt_runtime_quit_buf(task, quit_param);
+
+        if (nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT,
+                                  -1, 0, 0, b)
+                != NXT_OK
+            && b != NULL)
+        {
+            /*
+             * Port layer never took ownership of the GRACEFUL payload
+             * buffer; release it explicitly so the cascaded byte does
+             * not leak.  Mirrors the cleanup in
+             * src/nxt_runtime.c nxt_runtime_stop_*_processes().
+             */
+            b->completion_handler(task, b, b->parent);
+        }
     }
     nxt_queue_loop;
 }
@@ -759,7 +800,13 @@ nxt_proto_sigterm_handler(nxt_task_t *task, void *obj, void *data)
     nxt_trace(task, "signal signo:%d (%s) received",
               (int) (uintptr_t) obj, data);
 
-    nxt_proto_quit_children(task);
+    /*
+     * Direct signal to the prototype process is not the user-initiated
+     * lifecycle path (that goes main -> NXT_PORT_MSG_QUIT -> the message
+     * handler above).  Treat it as fast exit so children drop in flight
+     * rather than wait on a graceful drain that nobody requested.
+     */
+    nxt_proto_quit_children(task, NXT_PORT_QUIT_NORMAL);
 
     nxt_proto_exiting = 1;
 

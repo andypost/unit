@@ -5892,10 +5892,17 @@ nxt_router_get_mmap_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_assert(port->type == NXT_PROCESS_APP);
 
     if (nxt_slow_path(port->app == NULL)) {
-        nxt_alert(task, "get_mmap_handler: app == NULL for reply port %PI:%d",
-                  port->pid, port->id);
+        /*
+         * Pattern D′: a NULL app pointer here is a benign race during
+         * worker shutdown / graceful reload (the app freed before its
+         * reply port was drained), not a corruption.  Demoted from
+         * ALERT so reload-under-load doesn't pollute the log.
+         */
+        nxt_log(task, NXT_LOG_INFO,
+                "get_mmap_handler: app == NULL for reply port %PI:%d "
+                "(peer likely shutting down)",
+                port->pid, port->id);
 
-        // FIXME
         nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
                               -1, msg->port_msg.stream, 0, NULL);
 

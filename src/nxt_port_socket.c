@@ -746,8 +746,27 @@ nxt_port_read_handler(nxt_task_t *task, void *obj, void *data)
         b = nxt_port_buf_alloc(port);
 
         if (nxt_slow_path(b == NULL)) {
-            /* TODO: disable event for some time */
+            /*
+             * Buffer pool exhausted (transient OOM on port mem_pool).
+             * Falling through would dereference b->mem.pos and crash;
+             * mirror PR #54's contract by disarming the read event and
+             * routing through the orderly error path.  No timer
+             * infrastructure exists for ports, so re-arm depends on
+             * the port being torn down via nxt_port_error_handler.
+             *
+             * Recovery via timer-driven retry was rejected as out of
+             * P3 scope; terminal teardown is the strict improvement
+             * over the pre-P3 NULL-deref.
+             */
+            nxt_alert(task, "port{%d,%d} %d: buf alloc failed; "
+                            "disabling read",
+                      (int) port->pid, (int) port->id, port->socket.fd);
+            nxt_fd_event_block_read(task->thread->engine, &port->socket);
+            goto fail;
         }
+
+        /* Invariant past the OOM teardown above; aids future audits. */
+        nxt_assert(b != NULL);
 
         iov[0].iov_base = &msg.port_msg;
         iov[0].iov_len = sizeof(nxt_port_msg_t);
@@ -889,8 +908,30 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
         b = nxt_port_buf_alloc(port);
 
         if (nxt_slow_path(b == NULL)) {
-            /* TODO: disable event for some time */
+            /*
+             * Buffer pool exhausted (transient OOM on port mem_pool).
+             * Falling through would dereference b->mem.pos in either the
+             * dequeue memcpy or the iov[1] recv branch.  Mirror PR #54's
+             * contract: disarm the read event, decrement the queue
+             * counter, and route through the orderly error handler.
+             *
+             * Recovery via timer-driven retry was rejected as out of
+             * P3 scope; terminal teardown is the strict improvement
+             * over the pre-P3 NULL-deref.
+             */
+            nxt_alert(task, "port{%d,%d} %d: buf alloc failed; "
+                            "disabling read",
+                      (int) port->pid, (int) port->id, port->socket.fd);
+            nxt_fd_event_block_read(task->thread->engine, &port->socket);
+            nxt_atomic_fetch_add(&queue->nitems, -1);
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               nxt_port_error_handler, task, &port->socket,
+                               NULL);
+            return;
         }
+
+        /* Invariant past the OOM teardown above; aids future audits. */
+        nxt_assert(b != NULL);
 
         if (n >= (ssize_t) sizeof(nxt_port_msg_t)) {
             nxt_memcpy(&msg.port_msg, qmsg, sizeof(nxt_port_msg_t));
@@ -1342,7 +1383,15 @@ nxt_port_error_handler(nxt_task_t *task, void *obj, void *data)
     nxt_port_send_msg_t  *msg;
 
     nxt_debug(task, "port error handler %p", obj);
-    /* TODO */
+    /*
+     * The bare TODO here historically asked for richer error context
+     * (e.g. surfacing the actual socket.error to peers).  Investigated
+     * for P3 (write-path contract): the handler already drains all
+     * queued send messages, releases buffers, and decrements port
+     * refcounts.  No silent success or NULL-deref bug is hidden here;
+     * adding richer error responses is a future enhancement and not
+     * part of PR #54's write-path contract.
+     */
 
     port = nxt_container_of(obj, nxt_port_t, socket);
 

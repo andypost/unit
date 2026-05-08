@@ -746,7 +746,13 @@ nxt_port_read_handler(nxt_task_t *task, void *obj, void *data)
         b = nxt_port_buf_alloc(port);
 
         if (nxt_slow_path(b == NULL)) {
-            /* TODO: disable event for some time */
+            nxt_log(task, NXT_LOG_INFO,
+                    "port{%d,%d} %d: read-buf alloc failed; "
+                    "blocking read event",
+                    (int) port->pid, (int) port->id, port->socket.fd);
+
+            nxt_fd_event_block_read(task->thread->engine, &port->socket);
+            return;
         }
 
         iov[0].iov_base = &msg.port_msg;
@@ -889,7 +895,14 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
         b = nxt_port_buf_alloc(port);
 
         if (nxt_slow_path(b == NULL)) {
-            /* TODO: disable event for some time */
+            nxt_log(task, NXT_LOG_INFO,
+                    "port{%d,%d} %d: read-buf alloc failed; "
+                    "blocking queue read event",
+                    (int) port->pid, (int) port->id, port->socket.fd);
+
+            nxt_atomic_fetch_add(&queue->nitems, -1);
+            nxt_fd_event_block_read(task->thread->engine, &port->socket);
+            return;
         }
 
         if (n >= (ssize_t) sizeof(nxt_port_msg_t)) {
@@ -1342,7 +1355,6 @@ nxt_port_error_handler(nxt_task_t *task, void *obj, void *data)
     nxt_port_send_msg_t  *msg;
 
     nxt_debug(task, "port error handler %p", obj);
-    /* TODO */
 
     port = nxt_container_of(obj, nxt_port_t, socket);
 

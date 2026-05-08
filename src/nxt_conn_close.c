@@ -119,7 +119,31 @@ nxt_conn_close_handler(nxt_task_t *task, void *obj, void *data)
         nxt_socket_close(task, c->socket.fd);
         c->socket.fd = -1;
 
-        if (c->idle) {
+        /*
+         * Unlink from the engine idle/active tracking queue, if any.
+         * Conns that were never tracked (e.g. controller clients, proxy
+         * peers) keep c->idle == NXT_CONN_TRACK_NONE and own c->link
+         * separately, so this branch must not run for them.
+         *
+         * closed_conns_cnt is incremented symmetrically for both idle and
+         * active closes (P4.5).  Prior to P4.5 only idle closes were
+         * counted, but in practice every conn passing through accept was
+         * placed onto the idle queue and c->idle was never reset to 0 by
+         * nxt_conn_active(), so the counter was already incrementing for
+         * effectively every accepted-conn close.  The new symmetric form
+         * preserves that behaviour while also covering the case where a
+         * conn closes while genuinely active.
+         */
+        if (c->idle == NXT_CONN_TRACK_IDLE) {
+            nxt_queue_remove(&c->link);
+            engine->idle_conns_cnt--;
+            c->idle = NXT_CONN_TRACK_NONE;
+            engine->closed_conns_cnt++;
+
+        } else if (c->idle == NXT_CONN_TRACK_ACTIVE) {
+            nxt_queue_remove(&c->link);
+            nxt_atomic_fetch_add(&engine->active_conns_cnt, -1);
+            c->idle = NXT_CONN_TRACK_NONE;
             engine->closed_conns_cnt++;
         }
 
@@ -157,7 +181,17 @@ nxt_conn_close_timer_handler(nxt_task_t *task, void *obj, void *data)
         nxt_socket_close(task, c->socket.fd);
         c->socket.fd = -1;
 
-        if (c->idle) {
+        /* See nxt_conn_close_handler() for the symmetry rationale (P4.5). */
+        if (c->idle == NXT_CONN_TRACK_IDLE) {
+            nxt_queue_remove(&c->link);
+            engine->idle_conns_cnt--;
+            c->idle = NXT_CONN_TRACK_NONE;
+            engine->closed_conns_cnt++;
+
+        } else if (c->idle == NXT_CONN_TRACK_ACTIVE) {
+            nxt_queue_remove(&c->link);
+            nxt_atomic_fetch_add(&engine->active_conns_cnt, -1);
+            c->idle = NXT_CONN_TRACK_NONE;
             engine->closed_conns_cnt++;
         }
     }

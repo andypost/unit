@@ -5993,9 +5993,10 @@ static ssize_t
 nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, int fd,
     const void *buf, size_t buf_size, const nxt_send_oob_t *oob)
 {
-    int            err;
-    ssize_t        n;
-    struct iovec   iov[1];
+    int                  err;
+    ssize_t              n;
+    struct iovec         iov[1];
+    nxt_unit_ctx_impl_t  *ctx_impl;
 
     iov[0].iov_base = (void *) buf;
     iov[0].iov_len = buf_size;
@@ -6012,11 +6013,38 @@ retry:
         }
 
         /*
-         * FIXME: This should be "alert" after router graceful shutdown
-         * implementation.
+         * Severity is conditional on the context's lifecycle state:
+         *
+         *   - online (steady state OR deferred graceful drain): the
+         *     peer should still be reachable, sendmsg failure
+         *     indicates a real problem -> nxt_unit_alert.
+         *   - !online (nxt_unit_quit() has flipped the context out of
+         *     service at src/nxt_unit.c:5805): the peer is going away
+         *     by design, so EPIPE/ECONNRESET-class errors are expected
+         *     and would otherwise spam the log -> warn.
+         *
+         * Note: ctx_impl->quit_param is NOT a "shutdown in progress"
+         * flag.  It is initialised to NXT_QUIT_GRACEFUL in
+         * nxt_unit_ctx_init (src/nxt_unit.c:697) as the default
+         * "intended quit semantics" for the context, and is
+         * re-asserted to GRACEFUL inside nxt_unit_quit's NORMAL branch
+         * for broadcast purposes -- so it is GRACEFUL at steady state
+         * too and cannot be used to distinguish steady state from
+         * shutdown.  The unambiguous flag is ctx_impl->online.
+         *
+         * This closes the long-standing FIXME that asked for "alert"
+         * once router graceful-shutdown plumbing existed.
          */
-        nxt_unit_warn(ctx, "sendmsg(%d, %d) failed: %s (%d)",
-                      fd, (int) buf_size, strerror(err), err);
+        ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+        if (ctx_impl->online) {
+            nxt_unit_alert(ctx, "sendmsg(%d, %d) failed: %s (%d)",
+                           fd, (int) buf_size, strerror(err), err);
+
+        } else {
+            nxt_unit_warn(ctx, "sendmsg(%d, %d) failed: %s (%d)",
+                          fd, (int) buf_size, strerror(err), err);
+        }
 
     } else {
         nxt_unit_debug(ctx, "sendmsg(%d, %d, %d): %d", fd, (int) buf_size,

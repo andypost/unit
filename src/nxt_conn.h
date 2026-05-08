@@ -160,7 +160,23 @@ struct nxt_conn_s {
     uint8_t                       block_read;   /* 1 bit */
     uint8_t                       block_write;  /* 1 bit */
     uint8_t                       delayed;      /* 1 bit */
-    uint8_t                       idle;         /* 1 bit */
+
+#define NXT_CONN_TRACK_NONE       0
+#define NXT_CONN_TRACK_IDLE       1
+#define NXT_CONN_TRACK_ACTIVE     2
+
+    /*
+     * Tri-state membership in the engine's idle/active connection queues.
+     * NONE (0): conn was never placed onto an engine tracking queue
+     *           (e.g. controller clients, proxy peers).  c->link is owned
+     *           by some other subsystem.
+     * IDLE (1): conn is on engine->idle_connections.
+     * ACTIVE (2): conn is on engine->active_connections.
+     *
+     * Set/cleared exclusively by nxt_conn_idle() / nxt_conn_active() and
+     * cleared by nxt_conn_close() when the conn is unlinked from its queue.
+     */
+    uint8_t                       idle;         /* 2 bits */
 
 #define NXT_CONN_SENDFILE_OFF     0
 #define NXT_CONN_SENDFILE_ON      1
@@ -295,24 +311,62 @@ NXT_EXPORT void nxt_event_conn_job_sendfile(nxt_task_t *task,
     } while (0)
 
 
+/*
+ * Place conn onto engine->idle_connections.
+ *
+ * Valid prior states:
+ *   NXT_CONN_TRACK_NONE   - freshly created conn (e.g. just-accepted in
+ *                           nxt_conn_accept()).  Link is not on any queue.
+ *   NXT_CONN_TRACK_ACTIVE - keep-alive transition: conn is currently on
+ *                           engine->active_connections and is being moved
+ *                           back to idle awaiting the next request.
+ *
+ * After this macro: conn is on idle_connections, c->idle == TRACK_IDLE.
+ */
 #define nxt_conn_idle(engine, c)                                              \
     do {                                                                      \
         nxt_event_engine_t  *e = engine;                                      \
                                                                               \
+        if (c->idle == NXT_CONN_TRACK_ACTIVE) {                               \
+            nxt_queue_remove(&c->link);                                       \
+            nxt_atomic_fetch_add(&e->active_conns_cnt, -1);                   \
+        }                                                                     \
+                                                                              \
         nxt_queue_insert_head(&e->idle_connections, &c->link);                \
                                                                               \
-        c->idle = 1;                                                          \
+        c->idle = NXT_CONN_TRACK_IDLE;                                        \
         e->idle_conns_cnt++;                                                  \
     } while (0)
 
 
+/*
+ * Move conn onto engine->active_connections.
+ *
+ * Valid prior states:
+ *   NXT_CONN_TRACK_IDLE   - conn is currently on engine->idle_connections;
+ *                           a request has begun arriving (or idle timeout
+ *                           is firing a forced response).
+ *
+ * After this macro: conn is on active_connections, c->idle == TRACK_ACTIVE.
+ *
+ * Note: every existing call site in nxt_h1proto.c invokes this only on a
+ * conn that just transitioned from idle (handlers wired to *_idle_state /
+ * *_keepalive_state).  The TRACK_IDLE precondition is not asserted to keep
+ * the macro branch-free in the hot path; if a future caller violates it,
+ * idle_conns_cnt will go negative and the queue will corrupt -- both
+ * detectable under ASan via the ASSERT in nxt_conn_close().
+ */
 #define nxt_conn_active(engine, c)                                            \
     do {                                                                      \
         nxt_event_engine_t  *e = engine;                                      \
                                                                               \
         nxt_queue_remove(&c->link);                                           \
+        e->idle_conns_cnt -= (c->idle == NXT_CONN_TRACK_IDLE);                \
                                                                               \
-        e->idle_conns_cnt -= c->idle;                               \
+        nxt_queue_insert_head(&e->active_connections, &c->link);              \
+                                                                              \
+        c->idle = NXT_CONN_TRACK_ACTIVE;                                      \
+        nxt_atomic_fetch_add(&e->active_conns_cnt, 1);                        \
     } while (0)
 
 

@@ -484,7 +484,13 @@ nxt_runtime_close_idle_connections(nxt_event_engine_t *engine)
         c = nxt_queue_link_data(link, nxt_conn_t, link);
 
         if (!c->socket.read_ready) {
-            nxt_queue_remove(link);
+            /*
+             * Do not unlink here: nxt_conn_close() now removes the conn
+             * from idle_connections in its async close handler and
+             * decrements idle_conns_cnt accordingly (P4.5).  Iteration is
+             * safe because `next` was captured before close was scheduled
+             * and the actual unlink runs from a later work-queue tick.
+             */
             nxt_conn_close(engine, c);
         }
     }

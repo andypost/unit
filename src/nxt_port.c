@@ -194,6 +194,27 @@ nxt_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 void
 nxt_port_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
+    nxt_buf_t      *b;
+    uint8_t        quit_param;
+    nxt_runtime_t  *rt;
+
+    /*
+     * P5: read the optional wire-format byte set by P1's
+     * nxt_runtime_quit_buf() and propagate to rt->quit_mode so the
+     * receiving process's nxt_runtime_quit() can take the GRACEFUL
+     * path (drain its active connections).  Absence of the byte
+     * means NORMAL — matches libunit's parser at nxt_unit.c:1062-1068.
+     */
+    quit_param = NXT_PORT_QUIT_NORMAL;
+
+    b = msg->buf;
+    if (b != NULL && nxt_buf_mem_used_size(&b->mem) >= 1) {
+        quit_param = b->mem.pos[0];
+    }
+
+    rt = task->thread->runtime;
+    rt->quit_mode = quit_param;
+
     nxt_runtime_quit(task, 0);
 }
 

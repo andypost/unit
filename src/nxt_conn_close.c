@@ -5,6 +5,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_runtime.h>
 
 
 static void nxt_conn_shutdown_handler(nxt_task_t *task, void *obj, void *data);
@@ -145,6 +146,13 @@ nxt_conn_close_handler(nxt_task_t *task, void *obj, void *data)
             nxt_atomic_fetch_add(&engine->active_conns_cnt, -1);
             c->idle = NXT_CONN_TRACK_NONE;
             engine->closed_conns_cnt++;
+
+            /*
+             * P5: when the runtime is in graceful drain and this was
+             * the last active conn, post nxt_runtime_exit immediately
+             * (cancelling the graceful_timeout).  No-op outside drain.
+             */
+            nxt_runtime_drain_conn_completed(task, engine);
         }
 
         if (timers_pending == 0) {
@@ -193,6 +201,9 @@ nxt_conn_close_timer_handler(nxt_task_t *task, void *obj, void *data)
             nxt_atomic_fetch_add(&engine->active_conns_cnt, -1);
             c->idle = NXT_CONN_TRACK_NONE;
             engine->closed_conns_cnt++;
+
+            /* See nxt_conn_close_handler() — symmetric P5 hook. */
+            nxt_runtime_drain_conn_completed(task, engine);
         }
     }
 

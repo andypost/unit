@@ -10,7 +10,20 @@
 #include <nxt_port.h>
 #include <nxt_main_process.h>
 #include <nxt_router.h>
+#include <nxt_h1proto.h>
 #include <nxt_regex.h>
+
+
+/*
+ * P5: graceful_timeout default (ms) lives in nxt_runtime.h
+ * (NXT_RUNTIME_GRACEFUL_TIMEOUT_DEFAULT) so router worker engines
+ * use the same ceiling.
+ *
+ * TODO(P5 follow-up): expose under "settings.graceful_timeout" via
+ * nxt_conf_validation.c so operators can tune it.  For now hard-coded;
+ * surfacing it as user config is too invasive to land alongside the
+ * coordinator and would balloon this PR.
+ */
 
 
 static nxt_int_t nxt_runtime_inherited_listen_sockets(nxt_task_t *task,
@@ -21,7 +34,7 @@ static nxt_int_t nxt_runtime_event_engines(nxt_task_t *task, nxt_runtime_t *rt);
 static nxt_int_t nxt_runtime_thread_pools(nxt_thread_t *thr, nxt_runtime_t *rt);
 static void nxt_runtime_start(nxt_task_t *task, void *obj, void *data);
 static void nxt_runtime_initial_start(nxt_task_t *task, nxt_uint_t status);
-static void nxt_runtime_close_idle_connections(nxt_event_engine_t *engine);
+/* Exported in nxt_runtime.h for P5 reuse from nxt_router.c. */
 static void nxt_runtime_stop_all_processes(nxt_task_t *task, nxt_runtime_t *rt);
 static void nxt_runtime_exit(nxt_task_t *task, void *obj, void *data);
 static nxt_int_t nxt_runtime_event_engine_change(nxt_task_t *task,
@@ -431,6 +444,7 @@ void
 nxt_runtime_quit(nxt_task_t *task, nxt_uint_t status)
 {
     nxt_bool_t          done;
+    nxt_uint_t          active;
     nxt_runtime_t       *rt;
     nxt_event_engine_t  *engine;
 
@@ -458,6 +472,64 @@ nxt_runtime_quit(nxt_task_t *task, nxt_uint_t status)
 
     nxt_runtime_close_idle_connections(engine);
 
+    /*
+     * P5: on the GRACEFUL path (SIGQUIT, future X3 reload), give in-flight
+     * requests a chance to complete before tearing the engine down.  The
+     * NORMAL path (SIGTERM, SIGINT) keeps the original semantics: idle
+     * conns close above, active conns get force-torn-down by the natural
+     * runtime-exit cascade.
+     *
+     * The drain coordinator is idempotent on re-entry — nxt_runtime_quit
+     * can fire repeatedly as thread-pool / process-stop callbacks
+     * complete; engine->graceful_draining keeps the timer-arm and
+     * NOTICE-log to a single edge.
+     */
+    if (rt->quit_mode == NXT_PORT_QUIT_GRACEFUL
+        && !engine->graceful_draining)
+    {
+        active = nxt_runtime_drain_active_connections(task, engine);
+
+        nxt_log(task, NXT_LOG_NOTICE,
+                "graceful drain: %ui active connection(s)", active);
+
+        if (active == 0) {
+            /*
+             * No in-flight request to wait for — fall through to the
+             * standard exit-post path below.  Keep done as is: if a
+             * thread-pool / process-stop callback is still pending it
+             * will re-enter nxt_runtime_quit and post the exit later.
+             */
+
+        } else {
+            engine->graceful_draining = 1;
+            /*
+             * NULL graceful_done -> nxt_runtime_drain_conn_completed
+             * and the timer handler default to posting nxt_runtime_exit.
+             * Router worker threads override this; see
+             * nxt_router_worker_thread_quit().
+             */
+            engine->graceful_done = NULL;
+
+            engine->graceful_timer.handler =
+                nxt_runtime_graceful_timeout_handler;
+            engine->graceful_timer.work_queue = &engine->fast_work_queue;
+            engine->graceful_timer.log = &nxt_main_log;
+            engine->graceful_timer.task = &engine->task;
+            engine->graceful_timer.bias = NXT_TIMER_DEFAULT_BIAS;
+
+            nxt_timer_add(engine, &engine->graceful_timer,
+                          NXT_RUNTIME_GRACEFUL_TIMEOUT_DEFAULT);
+
+            /*
+             * Hold off on the exit post — natural request completion
+             * (nxt_conn_close_handler decrementing active_conns_cnt to
+             * zero while graceful_draining is set) or the timer handler
+             * will post nxt_runtime_exit when the time comes.
+             */
+            done = 0;
+        }
+    }
+
     if (done) {
         nxt_work_queue_add(&engine->fast_work_queue, nxt_runtime_exit,
                            task, rt, engine);
@@ -465,7 +537,7 @@ nxt_runtime_quit(nxt_task_t *task, nxt_uint_t status)
 }
 
 
-static void
+void
 nxt_runtime_close_idle_connections(nxt_event_engine_t *engine)
 {
     nxt_conn_t        *c;
@@ -494,6 +566,179 @@ nxt_runtime_close_idle_connections(nxt_event_engine_t *engine)
             nxt_conn_close(engine, c);
         }
     }
+}
+
+
+/*
+ * P5: walk engine->active_connections (which P4.5 made enumerable) and
+ * mark each connection so the next nxt_h1p_request_close() shutdown
+ * branch is taken instead of nxt_h1p_keepalive() — i.e. the conn is
+ * closed at the natural end of its current request rather than being
+ * placed back on the idle queue awaiting the next one.
+ *
+ * Why h1p->keepalive = 0 rather than a per-conn drain flag: every
+ * conn that ever appears on engine->active_connections gets there
+ * via nxt_conn_active(), and the only callers of that macro live in
+ * src/nxt_h1proto.c (verified by grep: 5 sites, all in h1proto).
+ * Therefore c->socket.data is reliably nxt_h1proto_t * for any conn
+ * on this queue, and clearing keepalive is exactly the existing
+ * "close after this request" hook the protocol already honours.
+ *
+ * No synchronous close: that would yank the response out from under
+ * a worker that is mid-write.  The caller's job is to arm the
+ * graceful_timeout timer and let natural completion do the rest;
+ * timer expiry handles the stragglers.
+ *
+ * Iteration safety: capture `next` before any potential mutation,
+ * matching nxt_runtime_close_idle_connections() and PR nginx/unit#334.
+ * Setting h1p->keepalive does not mutate c->link, but the pattern is
+ * cheap and forward-compatible if the marker ever grows.
+ */
+nxt_uint_t
+nxt_runtime_drain_active_connections(nxt_task_t *task,
+    nxt_event_engine_t *engine)
+{
+    nxt_uint_t        count;
+    nxt_conn_t        *c;
+    nxt_queue_t       *active;
+    nxt_h1proto_t     *h1p;
+    nxt_queue_link_t  *link, *next;
+
+    nxt_debug(task, "drain active connections");
+
+    active = &engine->active_connections;
+    count = 0;
+
+    for (link = nxt_queue_first(active);
+         link != nxt_queue_tail(active);
+         link = next)
+    {
+        next = nxt_queue_next(link);
+        c = nxt_queue_link_data(link, nxt_conn_t, link);
+
+        h1p = c->socket.data;
+        if (nxt_fast_path(h1p != NULL)) {
+            h1p->keepalive = 0;
+        }
+
+        count++;
+    }
+
+    return count;
+}
+
+
+/*
+ * P5: graceful_timeout expired — force-close any active connection
+ * whose in-flight request did not complete within the budget.
+ *
+ * Walk a snapshot of engine->active_connections via the next-before-
+ * mutation pattern: nxt_conn_close() schedules the actual unlink on
+ * a later work-queue tick, so iteration is safe, but we still want a
+ * deterministic snapshot.  The handler is the terminal step of the
+ * graceful state machine; once it fires we run engine->graceful_done
+ * — main process posts nxt_runtime_exit, router worker engines call
+ * nxt_thread_exit.  Any conn that still hasn't completed cleanup
+ * will be torn down by the engine free path.
+ */
+void
+nxt_runtime_graceful_timeout_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_uint_t           count;
+    nxt_conn_t           *c;
+    nxt_runtime_t        *rt;
+    nxt_queue_t          *active;
+    nxt_work_handler_t   done;
+    nxt_event_engine_t   *engine;
+    nxt_queue_link_t     *link, *next;
+
+    engine = task->thread->engine;
+    rt = task->thread->runtime;
+
+    active = &engine->active_connections;
+    count = 0;
+
+    for (link = nxt_queue_first(active);
+         link != nxt_queue_tail(active);
+         link = next)
+    {
+        next = nxt_queue_next(link);
+        c = nxt_queue_link_data(link, nxt_conn_t, link);
+
+        nxt_conn_close(engine, c);
+        count++;
+    }
+
+    nxt_log(task, NXT_LOG_WARN,
+            "graceful drain timeout: forcing close on %ui active "
+            "connection(s)", count);
+
+    /*
+     * Clear the flag before invoking the terminal action so
+     * nxt_conn_close_handler unwinds (which decrement
+     * active_conns_cnt as the close work-queue cascades) do not
+     * race in and run a duplicate completion.
+     */
+    engine->graceful_draining = 0;
+
+    done = engine->graceful_done;
+    if (done == NULL) {
+        /* Default: assume main-process semantics (process-wide exit). */
+        done = nxt_runtime_exit;
+    }
+
+    nxt_work_queue_add(&engine->fast_work_queue, done, task, rt, engine);
+}
+
+
+/*
+ * P5: called from nxt_conn_close_handler() / _timer_handler() right
+ * after engine->active_conns_cnt has been decremented for a conn that
+ * just finished its in-flight request during graceful drain.  When the
+ * count hits zero we have completed natural drain ahead of the timeout
+ * and can post nxt_runtime_exit immediately, cancelling the timer.
+ *
+ * Re-entrancy note: this is the same engine thread the close handler
+ * runs on, so no atomic dance is needed beyond the existing
+ * nxt_atomic_fetch_add() in the close handler.  Calling it on the
+ * NORMAL path (graceful_draining == 0) is a cheap no-op.
+ */
+void
+nxt_runtime_drain_conn_completed(nxt_task_t *task,
+    nxt_event_engine_t *engine)
+{
+    nxt_runtime_t       *rt;
+    nxt_work_handler_t  done;
+
+    if (!engine->graceful_draining) {
+        return;
+    }
+
+    if (engine->active_conns_cnt != 0) {
+        return;
+    }
+
+    nxt_log(task, NXT_LOG_NOTICE, "graceful drain complete");
+
+    /*
+     * Disable the timer first so it cannot fire after we run the
+     * terminal action.  Clear the flag so the same edge cannot fire
+     * twice (the timer handler also clears it before invoking
+     * graceful_done, but defensively pre-empting it here keeps the
+     * two paths symmetric).
+     */
+    engine->graceful_draining = 0;
+    nxt_timer_disable(engine, &engine->graceful_timer);
+    (void) nxt_timer_delete(engine, &engine->graceful_timer);
+
+    rt = task->thread->runtime;
+
+    done = engine->graceful_done;
+    if (done == NULL) {
+        done = nxt_runtime_exit;
+    }
+
+    nxt_work_queue_add(&engine->fast_work_queue, done, task, rt, engine);
 }
 
 

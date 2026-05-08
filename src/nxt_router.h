@@ -36,6 +36,18 @@ typedef struct {
     nxt_queue_t              apps;     /* of nxt_app_t */
 
     nxt_router_access_log_t  *access_log;
+
+    /*
+     * P5: count of router worker engines still draining in-flight
+     * HTTP/1 requests after a graceful SIGQUIT.  Set to the number
+     * of dispatched workers in nxt_router_quit_handler() and
+     * decremented atomically by each worker's
+     * nxt_router_worker_thread_drain_done().  When it reaches zero
+     * the main router engine is woken up early via post (instead
+     * of waiting for the full graceful_timeout).
+     */
+    nxt_atomic_uint_t        draining_engines;
+    nxt_event_engine_t       *graceful_main_engine;
 } nxt_router_t;
 
 

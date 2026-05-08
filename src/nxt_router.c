@@ -292,8 +292,14 @@ static const nxt_str_t  *nxt_app_msg_prefix[] = {
 };
 
 
+static void nxt_router_quit_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_graceful_main_exit(nxt_task_t *task, void *obj,
+    void *data);
+
+
 static const nxt_port_handlers_t  nxt_router_process_port_handlers = {
-    .quit         = nxt_signal_quit_handler,
+    .quit         = nxt_router_quit_handler,
     .new_port     = nxt_router_new_port_handler,
     .get_port     = nxt_router_get_port_handler,
     .change_file  = nxt_port_change_log_file_handler,
@@ -3877,16 +3883,362 @@ nxt_router_listen_socket_delete(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * P5 drain-done callback for router worker engines: replaces the
+ * nxt_runtime_exit (process-wide exit) default in
+ * nxt_runtime_drain_conn_completed() / graceful_timeout_handler() with
+ * the per-thread terminal action, nxt_thread_exit.  Nothing else is
+ * needed because the joint queue is already drained as part of the
+ * normal worker-thread quit flow.
+ */
+static void
+nxt_router_worker_thread_drain_done(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_work_t          *work;
+    nxt_event_engine_t  *main_engine;
+
+    nxt_debug(task, "router worker thread drain done");
+
+    /*
+     * P5: notify the main router engine that this worker has
+     * finished its drain.  When draining_engines hits zero, post
+     * nxt_router_graceful_main_exit early so the router exits
+     * promptly instead of waiting out the full graceful_timeout.
+     * Cheap atomic; the main-engine post is only issued on the
+     * zero edge.
+     */
+    if (nxt_router != NULL
+        && nxt_atomic_fetch_add(&nxt_router->draining_engines, -1) == 1)
+    {
+        main_engine = nxt_router->graceful_main_engine;
+
+        if (main_engine != NULL) {
+            work = nxt_zalloc(sizeof(nxt_work_t));
+            if (nxt_fast_path(work != NULL)) {
+                work->handler = nxt_router_graceful_main_exit;
+                work->task = &main_engine->task;
+                work->obj = NULL;
+                work->data = NULL;
+
+                nxt_event_engine_post(main_engine, work);
+            }
+        }
+    }
+
+    nxt_thread_exit(task->thread);
+}
+
+
+/*
+ * P5: deferred main-router-process exit handler — fires after
+ * graceful_timeout to let the worker thread engines drain their
+ * in-flight HTTP/1 requests before the router process tears down
+ * its IPC ports and TCP listener.  See nxt_router_quit_handler.
+ */
+static void
+nxt_router_graceful_main_exit(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_debug(task, "router graceful main exit");
+
+    nxt_process_quit(task, 0);
+}
+
+
+/*
+ * P5: router process QUIT IPC handler.  Replaces the generic
+ * nxt_signal_quit_handler so the router can:
+ *
+ *   1. Read the wire-format byte (P1) and propagate it to
+ *      rt->quit_mode -- the runtime layer uses this to pick the
+ *      drain coordinator vs the fast-exit path.
+ *   2. Dispatch nxt_router_worker_thread_quit to every worker
+ *      engine.  HTTP/1 connections live on those engines (see
+ *      engine->active_connections); the main router engine never
+ *      accepts them.  Without this dispatch, the router's main
+ *      nxt_runtime_quit would observe zero active conns on its
+ *      own engine and immediately fall through to exit, killing
+ *      the worker threads mid-request.
+ *   3. On the GRACEFUL path, defer nxt_process_quit (which closes
+ *      listen sockets and runs nxt_runtime_quit -> exit) by one
+ *      graceful_timeout.  Worker engines drain in parallel during
+ *      that window; their threads exit individually as they finish.
+ *      This is the "main-engine wait" the per-engine drain
+ *      coordinator alone cannot deliver, and is the minimum
+ *      coordination needed for the response to flow back to the
+ *      client before the router process dies.
+ *
+ *   On the NORMAL path the handler degrades to the upstream
+ *   behaviour: call nxt_process_quit immediately.
+ */
+static void
+nxt_router_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_buf_t           *b;
+    uint8_t             quit_param;
+    nxt_work_t          *work;
+    nxt_runtime_t       *rt;
+    nxt_event_engine_t  *engine;
+    nxt_event_engine_t  *main_engine;
+
+    quit_param = NXT_PORT_QUIT_NORMAL;
+
+    b = msg->buf;
+    if (b != NULL && nxt_buf_mem_used_size(&b->mem) >= 1) {
+        quit_param = b->mem.pos[0];
+    }
+
+    rt = task->thread->runtime;
+    rt->quit_mode = quit_param;
+
+    if (quit_param != NXT_PORT_QUIT_GRACEFUL || nxt_router == NULL) {
+        nxt_process_quit(task, 0);
+        return;
+    }
+
+    main_engine = task->thread->engine;
+
+    /*
+     * Sum active_conns_cnt across all worker engines (atomic reads).
+     * If every worker engine is idle, nothing to drain — fall through
+     * to the immediate nxt_process_quit so SIGQUIT-on-idle keeps
+     * the prompt-exit semantics that test_sigquit_no_active_exits_fast
+     * asserts.  The race against a conn that arrives between the
+     * check and the queue traversal is harmless: such a conn would
+     * be torn down by the engine free path along with everything
+     * else, which is the same outcome NXT_PORT_QUIT_NORMAL produces.
+     */
+    {
+        nxt_atomic_uint_t  total_active;
+
+        total_active = 0;
+        nxt_queue_each(engine, &nxt_router->engines, nxt_event_engine_t,
+                       link0)
+        {
+            total_active += engine->active_conns_cnt;
+        } nxt_queue_loop;
+
+        if (total_active == 0) {
+            nxt_process_quit(task, 0);
+            return;
+        }
+    }
+
+    /*
+     * Stash a pointer to the main router engine so each worker's
+     * drain-done callback can post the early-exit work back here.
+     * Reset the engine counter to the number of workers we are
+     * about to dispatch to.
+     */
+    nxt_router->graceful_main_engine = main_engine;
+    nxt_router->draining_engines = 0;
+
+    nxt_queue_each(engine, &nxt_router->engines, nxt_event_engine_t, link0) {
+        /*
+         * Skip the calling engine — the main router engine accepts
+         * no HTTP conns directly, but it carries listen sockets that
+         * nxt_process_quit() will close, so we defer it below.
+         */
+        if (engine == main_engine) {
+            continue;
+        }
+
+        work = nxt_zalloc(sizeof(nxt_work_t));
+        if (work == NULL) {
+            continue;
+        }
+
+        work->handler = nxt_router_worker_thread_quit;
+        work->task = &engine->task;
+        work->obj = NULL;
+        work->data = NULL;
+
+        nxt_atomic_fetch_add(&nxt_router->draining_engines, 1);
+        nxt_event_engine_post(engine, work);
+    } nxt_queue_loop;
+
+    /*
+     * Release the listening port to the kernel immediately so a
+     * fast restart cycle (test conftest, or operator-driven reload)
+     * doesn't see EADDRINUSE while we wait out the drain.  Two
+     * coordinated mutations:
+     *
+     *   1. Set every worker engine's lev->socket.fd to -1 so that
+     *      worker threads, when they later run
+     *      nxt_router_worker_thread_quit, skip the
+     *      nxt_fd_event_disable() call (which would otherwise
+     *      epoll_ctl(DEL) on a closed FD and emit an alert).
+     *      The worker thread isn't reading those lev structs
+     *      between QUIT IPC arrival and the dispatched quit work
+     *      running, so this main-thread mutation is safe.
+     *
+     *   2. Close the underlying ls->socket FD once.  Workers share
+     *      the same kernel FD via the inherited listen socket; one
+     *      close releases the port.
+     */
+    {
+        nxt_queue_link_t     *qlk, *llk;
+        nxt_listen_event_t   *lev;
+        nxt_socket_conf_t    *skcf;
+        nxt_listen_socket_t  *ls;
+
+        nxt_queue_each(engine, &nxt_router->engines, nxt_event_engine_t,
+                       link0)
+        {
+            for (llk = nxt_queue_first(&engine->listen_connections);
+                 llk != nxt_queue_tail(&engine->listen_connections);
+                 llk = nxt_queue_next(llk))
+            {
+                lev = nxt_queue_link_data(llk, nxt_listen_event_t, link);
+                lev->socket.fd = -1;
+            }
+        } nxt_queue_loop;
+
+        for (qlk = nxt_queue_first(&nxt_router->sockets);
+             qlk != nxt_queue_tail(&nxt_router->sockets);
+             qlk = nxt_queue_next(qlk))
+        {
+            skcf = nxt_queue_link_data(qlk, nxt_socket_conf_t, link);
+            ls = skcf->listen;
+            if (ls != NULL && ls->socket != -1) {
+                nxt_socket_close(task, ls->socket);
+                ls->socket = -1;
+            }
+        }
+    }
+
+    /*
+     * If for some reason no worker was dispatched (e.g. the only
+     * engine in router->engines was the main engine), fall through
+     * to immediate exit — the deferred timer below would otherwise
+     * wait for a drain-done that will never arrive.
+     */
+    if (nxt_router->draining_engines == 0) {
+        nxt_process_quit(task, 0);
+        return;
+    }
+
+    /*
+     * Defer the main-engine teardown by graceful_timeout via the
+     * engine's own timer infrastructure.  Reusing graceful_timer is
+     * safe: the main router engine never enters the runtime drain
+     * coordinator's GRACEFUL branch (its active_conns_cnt is always
+     * zero so the fast-path fall-through fires), which means
+     * graceful_timer is otherwise unused on this engine.
+     */
+    main_engine->graceful_timer.handler = nxt_router_graceful_main_exit;
+    main_engine->graceful_timer.work_queue = &main_engine->fast_work_queue;
+    main_engine->graceful_timer.log = &nxt_main_log;
+    main_engine->graceful_timer.task = &main_engine->task;
+    main_engine->graceful_timer.bias = NXT_TIMER_DEFAULT_BIAS;
+
+    /*
+     * Defer slightly past the worker engines' graceful_timeout so
+     * that on the timeout-escalation path, each worker's timer
+     * handler fires first (logging "graceful drain timeout: forcing
+     * close on N active connection(s)" and force-closing conns)
+     * before the main router process exits.  Without the +500ms,
+     * the main timer can race ahead and exit() the process before
+     * the worker WARN log lands, losing the visible escalation
+     * trace.
+     */
+    nxt_log(task, NXT_LOG_NOTICE,
+            "graceful drain: deferring router exit by %uDms",
+            (uint32_t) NXT_RUNTIME_GRACEFUL_TIMEOUT_DEFAULT + 500);
+
+    nxt_timer_add(main_engine, &main_engine->graceful_timer,
+                  NXT_RUNTIME_GRACEFUL_TIMEOUT_DEFAULT + 500);
+}
+
+
 static void
 nxt_router_worker_thread_quit(nxt_task_t *task, void *obj, void *data)
 {
+    nxt_uint_t          active;
+    nxt_runtime_t       *rt;
     nxt_event_engine_t  *engine;
 
     nxt_debug(task, "router worker thread quit");
 
     engine = task->thread->engine;
+    rt = task->thread->runtime;
 
     engine->shutdown = 1;
+
+    /*
+     * P5: when the router process is exiting on the GRACEFUL path,
+     * drain in-flight HTTP/1.1 requests on this worker engine before
+     * letting it exit.  rt->quit_mode is propagated to the router by
+     * nxt_signal_quit_handler() (P5 wire-format read).
+     *
+     * The drain coordinator mirrors nxt_runtime_quit() but uses
+     * nxt_thread_exit (via graceful_done) as the terminal action
+     * instead of nxt_runtime_exit (which would exit the whole router
+     * process and abort any peer worker thread that was still
+     * draining).
+     */
+    if (rt->quit_mode == NXT_PORT_QUIT_GRACEFUL
+        && !engine->graceful_draining)
+    {
+        /*
+         * P5: disable accept(2) on this worker's listen events so
+         * we stop pulling new conns onto the engine while we drain.
+         * The lev->socket.fd is already -1 if the main thread's
+         * nxt_router_quit_handler closed it before dispatching us
+         * (which it does on the GRACEFUL path); skip in that case.
+         */
+        {
+            nxt_queue_link_t    *link;
+            nxt_listen_event_t  *lev;
+
+            for (link = nxt_queue_first(&engine->listen_connections);
+                 link != nxt_queue_tail(&engine->listen_connections);
+                 link = nxt_queue_next(link))
+            {
+                lev = nxt_queue_link_data(link, nxt_listen_event_t, link);
+                if (lev->socket.fd != -1) {
+                    nxt_fd_event_disable(engine, &lev->socket);
+                }
+            }
+        }
+
+        nxt_runtime_close_idle_connections(engine);
+
+        active = nxt_runtime_drain_active_connections(task, engine);
+
+        nxt_log(task, NXT_LOG_NOTICE,
+                "graceful drain: %ui active connection(s)", active);
+
+        engine->graceful_done = nxt_router_worker_thread_drain_done;
+
+        if (active != 0) {
+            engine->graceful_draining = 1;
+
+            engine->graceful_timer.handler =
+                nxt_runtime_graceful_timeout_handler;
+            engine->graceful_timer.work_queue = &engine->fast_work_queue;
+            engine->graceful_timer.log = &nxt_main_log;
+            engine->graceful_timer.task = &engine->task;
+            engine->graceful_timer.bias = NXT_TIMER_DEFAULT_BIAS;
+
+            nxt_timer_add(engine, &engine->graceful_timer,
+                          NXT_RUNTIME_GRACEFUL_TIMEOUT_DEFAULT);
+
+            /*
+             * Hold off on thread_exit; either the natural completion
+             * (nxt_runtime_drain_conn_completed) or the timer handler
+             * will invoke nxt_router_worker_thread_drain_done.
+             */
+            return;
+        }
+
+        /*
+         * Zero active conns on this worker — invoke drain_done
+         * directly so the main router engine's counter stays
+         * accurate (this worker decrements its share before exiting).
+         */
+        nxt_router_worker_thread_drain_done(task, NULL, NULL);
+        return;
+    }
 
     if (nxt_queue_is_empty(&engine->joints)) {
         nxt_thread_exit(task->thread);

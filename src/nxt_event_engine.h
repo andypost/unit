@@ -470,7 +470,27 @@ struct nxt_event_engine_s {
     /* The engine ID, the main engine has ID 0. */
     uint32_t                   id;
 
-    uint8_t                    shutdown;  /* 1 bit */
+    uint8_t                    shutdown;          /* 1 bit */
+    uint8_t                    graceful_draining; /* 1 bit (P5) */
+
+    /*
+     * Armed by the runtime / router thread-quit on the GRACEFUL path
+     * when there are still active connections after idle conns have
+     * been closed.  On expiry, graceful_timer.handler walks
+     * engine->active_connections and force-closes any that did not
+     * finish their in-flight request before the timeout, then runs
+     * graceful_done.
+     *
+     * graceful_done is the per-engine terminal action invoked when
+     * either (a) the timer expires or (b) active_conns_cnt drops to
+     * zero ahead of the timer.  Main-process engines use it to post
+     * nxt_runtime_exit (-> exit(status)); router worker thread
+     * engines use it to call nxt_thread_exit.  This lets a single
+     * drain coordinator serve both engine families without baking
+     * exit-policy into the close path.
+     */
+    nxt_timer_t                graceful_timer;    /* P5 */
+    nxt_work_handler_t         graceful_done;     /* P5 */
 
     uint32_t                   batch;
     uint32_t                   connections;

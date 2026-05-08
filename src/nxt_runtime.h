@@ -129,6 +129,51 @@ void nxt_runtime_stop_app_processes(nxt_task_t *task, nxt_runtime_t *rt);
  */
 nxt_buf_t *nxt_runtime_quit_buf(nxt_task_t *task, uint8_t quit_param);
 
+/*
+ * P5: notify the runtime that a conn just decremented
+ * engine->active_conns_cnt during a graceful drain.  When the count
+ * hits zero before graceful_timeout, the runtime posts nxt_runtime_exit
+ * immediately rather than waiting on the timer.  Cheap no-op when the
+ * engine is not currently draining.
+ */
+void nxt_runtime_drain_conn_completed(nxt_task_t *task,
+    nxt_event_engine_t *engine);
+
+/*
+ * P5: walk engine->idle_connections and close each.  Exposed for
+ * router worker engines (nxt_router_worker_thread_quit) so the same
+ * idle-then-active drain shape that nxt_runtime_quit() applies on
+ * the main engine also runs per worker thread.
+ */
+void nxt_runtime_close_idle_connections(nxt_event_engine_t *engine);
+
+/*
+ * P5: walk engine->active_connections and mark each connection so
+ * its next nxt_h1p_request_close() takes the shutdown branch instead
+ * of going back to keep-alive.  Returns the count.  Used by
+ * nxt_runtime_quit() and by nxt_router_worker_thread_quit() so the
+ * router worker engines drain symmetrically with the main process.
+ */
+nxt_uint_t nxt_runtime_drain_active_connections(nxt_task_t *task,
+    nxt_event_engine_t *engine);
+
+/*
+ * P5: graceful_timeout timer handler.  Force-closes every still-
+ * active conn on the engine and runs engine->graceful_done.
+ * Exposed so per-engine setup paths can attach it to
+ * engine->graceful_timer.handler.
+ */
+void nxt_runtime_graceful_timeout_handler(nxt_task_t *task, void *obj,
+    void *data);
+
+/*
+ * P5: hard-coded graceful_timeout (ms) used by every engine that
+ * arms graceful_timer.  TODO: surface under "settings" via
+ * nxt_conf_validation.c — deferred to a follow-up to keep this PR
+ * scoped to the coordinator.
+ */
+#define NXT_RUNTIME_GRACEFUL_TIMEOUT_DEFAULT  30000
+
 NXT_EXPORT nxt_port_t *nxt_runtime_port_find(nxt_runtime_t *rt, nxt_pid_t pid,
     nxt_port_id_t port_id);
 

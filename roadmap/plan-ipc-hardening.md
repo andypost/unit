@@ -98,8 +98,9 @@ Classify each:
    in commit message).
 2. Fd with `CLOSE_FD` → close fd on `!= NXT_OK`.
 3. Buffer with refcount-bearing completion → run completion on `!= NXT_OK`.
-4. Both → do both, completion first (matches `nxt_port_error_handler`
-   ordering; see PR #8 commit `5a9f37d`).
+4. Both → do both, FD first (matches `nxt_port_error_handler` ordering
+   at `src/nxt_port_socket.c:1361` — `nxt_port_msg_close_fd(msg)` runs
+   before each buf's `completion_handler` is queued).
 
 ### Path-join helper (gemini PR #6 finding 3, deferred)
 
@@ -177,6 +178,11 @@ Reject in handlers; alert; reply with `NXT_PORT_MSG_RPC_ERROR`.
 - Cleaning up `nxt_runtime.c:511`/`:533` shutdown cascades unless they
   classify into category 2/3/4 above. Most likely category 1 (purely
   best-effort process-exit signaling).
+- General FD-lifetime hygiene across the rest of the codebase (audit
+  slot PR-E: accept-CLOEXEC, pipe-CLOEXEC, compression mmap FD leak,
+  plain `accept()` without CLOEXEC, etc.). The scope overlaps
+  conceptually but the bugs are pre-existing and unrelated to the IPC
+  reply-failure path; track and ship separately.
 
 ## Suggested commit shape
 

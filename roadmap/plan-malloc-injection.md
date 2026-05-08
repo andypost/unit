@@ -85,8 +85,16 @@ narrowly:
 - `mmap` — covers `nxt_port_mmap_*` paths if they get added later.
 - `posix_memalign` — covers aligned allocations in `nxt_buf_mem_alloc` etc.
 
-For PR scope: ship only `malloc` + `posix_memalign`. The rest can come as
-needed.
+For PR scope: ship `malloc`, `posix_memalign`, and `mmap` wrappers. The
+`mmap` wrapper costs almost nothing extra at the shim layer and lets the
+harness fence audit V11 (compression mmap FD leak) as a natural second
+consumer.
+
+Direct wrappers for `nxt_port_msg_alloc` and similar Unit-level helpers
+are intentionally **not** shipped — the stack-walk filter (next
+subsection) lets tests target a logical site like
+`malloc@nxt_port_msg_alloc:1` by walking up from `malloc` itself, so
+each Unit-level helper does not need its own wrapper.
 
 ### Per-symbol vs per-call-site
 
@@ -98,11 +106,24 @@ support targeting via a stack-walk filter:
 MALLOC_INJECT_TARGETS  "malloc@nxt_port_msg_alloc:1"
 ```
 
-Implementation: when targeted-mode is active, walk one frame up the
-stack with `__builtin_return_address(1)` and resolve via `dladdr()`; if
-the symbol matches, count and possibly fail. This costs ~1 µs per call
-in injection mode, zero when disabled (the shim early-returns when
-`MALLOC_INJECT_TARGETS` is empty).
+Implementation: when targeted-mode is active, walk up the stack via
+`__builtin_return_address(N)` for `N = 1..MAX_DEPTH` (default 8) and
+resolve each frame via `dladdr()`; if any frame's symbol matches the
+targeted caller, count and possibly fail. Single-frame lookup is too
+shallow for Unit's allocator stack — e.g.
+`nxt_port_msg_alloc → nxt_malloc → malloc` puts the logical caller two
+frames up, and `nxt_mp_alloc → nxt_malloc → malloc` puts it two frames
+up too. Depth is configurable per target via a `/N` suffix:
+`malloc@nxt_port_msg_alloc/4:1` caps the walk at 4 frames for that
+target, useful for keeping the cost bounded on hot allocations.
+
+Pre-resolve target symbols at shim init via one-time `dlsym()` so the
+per-call hot path only does `dladdr()` (or, better, an address-range
+compare against pre-resolved symbol bounds). This avoids `dladdr()`'s
+per-call internal lock on glibc versions where it isn't fully reentrant.
+
+Cost: a few µs per call in injection mode, zero when disabled (the shim
+early-returns when `MALLOC_INJECT_TARGETS` is empty).
 
 ## Layout
 
@@ -136,14 +157,18 @@ of the default build. CI invokes it explicitly before running the
 
 ```python
 @pytest.fixture
-def malloc_inject(unit, tmp_path):
+def malloc_inject(unit):
     """Yield a context manager that activates allocator fault injection
     against the running Unit instance.  Requires the Unit binary to have
     been started under LD_PRELOAD=build/malloc_inject.so (handled by the
     `unit` fixture when the test is decorated with @pytest.mark.malloc_inject).
-    """
-    sock = tmp_path / 'malloc-inject.sock'
 
+    The shim's control socket path is `/tmp/malloc-inject-<pid>.sock` by
+    convention; `unit.pid` is set after the daemon starts.  The `unit`
+    fixture is responsible for exporting `MALLOC_INJECT_CONTROL` to the
+    daemon's environment so the path matches what `_send_to_shim()` here
+    expects.
+    """
     @contextmanager
     def _activate(fail_when, call_count, then='succeed'):
         spec = f'{fail_when}:{call_count}'
@@ -277,6 +302,9 @@ Once the harness exists, the same pattern fences:
 - The cert-rotation flow under heavy reconfigure churn.
 - `nxt_router_access_log_reopen` retry on `nxt_port_socket_write` failure.
 - `nxt_main_port_modules_handler` (modules discovery) reply path.
+- **Audit V11** — `nxt_http_compression.c:280` FD leak when `mmap()` of
+  the source file fails. Natural second-consumer test for the `mmap`
+  wrapper shipped in v1.
 - Any future code that does the `nxt_port_socket_write(..., b)` pattern.
 
 These should be added incrementally as features touching those paths

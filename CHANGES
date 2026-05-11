@@ -14,6 +14,12 @@ Changes with FreeUnit 1.35.4                                     xx xxx 2026
     *) Bugfix: replace removed cgi module with email.parser in Python upload
        test fixture; fixes test suite compatibility with Python 3.13.
 
+    *) Bugfix: harden HTTP/URI parser and string helper bounds — proxy
+       response Content-Length underflow guarded in nxt_h1proto.c, oversized
+       upstream Content-Length values are now logged and flagged inconsistent
+       in nxt_http_proxy.c, nxt_is_complex_uri_encoded() off-by-one fixed for
+       trailing "%" sequences, and nxt_rmemstrn() rejects length > buffer.
+
 Changes with FreeUnit 1.35.3                                     07 Apr 2026
 
     *) Feature: migrate contrib package mirror from packages.nginx.org to

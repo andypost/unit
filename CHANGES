@@ -14,6 +14,17 @@ Changes with FreeUnit 1.35.4                                     xx xxx 2026
     *) Bugfix: replace removed cgi module with email.parser in Python upload
        test fixture; fixes test suite compatibility with Python 3.13.
 
+    *) Bugfix: tighten WebSocket frame-bound checks across libunit and the
+       protocol layer.  Adds guards for an OOB header read on truncated
+       extended-length frames (libunit nxt_unit.c), the matching unchecked
+       hsize in nxt_unit_websocket_retain(), the unvalidated MSB of the
+       64-bit extended payload length (RFC 6455 §5.2), a frame-size
+       decrement that was a no-op (nxt_http_websocket.c) and could leak
+       cross-frame bytes into the outgoing buffer, missing buffer-capacity
+       checks on the Java sendWsFrame JNI entry points, and a uint64
+       wraparound on pending_payload_len in the Python ASGI WebSocket
+       handler.  See security-audit.md V8/V9/V10/V12.
+
 Changes with FreeUnit 1.35.3                                     07 Apr 2026
 
     *) Feature: migrate contrib package mirror from packages.nginx.org to

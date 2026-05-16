@@ -225,3 +225,4 @@ def test_python_isolation_cgroup_invalid(require):
     check_invalid('')
     check_invalid('../scope')
     check_invalid('scope/../python')
+    check_invalid('scope\0python')

@@ -3364,9 +3364,17 @@ nxt_conf_vldt_cgroup_path(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
                                    &cgpath);
     }
 
-    sprintf(path, "/%*s/", (int) cgpath.length, cgpath.start);
+    if (cgpath.length == 0
+        || memchr(cgpath.start, '\0', cgpath.length) != NULL)
+    {
+        return nxt_conf_vldt_error(vldt,
+                                   "The cgroup path \"%V\" is invalid.",
+                                   &cgpath);
+    }
 
-    if (cgpath.length == 0 || strstr(path, "/../") != NULL) {
+    snprintf(path, sizeof(path), "/%.*s/", (int) cgpath.length, cgpath.start);
+
+    if (strstr(path, "/../") != NULL) {
         return nxt_conf_vldt_error(vldt,
                                    "The cgroup path \"%V\" is invalid.",
                                    &cgpath);

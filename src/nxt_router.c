@@ -4235,6 +4235,28 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
             field->name_length = f->name_length;
             field->value_length = f->value_length;
+
+            /*
+             * The response is built inside an mmap region the app worker
+             * writes; sptr offsets are peer-supplied.  Vet the offset +
+             * length against the response buffer before dereferencing,
+             * otherwise a buggy or malicious worker can encode arbitrary
+             * offsets and have the router serialise bytes from outside
+             * the response buffer (cross-request bleed within the same
+             * mmap region, or beyond) onto the wire.
+             */
+            if (nxt_slow_path(
+                    !nxt_unit_sptr_in_buf(&f->name, f->name_length,
+                                          b->mem.pos, b_size)
+                    || !nxt_unit_sptr_in_buf(&f->value, f->value_length,
+                                             b->mem.pos, b_size)))
+            {
+                nxt_alert(task, "response field sptr out of buffer "
+                                "(name_length=%d, value_length=%D)",
+                          (int) f->name_length, f->value_length);
+                goto fail;
+            }
+
             field->name = nxt_unit_sptr_get(&f->name);
             field->value = nxt_unit_sptr_get(&f->value);
 
@@ -4256,6 +4278,16 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         r->status = resp->status;
 
         if (resp->piggyback_content_length != 0) {
+            if (nxt_slow_path(
+                    !nxt_unit_sptr_in_buf(&resp->piggyback_content,
+                                          resp->piggyback_content_length,
+                                          b->mem.pos, b_size)))
+            {
+                nxt_alert(task, "response piggyback sptr out of buffer "
+                                "(length=%D)", resp->piggyback_content_length);
+                goto fail;
+            }
+
             b->mem.pos = nxt_unit_sptr_get(&resp->piggyback_content);
             b->mem.free = b->mem.pos + resp->piggyback_content_length;
 

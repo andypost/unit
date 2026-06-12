@@ -30,6 +30,14 @@
 #define PORT_MMAP_SIZE          (PORT_MMAP_HEADER_SIZE + PORT_MMAP_DATA_SIZE)
 #define PORT_MMAP_CHUNK_COUNT   (PORT_MMAP_DATA_SIZE / PORT_MMAP_CHUNK_SIZE)
 
+/*
+ * Generous upper bound on the number of shared-memory regions tracked
+ * per peer.  Used to cap peer-supplied mmap indices before the growth
+ * arithmetic in nxt_port_mmap_at(), so a forged hdr->id = 0xFFFFFFFF
+ * cannot wrap the growth loop and return an out-of-array pointer.
+ */
+#define PORT_MMAP_MAX_REGIONS   (1u << 20)
+
 
 typedef uint32_t  nxt_chunk_id_t;
 

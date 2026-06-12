@@ -48,6 +48,19 @@ nxt_port_mmap_at(nxt_port_mmaps_t *port_mmaps, uint32_t i)
 {
     uint32_t  cap;
 
+    /*
+     * Cap the index against a generous ceiling before the growth
+     * arithmetic.  When called from the receive path, i flows in from
+     * hdr->id of a peer-mapped region; a forged value of 0xFFFFFFFF
+     * would otherwise wrap (i + 1) to 0 in both the initial cap
+     * assignment and the loop condition, skip realloc, and return
+     * port_mmaps->elts + 0xFFFFFFFF — an out-of-array pointer the
+     * caller then writes through.
+     */
+    if (nxt_slow_path(i >= PORT_MMAP_MAX_REGIONS)) {
+        return NULL;
+    }
+
     cap = port_mmaps->cap;
 
     if (cap == 0) {

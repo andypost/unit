@@ -1,0 +1,106 @@
+APKBUILD changes for the armv7 debug build.
+
+Apply by hand to community/freeunit/APKBUILD in your aports checkout
+together with arm-alignment-debug.patch from this directory.
+
+1) Add the patch to source=
+---------------------------
+source="$pkgname-$pkgver.tar.gz::https://github.com/freeunitorg/freeunit/archive/refs/tags/$pkgver.tar.gz
+	$pkgname.initd
+	$pkgname.confd
+	$pkgname.logrotate
+	phpver.patch
+	fix-py-3-14.patch
+	fix-py-upload-edge-cases.patch
+	arm-alignment-debug.patch
+	"
+
+Then: cd community/freeunit && abuild checksum
+
+2) UBSan alignment instrumentation in build()
+---------------------------------------------
+Insert the case-block BEFORE the first ./configure call:
+
+build() {
+	local _otel=--otel
+	case "$CARCH" in
+		arm*|ppc64le|x86) _otel='' ;;
+	esac
+
+	# armv7 SIGBUS hunt: UBSan + symbols.  Remove after fix lands.
+	case "$CARCH" in
+		armhf|armv7)
+			export CFLAGS="$CFLAGS -fsanitize=alignment,undefined \
+			              -fno-sanitize-recover=alignment \
+			              -fno-omit-frame-pointer -g3 -O1"
+			export LDFLAGS="$LDFLAGS -fsanitize=alignment,undefined"
+			;;
+	esac
+
+	./configure \
+		...
+
+3) Make the crash observable during check()
+-------------------------------------------
+Temporarily flip these in check() so SIGBUS surfaces as a test
+failure with the router stderr captured, instead of being silently
+allowed and reaped:
+
+	case "$CARCH" in
+		armhf | armv7) _allow_fail=no ;;  # was: yes
+	esac
+
+	# Comment out for the debug run:
+	# pkill -f 'unitd.*--no-daemon' 2>/dev/null || true
+
+Revert both to current values once a fix is in.
+
+4) Reproduce
+------------
+docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+docker run --platform linux/arm/v7 -it --rm \
+  -e APORTSDIR=/mnt -v $(pwd):/mnt \
+  --ulimit nofile=65536:65536 \
+  registry.alpinelinux.org/alpine/infra/docker/alpine-gitlab-ci:latest \
+  sh -c "sleep infinity"
+docker exec -it --user buildozer <id> ash
+cd /mnt/community/freeunit
+abuild checksum
+abuild -r 2>&1 | tee /tmp/build.log
+
+5) Read the output
+------------------
+UBSan diagnostics look like:
+  src/nxt_http_parse.c:414:24: runtime error: load of misaligned
+  address 0xaabbccdd for type 'uint64_t', which requires 8 byte
+  alignment
+
+SIGBUS handler lines look like:
+  unit[armdbg]: SIGBUS si_addr=0x... pc=0x76abcdef ...
+
+Resolve PCs against the built binary:
+  addr2line -e src/freeunit-1.35.3/build/sbin/unitd -fC 0x76abcdef
+
+Bisect markers ("unit[armdbg]: pre/post ...") narrow the trap to
+either nxt_h1p_init or nxt_http_response_hash_init even when stderr
+is truncated.
+
+6) Suspect ranking (from source review)
+---------------------------------------
+- nxt_http_ver_t union @ src/nxt_http_parse.h:23-33
+  (uint64_t aliased with u_char[8], no nxt_aligned(8))
+- nxt_http_request_parse_t.version @ src/nxt_http_parse.h:49
+  (no aligned attribute; .version after string structs)
+- nxt_port_queue_t / nxt_nncq_t shm atomics
+  (shm offset can be 4-aligned; see src/nxt_port_queue.h, nxt_nncq.h)
+- nxt_thread_time_t 64-bit time_t / nxt_nsec_t
+
+Fix template once a line is identified:
+  typedef union {
+      ...
+  } nxt_aligned(8) nxt_http_ver_t;
+
+or:
+  uint64_t v __attribute__((aligned(8)));
+  nxt_memcpy(&v, p, 8);
+  if (v == http11_ui64 || ...)

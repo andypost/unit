@@ -1,0 +1,123 @@
+Debug-only instrumentation for the armv7 SIGBUS investigation.
+
+Adds:
+  1) A SIGBUS handler installed at the top of nxt_router_start() that
+     prints si_addr, PC, LR, SP, and r0..r7 from ucontext_t before the
+     router child dies.  Resolve PC with:
+       addr2line -e build/sbin/unitd -fC 0x<pc>
+  2) dprintf() bisect markers around the two sub-calls inside
+     nxt_http_init() so the test log identifies which sub-init traps
+     even if the handler output is truncated.
+
+No abort().  No behavioural change beyond stderr writes and the
+SIGBUS handler.  Drop before merging any fix.
+
+Pair with the UBSan CFLAGS hunk described in apkbuild.snippet for the
+strongest signal under clang-22 + musl + qemu-user.
+
+--- a/src/nxt_router.c	2026-06-12 15:52:59.173888692 +0000
++++ b/src/nxt_router.c	2026-06-12 15:53:22.390209728 +0000
+@@ -22,6 +22,12 @@
+ #include <nxt_app_queue.h>
+ #include <nxt_port_queue.h>
+ #include <nxt_http_compression.h>
++#if defined(__arm__)
++#include <signal.h>
++#include <ucontext.h>
++#include <unistd.h>
++#include <string.h>
++#endif
+ 
+ #define NXT_SHARED_PORT_ID  0xFFFFu
+ 
+@@ -339,6 +345,48 @@
+ }
+ 
+ 
++#if defined(__arm__)
++static void
++nxt_armv7_sigbus(int sig, siginfo_t *si, void *uctx)
++{
++    ucontext_t  *uc = uctx;
++
++    (void) sig;
++
++    dprintf(2,
++        "unit[armdbg]: SIGBUS si_addr=%p pc=0x%08lx lr=0x%08lx sp=0x%08lx\n"
++        "unit[armdbg]:   r0=%08lx r1=%08lx r2=%08lx r3=%08lx\n"
++        "unit[armdbg]:   r4=%08lx r5=%08lx r6=%08lx r7=%08lx\n",
++        si->si_addr,
++        (unsigned long) uc->uc_mcontext.arm_pc,
++        (unsigned long) uc->uc_mcontext.arm_lr,
++        (unsigned long) uc->uc_mcontext.arm_sp,
++        (unsigned long) uc->uc_mcontext.arm_r0,
++        (unsigned long) uc->uc_mcontext.arm_r1,
++        (unsigned long) uc->uc_mcontext.arm_r2,
++        (unsigned long) uc->uc_mcontext.arm_r3,
++        (unsigned long) uc->uc_mcontext.arm_r4,
++        (unsigned long) uc->uc_mcontext.arm_r5,
++        (unsigned long) uc->uc_mcontext.arm_r6,
++        (unsigned long) uc->uc_mcontext.arm_r7);
++    _exit(135);
++}
++
++
++static void
++nxt_armv7_install_sigbus(void)
++{
++    struct sigaction  sa;
++
++    memset(&sa, 0, sizeof(sa));
++    sa.sa_sigaction = nxt_armv7_sigbus;
++    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
++    sigemptyset(&sa.sa_mask);
++    sigaction(SIGBUS, &sa, NULL);
++}
++#endif
++
++
+ static nxt_int_t
+ nxt_router_start(nxt_task_t *task, nxt_process_data_t *data)
+ {
+@@ -347,6 +395,10 @@
+     nxt_router_t   *router;
+     nxt_runtime_t  *rt;
+ 
++#if defined(__arm__)
++    nxt_armv7_install_sigbus();
++#endif
++
+     rt = task->thread->runtime;
+ 
+     nxt_log(task, NXT_LOG_INFO, "router started");
+--- a/src/nxt_http_request.c	2026-06-12 15:52:59.178728233 +0000
++++ b/src/nxt_http_request.c	2026-06-12 15:53:39.126209346 +0000
+@@ -7,6 +7,7 @@
+ #include <nxt_router.h>
+ #include <nxt_http.h>
+ #include <nxt_otel.h>
++#include <unistd.h>
+ 
+ 
+ static nxt_int_t nxt_http_validate_host(nxt_str_t *host, nxt_mp_t *mp);
+@@ -68,13 +69,19 @@
+ {
+     nxt_int_t  ret;
+ 
++    dprintf(2, "unit[armdbg]: pre nxt_h1p_init\n");
+     ret = nxt_h1p_init(task);
++    dprintf(2, "unit[armdbg]: post nxt_h1p_init ret=%d\n", (int) ret);
+ 
+     if (ret != NXT_OK) {
+         return ret;
+     }
+ 
+-    return nxt_http_response_hash_init(task);
++    dprintf(2, "unit[armdbg]: pre nxt_http_response_hash_init\n");
++    ret = nxt_http_response_hash_init(task);
++    dprintf(2, "unit[armdbg]: post nxt_http_response_hash_init ret=%d\n",
++            (int) ret);
++    return ret;
+ }
+ 
+ 

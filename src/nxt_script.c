@@ -541,12 +541,19 @@ nxt_script_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_runtime_t        *rt;
     nxt_port_msg_type_t  type;
 
-    port = nxt_runtime_port_find(task->thread->runtime, msg->port_msg.pid,
+    /*
+     * Look up the sender's port via the kernel-validated PID
+     * (SCM_CREDENTIALS).  msg->port_msg.pid is self-declared, so using
+     * it would let a compromised worker spoof the controller / router
+     * and pull arbitrary script material out of main.
+     */
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_recv_msg_cmsg_pid(msg),
                                  msg->port_msg.reply_port);
 
     if (nxt_slow_path(port == NULL)) {
         nxt_alert(task, "process port not found (pid %PI, reply_port %d)",
-                  msg->port_msg.pid, msg->port_msg.reply_port);
+                  nxt_recv_msg_cmsg_pid(msg), msg->port_msg.reply_port);
         return;
     }
 
@@ -554,7 +561,7 @@ nxt_script_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
                       && port->type != NXT_PROCESS_ROUTER))
     {
         nxt_alert(task, "process %PI cannot store scripts",
-                  msg->port_msg.pid);
+                  nxt_recv_msg_cmsg_pid(msg));
         return;
     }
 

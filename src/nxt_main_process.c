@@ -632,7 +632,18 @@ nxt_main_process_created_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     rt = task->thread->runtime;
 
-    port = nxt_runtime_port_find(rt, msg->port_msg.pid,
+    /*
+     * Look up the sender's port via the kernel-validated PID
+     * (SCM_CREDENTIALS).  The PROCESS_CREATED message is sent by the
+     * newly created process itself (nxt_process_send_created()), and
+     * main registers that process's port under the same kernel PID
+     * (fork() return value, or the cmsg PID from the WHOAMI exchange),
+     * so this is a 1:1 replacement of the self-declared, spoofable
+     * msg->port_msg.pid.  Without it a compromised worker could pose
+     * as a process in the CREATING state and have main perform the
+     * privileged uid_map/gid_map writes at a moment of its choosing.
+     */
+    port = nxt_runtime_port_find(rt, nxt_recv_msg_cmsg_pid(msg),
                                  msg->port_msg.reply_port);
     if (nxt_slow_path(port == NULL)) {
         return;
@@ -1118,7 +1129,14 @@ nxt_main_port_socket_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_listening_socket_t  ls;
     u_char                  message[2048];
 
-    port = nxt_runtime_port_find(task->thread->runtime, msg->port_msg.pid,
+    /*
+     * Look up the sender's port via the kernel-validated PID
+     * (SCM_CREDENTIALS).  msg->port_msg.pid is self-declared, so using
+     * it would let a compromised worker impersonate the router and
+     * ask main to bind a privileged listening socket.
+     */
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_recv_msg_cmsg_pid(msg),
                                  msg->port_msg.reply_port);
     if (nxt_slow_path(port == NULL)) {
         return;
@@ -1126,7 +1144,7 @@ nxt_main_port_socket_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     if (nxt_slow_path(port->type != NXT_PROCESS_ROUTER)) {
         nxt_alert(task, "process %PI cannot create listener sockets",
-                  msg->port_msg.pid);
+                  nxt_recv_msg_cmsg_pid(msg));
 
         return;
     }
@@ -1333,17 +1351,33 @@ nxt_main_port_socket_unlink_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     size_t               i;
     nxt_buf_t            *b;
     const char           *filename;
+    nxt_port_t           *router_port;
     nxt_runtime_t        *rt;
     nxt_sockaddr_t       *sa;
     nxt_listen_socket_t  *ls;
+
+    rt = task->thread->runtime;
+
+    /*
+     * Privileged unlink of an attacker-controllable path.  Only accept
+     * from the router; identify the sender via SCM_CREDENTIALS so a
+     * compromised worker cannot spoof the message and have main remove
+     * arbitrary files.
+     */
+    router_port = rt->port_by_type[NXT_PROCESS_ROUTER];
+    if (nxt_slow_path(router_port == NULL
+                      || nxt_recv_msg_cmsg_pid(msg) != router_port->pid))
+    {
+        nxt_alert(task, "process %PI cannot unlink listener sockets",
+                  nxt_recv_msg_cmsg_pid(msg));
+        return;
+    }
 
     b = msg->buf;
     sa = (nxt_sockaddr_t *) b->mem.pos;
 
     filename = sa->u.sockaddr_un.sun_path;
     unlink(filename);
-
-    rt = task->thread->runtime;
 
     for (i = 0; i < rt->listen_sockets->nelts; i++) {
         const char  *name;
@@ -1448,8 +1482,21 @@ nxt_main_port_modules_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     rt = task->thread->runtime;
 
-    if (msg->port_msg.pid != rt->port_by_type[NXT_PROCESS_DISCOVERY]->pid) {
-        nxt_alert(task, "process %PI cannot send modules", msg->port_msg.pid);
+    /*
+     * Use the kernel-validated sender PID (SCM_CREDENTIALS) for both
+     * the authorisation check and the port lookup: msg->port_msg.pid
+     * is self-declared by the sender and a compromised worker can
+     * forge it to impersonate discovery / controller / router.  Guard
+     * against a NULL discovery slot — discovery exits after sending
+     * the modules message, so a late or duplicated message can arrive
+     * after rt->port_by_type[DISCOVERY] has been cleared.
+     */
+    if (nxt_slow_path(rt->port_by_type[NXT_PROCESS_DISCOVERY] == NULL
+                      || nxt_recv_msg_cmsg_pid(msg)
+                         != rt->port_by_type[NXT_PROCESS_DISCOVERY]->pid))
+    {
+        nxt_alert(task, "process %PI cannot send modules",
+                  nxt_recv_msg_cmsg_pid(msg));
         return;
     }
 
@@ -1458,7 +1505,8 @@ nxt_main_port_modules_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         return;
     }
 
-    port = nxt_runtime_port_find(task->thread->runtime, msg->port_msg.pid,
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_recv_msg_cmsg_pid(msg),
                                  msg->port_msg.reply_port);
 
     if (nxt_fast_path(port != NULL)) {
@@ -1620,8 +1668,19 @@ nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     ctl_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
 
-    if (nxt_slow_path(msg->port_msg.pid != ctl_port->pid)) {
-        nxt_alert(task, "process %PI cannot store conf", msg->port_msg.pid);
+    /*
+     * Use the kernel-validated sender PID (SCM_CREDENTIALS): msg->port_msg.pid
+     * is self-declared and a compromised worker can forge it to pose as the
+     * controller and have main rewrite the persistent configuration store —
+     * arbitrary configuration on the next reload is root code execution.
+     * The NULL guard covers the early-startup / late-teardown window in
+     * which the controller slot is unset.
+     */
+    if (nxt_slow_path(ctl_port == NULL
+                      || nxt_recv_msg_cmsg_pid(msg) != ctl_port->pid))
+    {
+        nxt_alert(task, "process %PI cannot store conf",
+                  nxt_recv_msg_cmsg_pid(msg));
         return;
     }
 
@@ -1728,10 +1787,29 @@ nxt_main_port_access_log_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     u_char               *path;
     nxt_int_t            ret;
     nxt_file_t           file;
-    nxt_port_t           *port;
+    nxt_port_t           *port, *router_port;
+    nxt_runtime_t        *rt;
     nxt_port_msg_type_t  type;
 
     nxt_debug(task, "opening access log file");
+
+    rt = task->thread->runtime;
+
+    /*
+     * Privileged file open as root with an attacker-controllable path.
+     * Only accept from the router; identify the sender via
+     * SCM_CREDENTIALS so a compromised worker cannot spoof the message
+     * and have main create / append to /etc/passwd or any other
+     * privileged path.
+     */
+    router_port = rt->port_by_type[NXT_PROCESS_ROUTER];
+    if (nxt_slow_path(router_port == NULL
+                      || nxt_recv_msg_cmsg_pid(msg) != router_port->pid))
+    {
+        nxt_alert(task, "process %PI cannot open access log",
+                  nxt_recv_msg_cmsg_pid(msg));
+        return;
+    }
 
     path = msg->buf->mem.pos;
 
@@ -1746,7 +1824,8 @@ nxt_main_port_access_log_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     type = (ret == NXT_OK) ? NXT_PORT_MSG_RPC_READY_LAST | NXT_PORT_MSG_CLOSE_FD
                            : NXT_PORT_MSG_RPC_ERROR;
 
-    port = nxt_runtime_port_find(task->thread->runtime, msg->port_msg.pid,
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_recv_msg_cmsg_pid(msg),
                                  msg->port_msg.reply_port);
 
     if (nxt_fast_path(port != NULL)) {

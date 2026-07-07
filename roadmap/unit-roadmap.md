@@ -26,11 +26,18 @@ _Dated note; revisit each release._ The **1.35.6** cycle is merged to
   OOB / cross-frame disclosure (High); CVEs to follow, backport to 1.34.x LTS.
   This advances **G2 (security disclosure process)** below.
 
-**Near-term security follow-ups** (not in 1.35.6): publish the advisories +
-request CVEs at the tag; backport to 1.34.x; the **wasmtime 35 → 36.0.10+
-security bump** (see [unit-wasm.md](unit-wasm.md) W1 — clears 2 CRITICAL +
-several HIGH Dependabot CVEs in `wasm-wasi-component`); and the pending
-port/header hardening PRs (#27/#28/#29).
+**Post-audit hardening** already forwarded upstream as focused PRs (in review):
+- **#88** — bound the shared-memory port queue item size (stack-overflow fix).
+- **#90** — reject control chars in `set_headers` names/values (response splitting).
+- **#91** — authorize privileged IPC senders by kernel-validated PID (`SCM_CREDENTIALS`).
+
+**Near-term security follow-ups** (not in 1.35.6):
+- Publish the two draft advisories + request CVEs **at the 1.35.6 tag**; backport to 1.34.x LTS.
+- Land the **wasmtime 35 → 36.0.12 security bump** (branch `fix/wasmtime-36-security-bump`, clears 2 CRITICAL + HIGH Dependabot CVEs in `wasm-wasi-component`; see [unit-wasm.md](unit-wasm.md) W1).
+- **wasmtime → 44** follow-up: the only remaining Rust CVE is `rustls-webpki` in `wasm-wasi-component`, blocked until wasmtime moves off rustls 0.22 (first release on webpki 0.103 is 44.0.0).
+- Remaining IPC/audit items still on `andypost/unit`: **#26** (Trivy + cgroup NUL), plus the deferred openat2 mount-via-fd (completes #14's mount vector).
+
+_Working state / resume notes live in `plan-finish-vectors.md` (maintainer-private, not committed)._
 
 ---
 

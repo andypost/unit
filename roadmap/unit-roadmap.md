@@ -11,6 +11,29 @@ Per-language detail lives in:
 
 ---
 
+## Release status — 1.35.6 (2026-07, imminent)
+
+_Dated note; revisit each release._ The **1.35.6** cycle is merged to
+`pre-1.35.6` and near release. It ships:
+
+- **Security hardening** — a 14-vector audit remediation across the HTTP/
+  WebSocket paths, the libunit shmem ABI, process isolation, TLS, the
+  controller, and the language bindings (merged via #85).
+- **OpenTelemetry** upgraded 0.24 → 0.32 (semconv attributes, HTTP + gRPC
+  transports).
+- **Two GitHub Security Advisories** filed as drafts (published with the tag):
+  control-socket peer-auth bypass + cgroup TOCTOU (High), and WebSocket frame
+  OOB / cross-frame disclosure (High); CVEs to follow, backport to 1.34.x LTS.
+  This advances **G2 (security disclosure process)** below.
+
+**Near-term security follow-ups** (not in 1.35.6): publish the advisories +
+request CVEs at the tag; backport to 1.34.x; the **wasmtime 35 → 36.0.10+
+security bump** (see [unit-wasm.md](unit-wasm.md) W1 — clears 2 CRITICAL +
+several HIGH Dependabot CVEs in `wasm-wasi-component`); and the pending
+port/header hardening PRs (#27/#28/#29).
+
+---
+
 ## The guiding insight
 
 Reading the three language roadmaps side-by-side, the same feature keeps appearing four or five times:

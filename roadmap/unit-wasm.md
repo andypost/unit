@@ -39,7 +39,7 @@ This backend is what was originally merged upstream. It's functional but require
 
 ### Runtime stack
 
-- **Wasmtime version** — `Cargo.toml` pins 35.0.0; upstream `pkg/contrib/src/wasmtime/version` was recently bumped to 43.0.1 in commit `925d6626` for the Docker image. **Version skew** between the Rust crate and the packaged C library is real; should be reconciled.
+- **Wasmtime version** — `Cargo.toml` pins 35.0.0; upstream `pkg/contrib/src/wasmtime/version` was recently bumped to 43.0.1 in commit `925d6626` for the Docker image. **Version skew** between the Rust crate and the packaged C library is real; should be reconciled. **_(2026-07)_** wasmtime 35.0.0 also carries **2 CRITICAL + several HIGH open Dependabot advisories** (segfault / out-of-sandbox load codegen bugs); a security-driven bump to **≥ 36.0.10** is in progress (see W1) — this is now the trigger for reconciling the crate version, not just the Docker skew.
 - **WebAssembly standards implemented:** WASI 0.2 (aka "Preview 2"). WASI 0.3 (async-native) is in draft; WASI Preview 1 is legacy, used by the core SAPI implicitly.
 - **Docker:** `ghcr.io/freeunitorg/freeunit:latest-wasm` ships both backends.
 - **CI:** no dedicated wasm CI matrix beyond the Docker build workflow.
@@ -70,10 +70,11 @@ All in `src/wasm-wasi-component/src/lib.rs`:
 
 ### Near term (1–3 months)
 
-**W1. Reconcile wasmtime versions across the tree.**
-- Bump `Cargo.toml` from wasmtime 35 → 43.0.1 to match the packaged C library.
+**W1. Reconcile wasmtime versions across the tree. _(now security-driven, in progress 2026-07)_**
+- **Immediate (security):** bump `src/wasm-wasi-component/Cargo.toml` wasmtime / wasmtime-wasi / wasmtime-wasi-http 35 → **≥ 36.0.10** to clear the 2 CRITICAL + HIGH Dependabot CVEs (also `rustls-webpki` ≥ 0.103.13). Work in progress on branch `fix/wasmtime-36-security-bump`.
+- **Then:** reconcile toward the packaged C library (43.0.1) so the Rust crate and `libwasmtime.so` don't skew.
 - Test across the supported OS matrix; cranelift ABI changes between majors occasionally.
-- **Effort:** 3 days if no API breakage; up to 1 week if cranelift-codegen changed.
+- **Effort:** the 36.x security bump is the priority; the full 43.x reconcile is the follow-on.
 
 **W2. Async body streaming for the component backend.**
 - Drains the largest TODO cluster (`lib.rs:382,389,390`). Requires libunit body API to go async, which is the same change `unit-roadmap.md` D3 needs for HTTP/2 work — **co-design these two**.

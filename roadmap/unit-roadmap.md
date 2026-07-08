@@ -11,20 +11,28 @@ Per-language detail lives in:
 
 ---
 
-## Release status — 1.35.6 (2026-07, imminent)
+## Release status — 1.35.6 (2026-07, content-complete on `pre-1.35.6`)
 
-_Dated note; revisit each release._ The **1.35.6** cycle is merged to
-`pre-1.35.6` and near release. It ships:
+_Dated note; revisit each release._ The **1.35.6** cycle is **content-complete
+and fully merged to `pre-1.35.6`**. Only the release mechanics remain (see
+_Security track_ below). It ships:
 
-- **Security hardening** — a 14-vector audit remediation across the HTTP/
+- **Security hardening** — the 14-vector audit remediation across the HTTP/
   WebSocket paths, the libunit shmem ABI, process isolation, TLS, the
-  controller, and the language bindings (merged via #85).
-- **OpenTelemetry** upgraded 0.24 → 0.32 (semconv attributes, HTTP + gRPC
-  transports).
-- **Two GitHub Security Advisories** filed as drafts (published with the tag):
-  control-socket peer-auth bypass + cgroup TOCTOU (High), and WebSocket frame
-  OOB / cross-frame disclosure (High); CVEs to follow, backport to 1.34.x LTS.
-  This advances **G2 (security disclosure process)** below.
+  controller, and the language bindings (#85), plus the post-audit follow-ups,
+  all merged: port-queue item-size cap (#88), `set_headers` control-char
+  rejection (#90), kernel-PID IPC sender auth (#91), port-read OOM null-deref
+  (#96), rootfs path normalization (#105), router→worker `fields[]` region +
+  Java `InputStream.read` off/len bounds (#112), duplicate upstream
+  Content-Length (#113), NUL/empty in config C-string values (#114), and mount
+  onto the openat2-validated fd — closing #14's mount-destination TOCTOU (#115).
+- **Engine** — symmetric idle/active connection tracking, prep for graceful
+  drain, with `/status` connection accounting now exact on every close path
+  (#111).
+- **Lifecycle** — SIGQUIT graceful-quit plumbing (#107) + two-phase listener
+  close (#108): the first shipped slices of the graceful-shutdown plan.
+- **wasmtime 35 → 36.0.12** (#87) — clears the wasmtime sandbox-escape CVEs.
+- **OpenTelemetry** 0.24 → 0.32 (semconv attributes, HTTP + gRPC transports).
 
 **Post-audit hardening** — merged to `pre-1.35.6` as focused PRs:
 - **#88** — bound the shared-memory port queue item size (stack-overflow fix).
@@ -38,14 +46,55 @@ _Dated note; revisit each release._ The **1.35.6** cycle is merged to
 - **#114** — reject empty / embedded-NUL config strings consumed as C strings (app options + pathname unix sockets).
 - **#115** — mount rootfs destinations onto the openat2-validated fd (`/proc/self/fd`), completing #14's mount-destination vector.
 
-**Near-term security follow-ups** (not in 1.35.6):
-- Publish the two draft advisories + request CVEs **at the 1.35.6 tag**; backport to 1.34.x LTS.
-- Land the **wasmtime 35 → 36.0.12 security bump** (branch `fix/wasmtime-36-security-bump`, clears 2 CRITICAL + HIGH Dependabot CVEs in `wasm-wasi-component`; see [unit-wasm.md](unit-wasm.md) W1).
-- **wasmtime → 44** follow-up: the only remaining Rust CVE is `rustls-webpki` in `wasm-wasi-component`, blocked until wasmtime moves off rustls 0.22 (first release on webpki 0.103 is 44.0.0).
-- Remaining IPC/audit items still on `andypost/unit`: **#26** (Trivy + cgroup NUL). _(The deferred openat2 mount-via-fd shipped as #115 — #14's mount-destination vector is closed and GHSA-14 can now claim it.)_
-- **Config→C-string NUL/empty guards outside app options** — [#116](https://github.com/freeunitorg/freeunit/issues/116): extend the item-12b guards (shipped in #114) to `access_log` path, TLS certificate names, and njs module paths (PR-A), plus the templated `share`/`chroot`/`index` at resolution time (PR-B).
+Perf validated (A/B/C bench, `f2cd42e2` → wave → +#111): the whole wave costs
+≈ +3 % router CPU/request only on the synthetic `return 200` hot path and
+**+0.1 % on the PHP/IPC app path**; #111 itself is unmeasurable. No latency-tail
+or error-rate change. Trade accepted for two CVE-class fixes.
+
+### Security track — handled; feature work must not re-open it
+
+**Security for 1.35.6 is owned end-to-end by the maintainer/security track and
+is effectively done.** Agents doing feature or refactor work should treat the
+audit + hardening as **complete** and must **not re-audit, re-open, or block on
+these items** — the live working state is private (`plan-finish-vectors.md`),
+not here. The only actions left, all security-track owned:
+
+- Cut the release: `pre-1.35.6` → `master` (merge, **not** fast-forward — master
+  carries CI-only commits), tag **1.35.6**.
+- Publish the two draft GHSAs + request CVEs **at the tag** — `GHSA-768w-qrh2-jjvh`
+  (control-socket peer-auth + cgroup TOCTOU, High) and `GHSA-g6v8-r577-76jm`
+  (WebSocket OOB / cross-frame disclosure, High) — then backport #14/#18 to
+  **1.34.x LTS**. This advances **G2 (security disclosure process)** below.
+- Deferred, non-blocking: `andypost/unit#26` (Trivy + cgroup NUL); **wasmtime → 44**
+  for the last `rustls-webpki` CVE, blocked until wasmtime moves off rustls 0.22
+  (first release on webpki 0.103 is 44.0.0; see [unit-wasm.md](unit-wasm.md) W1);
+  **[#116](https://github.com/freeunitorg/freeunit/issues/116)** — extend the item-12b
+  config C-string NUL/empty guards (shipped in #114) to `access_log` path, TLS
+  certificate names, and njs module paths (PR-A), plus the templated
+  `share`/`chroot`/`index` at resolution time (PR-B).
 
 _Working state / resume notes live in `plan-finish-vectors.md` (maintainer-private, not committed)._
+
+### After 1.35.6 — where the next work goes (non-security)
+
+With the security wave closed, the next cycle is **feature / platform work**.
+Pick from here (in rough priority), not from the security list above:
+
+1. **Graceful shutdown / reload — finish the series.** #107/#108/#111 shipped the
+   signal split, listener drain, and the `active_connections` engine primitive.
+   Next are the server-initiated connection drain and `POST /reload` endpoint —
+   phases 5–7 of [plan-graceful-shutdown.md](plan-graceful-shutdown.md). Highest-
+   leverage because it unblocks PHP P6 / Python P7 / Ruby P7 reload.
+2. **"Design once" cross-cutting primitives** — status API, preload/warmup,
+   graceful reload, per-target env/venv (the table below) in the router /
+   controller / libunit layer so SAPIs stay thin.
+3. **Per-language modules** — PHP (ZTS pool, persistent worker), Python
+   (free-threaded 3.13t, subinterpreters), Ruby (Fiber scheduler, YJIT); see the
+   per-language docs.
+4. **Scheduler / `/run` endpoint** — [plan-run.md](plan-run.md).
+
+The 12-month timeline at the bottom sequences these across the Core / PHP /
+Python / Ruby / Governance streams.
 
 ---
 

@@ -10,6 +10,23 @@ The hardest piece — per-context request draining — is **already implemented*
 
 This plan threads existing primitives into a delivered feature across **7 phases (~7–8 weeks)**. It does not invent new abstractions.
 
+## Delivery status (2026-07)
+
+| Phase | State | Landed as |
+|---|---|---|
+| **P1** — signal split / `quit_mode` plumbing | ✅ shipped in 1.35.6 | #107 |
+| **P2** — two-phase listener close | ✅ shipped in 1.35.6 | #108 |
+| **P4.5** — `active_connections` engine primitive (pre-P5) | ✅ shipped in 1.35.6 | #111 |
+| **P3, P4** — write-path D′, engine teardown | open | — |
+| **P5** — server-initiated connection drain | **next** — its prerequisite (an enumerable in-flight list) is #111's `active_connections` | — |
+| **P6** — `POST /reload` endpoint | open (depends on P5) | — |
+| **P7** — per-language drain hooks (Python, Ruby) | open | — |
+
+**Resume point for feature work: P5.** Build `nxt_runtime_drain_active_connections()`
+on top of `engine->active_connections` / `active_conns_cnt` (read only on the
+owning engine's thread). This is non-security work — the 1.35.6 hardening wave is
+closed (see `unit-roadmap.md` → _Security track_).
+
 ## What "done" looks like
 
 ```mermaid

@@ -36,6 +36,7 @@ _Dated note; revisit each release._ The **1.35.6** cycle is merged to
 - Land the **wasmtime 35 → 36.0.12 security bump** (branch `fix/wasmtime-36-security-bump`, clears 2 CRITICAL + HIGH Dependabot CVEs in `wasm-wasi-component`; see [unit-wasm.md](unit-wasm.md) W1).
 - **wasmtime → 44** follow-up: the only remaining Rust CVE is `rustls-webpki` in `wasm-wasi-component`, blocked until wasmtime moves off rustls 0.22 (first release on webpki 0.103 is 44.0.0).
 - Remaining IPC/audit items still on `andypost/unit`: **#26** (Trivy + cgroup NUL), plus the deferred openat2 mount-via-fd (completes #14's mount vector).
+- **Config→C-string NUL/empty guards outside app options** — [#116](https://github.com/freeunitorg/freeunit/issues/116): extend the item-12b guards (shipped in #114) to `access_log` path, TLS certificate names, and njs module paths (PR-A), plus the templated `share`/`chroot`/`index` at resolution time (PR-B).
 
 _Working state / resume notes live in `plan-finish-vectors.md` (maintainer-private, not committed)._
 

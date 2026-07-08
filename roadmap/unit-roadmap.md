@@ -26,16 +26,23 @@ _Dated note; revisit each release._ The **1.35.6** cycle is merged to
   OOB / cross-frame disclosure (High); CVEs to follow, backport to 1.34.x LTS.
   This advances **G2 (security disclosure process)** below.
 
-**Post-audit hardening** already forwarded upstream as focused PRs (in review):
+**Post-audit hardening** — merged to `pre-1.35.6` as focused PRs:
 - **#88** — bound the shared-memory port queue item size (stack-overflow fix).
 - **#90** — reject control chars in `set_headers` names/values (response splitting).
 - **#91** — authorize privileged IPC senders by kernel-validated PID (`SCM_CREDENTIALS`).
+- **#95 / #105** — reject embedded-NUL and lexical-`/` rootfs and cgroup isolation paths.
+
+**Wave-3 residual hardening** — merged to `pre-1.35.6`:
+- **#112** — libunit request `fields[]` region + per-field sptr bounds and cached-index range-check; Java `InputStream.read()` off/len guard.
+- **#113** — reject duplicate upstream `Content-Length` (response-smuggling desync).
+- **#114** — reject empty / embedded-NUL config strings consumed as C strings (app options + pathname unix sockets).
+- **#115** — mount rootfs destinations onto the openat2-validated fd (`/proc/self/fd`), completing #14's mount-destination vector.
 
 **Near-term security follow-ups** (not in 1.35.6):
 - Publish the two draft advisories + request CVEs **at the 1.35.6 tag**; backport to 1.34.x LTS.
 - Land the **wasmtime 35 → 36.0.12 security bump** (branch `fix/wasmtime-36-security-bump`, clears 2 CRITICAL + HIGH Dependabot CVEs in `wasm-wasi-component`; see [unit-wasm.md](unit-wasm.md) W1).
 - **wasmtime → 44** follow-up: the only remaining Rust CVE is `rustls-webpki` in `wasm-wasi-component`, blocked until wasmtime moves off rustls 0.22 (first release on webpki 0.103 is 44.0.0).
-- Remaining IPC/audit items still on `andypost/unit`: **#26** (Trivy + cgroup NUL), plus the deferred openat2 mount-via-fd (completes #14's mount vector).
+- Remaining IPC/audit items still on `andypost/unit`: **#26** (Trivy + cgroup NUL). _(The deferred openat2 mount-via-fd shipped as #115 — #14's mount-destination vector is closed and GHSA-14 can now claim it.)_
 - **Config→C-string NUL/empty guards outside app options** — [#116](https://github.com/freeunitorg/freeunit/issues/116): extend the item-12b guards (shipped in #114) to `access_log` path, TLS certificate names, and njs module paths (PR-A), plus the templated `share`/`chroot`/`index` at resolution time (PR-B).
 
 _Working state / resume notes live in `plan-finish-vectors.md` (maintainer-private, not committed)._

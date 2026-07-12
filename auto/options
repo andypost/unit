@@ -33,6 +33,10 @@ NXT_BROTLI=NO
 NXT_NJS=NO
 NXT_OTEL=NO
 
+NXT_IO_URING=NO
+NXT_IO_URING_DEFAULT=NO
+NXT_IO_URING_LIBS=
+
 NXT_TEST_BUILD_EPOLL=NO
 NXT_TEST_BUILD_EVENTPORT=NO
 NXT_TEST_BUILD_DEVPOLL=NO
@@ -122,6 +126,13 @@ do
 
         --njs)                           NXT_NJS=YES                         ;;
         --otel)                          NXT_OTEL=YES                        ;;
+
+        --io-uring)                      NXT_IO_URING=YES                    ;;
+        --no-io-uring)                   NXT_IO_URING=NO                     ;;
+        --io-uring-default)
+            NXT_IO_URING=YES
+            NXT_IO_URING_DEFAULT=YES
+        ;;
 
         --test-build-epoll)              NXT_TEST_BUILD_EPOLL=YES            ;;
         --test-build-eventport)          NXT_TEST_BUILD_EVENTPORT=YES        ;;

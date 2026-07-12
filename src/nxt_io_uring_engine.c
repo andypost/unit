@@ -181,6 +181,19 @@
 #define nxt_iou_ud_gen(ud)    ((uint32_t) (((ud) >> 3) & NXT_IOU_GEN_MASK))
 #define nxt_iou_ud_idx(ud)    ((uint32_t) ((ud) >> 35))
 
+/*
+ * The slot stores generations as free-running uint16_t counters while
+ * user_data carries only their low 13 bits, so every stale-CQE comparison
+ * must reduce the slot value with this macro; comparing against the raw
+ * counter would reject ALL completions once a generation passes 8191,
+ * leaving the fd permanently dead.  Generation arithmetic is modulo 2^13:
+ * a stale CQE is mis-accepted only if exactly 8192 disable/enable cycles
+ * complete while that CQE is still in flight, which cannot happen -- CQEs
+ * in flight are bounded by one CQ-drain window and each cycle costs at
+ * least one submitted SQE.
+ */
+#define nxt_iou_gen(g)        ((uint16_t) ((g) & NXT_IOU_GEN_MASK))
+
 /* Internal sentinel user_data values (KIND == INTERNAL). */
 #define NXT_IOU_UD_POST      ((uint64_t) 0x2)   /* eventfd post channel     */
 #define NXT_IOU_UD_REMOVE    ((uint64_t) 0x6)   /* POLL_REMOVE/cancel CQEs  */
@@ -500,6 +513,7 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
         ret = io_uring_queue_init_params(iou->sq_entries, &iou->ring, &params);
 
         if (ret == 0) {
+            iou->ring_inited = 1;
             break;
         }
 
@@ -1873,13 +1887,27 @@ nxt_io_uring_block_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
  * Cancelling first (remove bumps the generation, so a fresh enable_read()
  * re-arms a POLL_ADD that re-checks readiness at submission) also prevents a
  * duplicate poll when the armed direction is the one being re-armed here.
+ * Removing only the directions that are actually armed avoids registering a
+ * second poll under the SAME user_data and leaking an armed poll when the
+ * opposite direction is flipped INACTIVE.
  */
 
 static void
 nxt_io_uring_oneshot_read(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
-    nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_READ);
-    nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_WRITE);
+    nxt_io_uring_slot_t  *slot;
+
+    slot = nxt_io_uring_slot(engine, ev->fd);
+
+    if (slot != NULL) {
+        if (slot->read_armed) {
+            nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_READ);
+        }
+
+        if (slot->write_armed) {
+            nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_WRITE);
+        }
+    }
 
     ev->read = NXT_EVENT_ONESHOT;
     ev->write = NXT_EVENT_INACTIVE;
@@ -1893,8 +1921,19 @@ nxt_io_uring_oneshot_read(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 static void
 nxt_io_uring_oneshot_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
-    nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_READ);
-    nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_WRITE);
+    nxt_io_uring_slot_t  *slot;
+
+    slot = nxt_io_uring_slot(engine, ev->fd);
+
+    if (slot != NULL) {
+        if (slot->read_armed) {
+            nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_READ);
+        }
+
+        if (slot->write_armed) {
+            nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_WRITE);
+        }
+    }
 
     ev->read = NXT_EVENT_INACTIVE;
     ev->write = NXT_EVENT_ONESHOT;
@@ -2624,7 +2663,7 @@ nxt_io_uring_accept_cqe(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
      * it stale.  The connection was already accepted from the backlog, so
      * close(2) is the only correct disposition.
      */
-    if (gen != slot->read_generation) {
+    if (gen != nxt_iou_gen(slot->read_generation)) {
         if (res >= 0) {
             (void) close(res);
         }
@@ -2685,27 +2724,42 @@ nxt_io_uring_accept_cqe(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
         return;
     }
 
-    c->socket.fd = res;
-
     /*
      * Fill the remote sockaddr for this specific fd with getpeername(): exact,
      * and avoids keeping a per-arming addr buffer alive in the slot across the
-     * completion.  Failure (e.g. peer already reset) leaves the zeroed cache
-     * sockaddr and the conn's own read will surface the error.
+     * completion.  On failure (the peer already dropped the connection, e.g.
+     * an RST between the kernel's accept and this drain) the connection is
+     * DROPPED rather than served with a zeroed sockaddr: sa_family 0 would
+     * flow into access logs and ACL matching as a bogus client address.  The
+     * fd is closed, the pre-allocated conn stays in lev->next for the next
+     * completion, and the re-arm below continues accepting -- the same
+     * disposition as the poll-path accept4() failing for a torn-down peer.
      */
     socklen = c->remote->socklen;
-    (void) getpeername(res, &c->remote->u.sockaddr, &socklen);
 
-    nxt_debug(ev->task, "io_uring accept(%d): %d", ev->fd, res);
+    if (nxt_slow_path(getpeername(res, &c->remote->u.sockaddr, &socklen)
+                      != 0))
+    {
+        nxt_debug(ev->task, "io_uring accept(%d): getpeername(%d) failed %E",
+                  ev->fd, res, nxt_errno);
 
-    /*
-     * Adapted accept flow: nxt_conn_accept sets the conn up, enqueues the
-     * listen handler, and pre-allocates the next lev->next (or triggers
-     * close_idle backpressure, which disables/cancels this listener).  Its
-     * poll-mode re-arm tail is inert here: lev->socket.read_ready is never set
-     * in completion mode, so it never reschedules the poll accept handler.
-     */
-    nxt_conn_accept(ev->task, lev, c);
+        (void) close(res);
+
+    } else {
+        c->socket.fd = res;
+
+        nxt_debug(ev->task, "io_uring accept(%d): %d", ev->fd, res);
+
+        /*
+         * Adapted accept flow: nxt_conn_accept sets the conn up, enqueues the
+         * listen handler, and pre-allocates the next lev->next (or triggers
+         * close_idle backpressure, which disables/cancels this listener).  Its
+         * poll-mode re-arm tail is inert here: lev->socket.read_ready is never
+         * set in completion mode, so it never reschedules the poll accept
+         * handler.
+         */
+        nxt_conn_accept(ev->task, lev, c);
+    }
 
     /*
      * Re-arm the oneshot accept unless backpressure disabled the listener

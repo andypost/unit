@@ -285,7 +285,9 @@ start_unitd() {  # label build run -> sets UNITD_PID, ROUTER, ENGINE[label]
         echo "run path too long for AF_UNIX socket ($run); set a shorter RUNBASE" >&2
         return 1
     fi
-    "$build/sbin/unitd" --no-daemon \
+    # Pin the whole server tree at spawn (children inherit affinity); the
+    # later router re-pin is then just a no-op safety net.
+    taskset -c "$SERVER_CORES" "$build/sbin/unitd" --no-daemon \
         --control "unix:$run/control.sock" \
         --pid "$run/unit.pid" --log "$run/unit.log" \
         --statedir "$run/state" --tmpdir "$run" \
@@ -402,12 +404,18 @@ run_build_round() {
         local root
         root=$(ensure_phpapp) || root=""
         if [ -n "$root" ]; then
-            cleanup_http_reconfig "$run" "$pphp" "$root" || { echo "php conf failed $label"; }
-            if [ -n "$ROUTER" ]; then
+            if cleanup_http_reconfig "$run" "$pphp" "$root"; then
                 taskset -c "$LOAD_CORES" "$OHA" --no-tui --output-format json -t "$OHA_TIMEOUT" -n 5000 -c 8 \
                     "http://127.0.0.1:$pphp/" >/dev/null 2>&1
                 oha_one "$run" "$label" php_ka "http://127.0.0.1:$pphp/" "$N_PHP" 8 1 tree
                 ab_one  "$run" "$label" php_ka "http://127.0.0.1:$pphp/" "$N_PHP" 8 1 tree
+            else
+                # module + app dir are BOTH present, so a config/listener
+                # failure is a real regression in this build, not a missing
+                # optional dependency: fail the round, never degrade to a
+                # SKIP that leaves one side without PHP samples at exit 0.
+                echo "php config/listener FAILED for $label (see $run/conf-php.json)" >&2
+                meas_failed=1
             fi
         else
             echo "$label php_ka SKIP php (no app dir)" | tee -a "$RESULTS"

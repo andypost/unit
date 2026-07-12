@@ -88,7 +88,50 @@
 
 
 /*
- * user_data layout returned verbatim in every CQE (64 bits, fully allocated):
+ * RECV (buf-ring multishot recv) is DETECTED but the completion-mode recv conn
+ * path is not yet wired: the operational tier is clamped to ACCEPT in setup().
+ * The deferral is deliberate, not an oversight -- three constraints must be
+ * resolved together before it is safe, and none is a small change:
+ *
+ *   1. Scope (design §2.4).  Multishot recv must cover ONLY data connections,
+ *      never the UDS port sockets, whose messages carry SCM_RIGHTS fd-passing
+ *      and credential cmsgs that a provided-buffer IORING_OP_RECV cannot carry
+ *      (it has no ancillary-data channel).  But data conns and port sockets
+ *      arm read through the SAME engine enable_read (nxt_port_socket.c calls
+ *      nxt_fd_event_enable_read directly), and nxt_fd_event_t carries no type
+ *      tag to tell them apart -- and design §1.7 forbids adding one (ABI churn
+ *      across every engine).  So recv cannot be armed from enable_read; it must
+ *      be driven from a completion-mode nxt_conn_io_t whose read handler forks
+ *      the readiness-based nxt_conn_io_read state machine.
+ *
+ *   2. Buffer lifetime (design OQ2).  The zero-copy win requires handing a ring
+ *      buffer to the request pipeline as c->read; but the router may hold
+ *      c->read across a round-trip to the application process, pinning a ring
+ *      buffer far longer than the ring can afford and starving it.  The safe
+ *      answer is copy-out at the HTTP-parse boundary for data that outlives the
+ *      completion -- which reintroduces a copy for bodies -- while a pure
+ *      copy-out-immediately model adds a userspace copy on top of the kernel's,
+ *      making it likely net-negative versus poll+recv (one kernel->c->read
+ *      copy, zero syscalls saved beyond recv).  Getting the pin/return/close
+ *      lifecycle wrong is a use-after-free or a leaked buffer -- i.e. a soak
+ *      signal-11, exactly what the acceptance gate forbids.
+ *
+ *   3. Read discipline.  Unit block_read()s after every successful read and
+ *      re-enable_read()s when it wants more; multishot recv instead delivers
+ *      continuously, so a "blocked" conn would accumulate ring buffers (bounded
+ *      by TCP rcvbuf, but multiplied across conns) until ENOBUFS, needing the
+ *      degrade-to-poll+recv path to be robust.
+ *
+ * Because a subtly wrong recv path breaks the DEFAULT build's soak with
+ * signal-11, wiring it is left to a focused follow-up with its own soak gate;
+ * the ACCEPT tier already delivers the dominant measured win (herd removal).
+ * The kernel RECV capability is still probed (nxt_io_uring_kernel_tier) so the
+ * follow-up only has to flip the clamp and light up the tier >= RECV branch.
+ */
+
+
+/*
+ * user_data layout returned verbatim in every CQE:
  *
  *   bit  0        DIR    0 = read, 1 = write
  *   bit  1        KIND   0 = fd poll (slot-indexed), 1 = internal sentinel
@@ -509,6 +552,16 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
 
     if (tier > cap) {
         tier = cap;
+    }
+
+    /*
+     * Clamp the operational tier to ACCEPT: the completion-mode recv conn path
+     * is not yet wired (see the RECV deferral note near the tier defines), so
+     * the reported tier must reflect actual behaviour.  Kernel RECV support is
+     * still detected above for the follow-up that lifts this clamp.
+     */
+    if (tier > NXT_IOU_TIER_ACCEPT) {
+        tier = NXT_IOU_TIER_ACCEPT;
     }
 
     iou->tier = tier;

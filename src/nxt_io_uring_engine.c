@@ -90,15 +90,22 @@
 /*
  * user_data layout returned verbatim in every CQE (64 bits, fully allocated):
  *
- *   bit  0        DIR   0 = read poll, 1 = write poll
- *   bit  1        KIND  0 = fd poll (slot-indexed), 1 = internal sentinel
- *   bits 2..33    GEN   32-bit per-direction generation (stale-CQE rejection)
- *   bits 34..63   IDX   30-bit slot index == fd number (up to ~1.07e9 fds)
+ *   bit  0        DIR    0 = read, 1 = write
+ *   bit  1        KIND   0 = fd poll (slot-indexed), 1 = internal sentinel
+ *   bit  2        ACCEPT 1 = completion-mode accept op (res carries the fd)
+ *   bits 3..34    GEN    32-bit per-direction generation (stale-CQE rejection)
+ *   bits 35..63   IDX    29-bit slot index == fd number (up to ~536M fds)
  *
- * GEN is the full 32-bit width of the slot's generation counter, so a stale
- * CQE can only alias a live arming after 2^32 disable/enable cycles on the
- * same fd number -- unreachable for any realistic churn.  IDX at 30 bits
- * covers any attainable RLIMIT_NOFILE.
+ * This unifies stage1's repacked layout with the completion-mode accept bit:
+ * KIND (internal-vs-fd) and ACCEPT (poll-vs-accept-op, only when KIND==fd) are
+ * independent 1-bit fields, GEN keeps stage1's full 32-bit width -- so the mask
+ * is an identity on the uint32_t slot counter and a stale CQE can only alias a
+ * live arming after 2^32 disable/enable cycles on one fd number -- and IDX
+ * gives up one bit (29, still ~536M fds, beyond any attainable RLIMIT_NOFILE)
+ * to make room.  The ACCEPT bit keeps an accept CQE self-describing: even a
+ * stale one (after cancel/close and possible fd reuse) is recognised and its
+ * already-accepted fd is closed rather than leaked, and the deferred cancel of
+ * a condemned accept arming reissues ASYNC_CANCEL under this exact user_data.
  */
 
 #define NXT_IOU_DIR_READ     0
@@ -117,16 +124,18 @@
  */
 #define nxt_iou_gen(g)        ((uint32_t) ((g) & NXT_IOU_GEN_MASK))
 
-#define nxt_iou_ud(idx, gen, dir)                                             \
-    ( ((uint64_t) (idx) << 34)                                                \
-      | (((uint64_t) ((gen) & NXT_IOU_GEN_MASK)) << 2)                        \
+#define nxt_iou_ud(idx, gen, dir, acc)                                        \
+    ( ((uint64_t) (idx) << 35)                                                \
+      | (((uint64_t) ((gen) & NXT_IOU_GEN_MASK)) << 3)                        \
+      | ((uint64_t) ((acc) != 0) << 2)                                        \
       | ((uint64_t) (NXT_IOU_KIND_FD) << 1)                                   \
       | (uint64_t) (dir) )
 
 #define nxt_iou_ud_dir(ud)    ((uint32_t) ((ud) & 0x1))
 #define nxt_iou_ud_kind(ud)   ((uint32_t) (((ud) >> 1) & 0x1))
-#define nxt_iou_ud_gen(ud)    ((uint32_t) (((ud) >> 2) & NXT_IOU_GEN_MASK))
-#define nxt_iou_ud_idx(ud)    ((uint32_t) ((ud) >> 34))
+#define nxt_iou_ud_accept(ud) ((uint32_t) (((ud) >> 2) & 0x1))
+#define nxt_iou_ud_gen(ud)    ((uint32_t) (((ud) >> 3) & NXT_IOU_GEN_MASK))
+#define nxt_iou_ud_idx(ud)    ((uint32_t) ((ud) >> 35))
 
 /* Internal sentinel user_data values (KIND == INTERNAL). */
 #define NXT_IOU_UD_POST      ((uint64_t) 0x2)   /* eventfd post channel     */
@@ -174,7 +183,7 @@ static void nxt_io_uring_arm_failed(nxt_event_engine_t *engine,
 static void nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
     nxt_uint_t dir);
 static nxt_bool_t nxt_io_uring_submit_remove(nxt_event_engine_t *engine,
-    nxt_fd_t fd, uint32_t gen, nxt_uint_t dir);
+    nxt_fd_t fd, uint32_t gen, nxt_uint_t dir, nxt_bool_t accept);
 static void nxt_io_uring_retry_pending_removes(nxt_event_engine_t *engine);
 static void nxt_io_uring_arm_pend(nxt_event_engine_t *engine,
     nxt_io_uring_slot_t *slot, nxt_uint_t dir);
@@ -216,6 +225,8 @@ static void nxt_io_uring_handle_cqe(nxt_event_engine_t *engine,
     struct io_uring_cqe *cqe);
 static void nxt_io_uring_error(nxt_event_engine_t *engine,
     nxt_io_uring_slot_t *slot, nxt_fd_event_t *ev);
+static void nxt_io_uring_accept_cqe(nxt_event_engine_t *engine,
+    nxt_io_uring_slot_t *slot, uint16_t gen, struct io_uring_cqe *cqe);
 static void nxt_io_uring_internal_cqe(nxt_event_engine_t *engine,
     struct io_uring_cqe *cqe);
 
@@ -643,7 +654,8 @@ nxt_io_uring_accept_supported(struct io_uring *ring)
         return 0;
     }
 
-    io_uring_prep_multishot_accept(sqe, lfd, NULL, NULL, SOCK_NONBLOCK);
+    io_uring_prep_multishot_accept(sqe, lfd, NULL, NULL,
+                                   SOCK_NONBLOCK | SOCK_CLOEXEC);
     io_uring_sqe_set_data64(sqe, NXT_IOU_UD_REMOVE);
 
     if (io_uring_submit(ring) < 0) {
@@ -1216,7 +1228,8 @@ nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t dir,
         if (nxt_slow_path(slot->read_remove_pending)) {
             if (!nxt_io_uring_submit_remove(engine, ev->fd,
                                             slot->read_remove_gen,
-                                            NXT_IOU_DIR_READ))
+                                            NXT_IOU_DIR_READ,
+                                            slot->read_remove_accept))
             {
                 return 0;
             }
@@ -1228,7 +1241,7 @@ nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t dir,
         if (nxt_slow_path(slot->write_remove_pending)) {
             if (!nxt_io_uring_submit_remove(engine, ev->fd,
                                             slot->write_remove_gen,
-                                            NXT_IOU_DIR_WRITE))
+                                            NXT_IOU_DIR_WRITE, 0))
             {
                 return 0;
             }
@@ -1250,6 +1263,7 @@ nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t dir,
         mask = NXT_IOU_READ_MASK;
         slot->read_armed = 1;
         slot->read_multishot = multishot;
+        slot->accept = 0;             /* a poll arming, not multishot accept  */
 
     } else {
         gen = slot->write_generation;
@@ -1264,7 +1278,7 @@ nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t dir,
         io_uring_prep_poll_add(sqe, ev->fd, mask);
     }
 
-    io_uring_sqe_set_data64(sqe, nxt_iou_ud(ev->fd, gen, dir));
+    io_uring_sqe_set_data64(sqe, nxt_iou_ud(ev->fd, gen, dir, 0));
 
     engine->u.io_uring.nsubmitted++;
 
@@ -1280,6 +1294,7 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
     nxt_uint_t dir)
 {
     uint32_t             gen;
+    nxt_bool_t           accept;
     nxt_io_uring_slot_t  *slot;
 
     slot = nxt_io_uring_slot(engine, ev->fd);
@@ -1289,13 +1304,14 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
 
     /*
      * The armed flag is cleared and the generation bumped up front -- before
-     * the POLL_REMOVE SQE is (attempted to be) obtained.  This is deliberate:
+     * the cancel SQE is (attempted to be) obtained.  This is deliberate:
      * it keeps the slot immediately safe to re-arm and the fd safe to close and
      * reuse, because the bump invalidates every completion still in flight for
      * this arming (they carry the pre-bump generation and are rejected).  If
-     * the SQE cannot be obtained the cancel is not lost -- it is recorded and
-     * retried from nxt_io_uring_poll() under the pre-bump generation, so the
-     * leaked kernel poll's file reference is dropped even after a close/reuse.
+     * the SQE cannot be obtained the cancel is not lost -- it is recorded
+     * (together with the arming's kind, see read_remove_accept) and retried
+     * from nxt_io_uring_poll() under the pre-bump generation, so the leaked
+     * kernel arming's file reference is dropped even after a close/reuse.
      */
     /*
      * Any disable/delete/close/oneshot on a direction invalidates a re-arm
@@ -1303,6 +1319,8 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
      * so drop the pending record before it is retried.  Cleared up front so
      * the !armed early-return below cannot skip it.
      */
+    accept = 0;
+
     if (dir == NXT_IOU_DIR_READ) {
         if (slot->read_arm_pending) {
             slot->read_arm_pending = 0;
@@ -1314,7 +1332,9 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
             return;
         }
         gen = slot->read_generation;
+        accept = slot->accept;
         slot->read_armed = 0;
+        slot->accept = 0;
         slot->read_generation++;
 
     } else {
@@ -1332,7 +1352,9 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
         slot->write_generation++;
     }
 
-    if (nxt_slow_path(!nxt_io_uring_submit_remove(engine, ev->fd, gen, dir))) {
+    if (nxt_slow_path(!nxt_io_uring_submit_remove(engine, ev->fd, gen, dir,
+                                                  accept)))
+    {
         nxt_alert(ev->task, "io_uring_get_sqe() failed for fd %d, "
                   "deferring poll cancel", ev->fd);
 
@@ -1350,6 +1372,7 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
                 engine->u.io_uring.npending_removes++;
             }
             slot->read_remove_gen = gen;
+            slot->read_remove_accept = accept;
 
         } else {
             if (!slot->write_remove_pending) {
@@ -1362,22 +1385,25 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
         return;
     }
 
-    nxt_debug(ev->task, "io_uring remove fd:%d dir:%d gen:%uD",
-              ev->fd, (int) dir, (uint32_t) gen);
+    nxt_debug(ev->task, "io_uring remove fd:%d dir:%d gen:%uD acc:%d",
+              ev->fd, (int) dir, (uint32_t) gen, (int) accept);
 }
 
 
 /*
- * Prepare and account a POLL_REMOVE for a specific (fd, generation, direction)
- * arming.  POLL_REMOVE matches by the exact user_data the POLL_ADD was issued
- * with, so the pre-bump generation must be used.  Returns 0 iff no SQE could be
- * obtained even after the get_sqe() submit-flush (SQ ring exhausted while the
- * CQ overflowed); the caller records the cancel for retry.
+ * Prepare and account the cancel for a specific (fd, generation, direction)
+ * arming.  Both cancel forms match by the exact user_data the arming was
+ * issued with, so the pre-bump generation must be used: POLL_REMOVE for a
+ * poll, ASYNC_CANCEL for a multishot accept (which is not a poll and would be
+ * missed by POLL_REMOVE) -- the accept flag selects which, and MUST reflect
+ * the condemned arming's kind, not the slot's current one.  Returns 0 iff no
+ * SQE could be obtained even after the get_sqe() submit-flush (SQ ring
+ * exhausted while the CQ overflowed); the caller records the cancel for retry.
  */
 
 static nxt_bool_t
 nxt_io_uring_submit_remove(nxt_event_engine_t *engine, nxt_fd_t fd, uint32_t gen,
-    nxt_uint_t dir)
+    nxt_uint_t dir, nxt_bool_t accept)
 {
     struct io_uring_sqe  *sqe;
 
@@ -1386,7 +1412,14 @@ nxt_io_uring_submit_remove(nxt_event_engine_t *engine, nxt_fd_t fd, uint32_t gen
         return 0;
     }
 
-    io_uring_prep_poll_remove(sqe, nxt_iou_ud(fd, gen, dir));
+    if (accept) {
+        io_uring_prep_cancel64(sqe,
+                               nxt_iou_ud(fd, gen, NXT_IOU_DIR_READ, 1), 0);
+
+    } else {
+        io_uring_prep_poll_remove(sqe, nxt_iou_ud(fd, gen, dir, 0));
+    }
+
     io_uring_sqe_set_data64(sqe, NXT_IOU_UD_REMOVE);
 
     engine->u.io_uring.nsubmitted++;
@@ -1396,13 +1429,15 @@ nxt_io_uring_submit_remove(nxt_event_engine_t *engine, nxt_fd_t fd, uint32_t gen
 
 
 /*
- * Retry, at the top of nxt_io_uring_poll(), the POLL_REMOVEs that could not get
+ * Retry, at the top of nxt_io_uring_poll(), the cancels that could not get
  * an SQE when their direction was disabled/deleted/closed.  Gated by
  * npending_removes so the slot scan never runs in steady state.  A still-live
- * kernel poll keeps its file reference until this lands, so retrying until an
- * SQE is available is what stops a close-with-live-poller from leaking that
+ * kernel arming keeps its file reference until this lands, so retrying until
+ * an SQE is available is what stops a close-with-live-poller from leaking that
  * reference to ring teardown; the generation bump done at record time keeps any
- * completion the poll emits meanwhile harmless (and safe across an fd reuse).
+ * completion the arming emits meanwhile harmless (and safe across an fd reuse).
+ * The recorded read_remove_accept restores the correct cancel form for a
+ * condemned accept arming.
  */
 
 static void
@@ -1419,7 +1454,8 @@ nxt_io_uring_retry_pending_removes(nxt_event_engine_t *engine)
 
         if (slot->read_remove_pending
             && nxt_io_uring_submit_remove(engine, fd, slot->read_remove_gen,
-                                          NXT_IOU_DIR_READ))
+                                          NXT_IOU_DIR_READ,
+                                          slot->read_remove_accept))
         {
             slot->read_remove_pending = 0;
             iou->npending_removes--;
@@ -1427,7 +1463,7 @@ nxt_io_uring_retry_pending_removes(nxt_event_engine_t *engine)
 
         if (slot->write_remove_pending
             && nxt_io_uring_submit_remove(engine, fd, slot->write_remove_gen,
-                                          NXT_IOU_DIR_WRITE))
+                                          NXT_IOU_DIR_WRITE, 0))
         {
             slot->write_remove_pending = 0;
             iou->npending_removes--;
@@ -1816,17 +1852,33 @@ nxt_io_uring_oneshot_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 
 
 /*
- * enable_accept arms a NON-multishot POLL_ADD (POLLIN) on the listen socket
- * while keeping the state ACTIVE.  Multishot poll posts one CQE per wait
- * queue wakeup and never re-reports a still-non-empty backlog, so a partial
- * accept batch would strand the remaining connections (edge stall, contract
- * item #5).  With a single POLL_ADD the CQE handler's !F_MORE branch re-arms
- * after every event, and POLL_ADD re-checks readiness at submission -- firing
- * immediately when the backlog is non-empty -- which emulates the required
- * level-triggered re-fire at one SQE per accept batch.  IORING_OP_POLL_ADD
- * has no EPOLLEXCLUSIVE analogue, so the cross-worker thundering herd is
- * accepted for Stage 1.
+ * Multishot accept (tier >= ACCEPT): one IORING_ACCEPT_MULTISHOT SQE yields a
+ * CQE per accepted connection, res carrying the new fd.  Because accept is a
+ * *consuming* wake-one operation, N worker rings armed on the same shared
+ * listen fd behave like N threads blocked in accept(2) -- each connection
+ * completes on exactly one ring -- which structurally kills the cross-worker
+ * thundering herd that POLL_ADD (no EPOLLEXCLUSIVE analogue) suffered in
+ * Stage 1, the dominant measured accept-path regression.
+ *
+ * SOCK_NONBLOCK | SOCK_CLOEXEC is passed as the accept flag to match Unit's
+ * accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC) contract: nonblocking lets the
+ * accepted fd skip the per-conn fixup, and CLOEXEC keeps it from leaking into
+ * spawned application processes (the invariant the accept4 paths enforce).
+ * The remote sockaddr is filled per accepted fd with getpeername() rather than
+ * multishot accept's shared addr buffer, which is overwritten asynchronously
+ * before the CQE is drained and so is unreliable per-CQE.
+ *
+ * Backpressure reuses the existing accept machinery unchanged: when a conn slot
+ * cannot be allocated (max_connections) nxt_conn_accept_next -> _close_idle
+ * calls disable_read, which cancels the multishot accept, and the 100 ms listen
+ * timer's enable_accept re-arms it.  Any connection the kernel accepted into a
+ * CQE we cannot service (over the limit, or queued before the cancel took
+ * effect) is closed, never leaked.
  */
+
+static nxt_bool_t nxt_io_uring_arm_accept(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev);
+
 
 static void
 nxt_io_uring_enable_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
@@ -1843,11 +1895,83 @@ nxt_io_uring_enable_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
         return;
     }
 
-    if (!slot->read_armed
-        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 0)))
-    {
+    if (slot->read_armed) {
+        return;
+    }
+
+    if (engine->u.io_uring.tier >= NXT_IOU_TIER_ACCEPT) {
+        if (nxt_slow_path(!nxt_io_uring_arm_accept(engine, ev))) {
+            nxt_io_uring_arm_failed(engine, ev);
+        }
+        return;
+    }
+
+    /*
+     * Tier POLL: a NON-multishot POLL_ADD (POLLIN) re-armed per accept batch.
+     * Multishot poll never re-reports a still-non-empty backlog, so a partial
+     * accept batch would strand the remaining connections (edge stall, contract
+     * item #5); a single POLL_ADD re-checks readiness at submission -- firing
+     * immediately when the backlog is non-empty -- which the !F_MORE re-arm
+     * turns into the required level-triggered re-fire at one SQE per batch.
+     */
+    if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 0))) {
         nxt_io_uring_arm_failed(engine, ev);
     }
+}
+
+
+static nxt_bool_t
+nxt_io_uring_arm_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
+{
+    struct io_uring_sqe  *sqe;
+    nxt_io_uring_slot_t  *slot;
+
+    slot = nxt_io_uring_slot(engine, ev->fd);
+    if (nxt_slow_path(slot == NULL)) {
+        nxt_alert(ev->task, "io_uring slot alloc failed for fd %d", ev->fd);
+        return 0;
+    }
+
+    /*
+     * Flush the R direction's deferred cancel before installing the accept,
+     * mirroring nxt_io_uring_arm(): it keeps the recorded state bounded to a
+     * single condemned arming per direction.  Fail the arm if the cancel
+     * cannot get an SQE; the callers escalate exactly as for a failed arm.
+     */
+    if (nxt_slow_path(slot->read_remove_pending)) {
+        if (!nxt_io_uring_submit_remove(engine, ev->fd, slot->read_remove_gen,
+                                        NXT_IOU_DIR_READ,
+                                        slot->read_remove_accept))
+        {
+            return 0;
+        }
+        slot->read_remove_pending = 0;
+        engine->u.io_uring.npending_removes--;
+    }
+
+    sqe = nxt_io_uring_get_sqe(engine);
+    if (nxt_slow_path(sqe == NULL)) {
+        nxt_alert(ev->task, "io_uring_get_sqe() failed for fd %d", ev->fd);
+        return 0;
+    }
+
+    slot->ev = ev;
+    slot->read_armed = 1;
+    slot->accept = 1;
+    slot->read_multishot = 1;
+
+    io_uring_prep_multishot_accept(sqe, ev->fd, NULL, NULL,
+                                   SOCK_NONBLOCK | SOCK_CLOEXEC);
+    io_uring_sqe_set_data64(sqe,
+                        nxt_iou_ud(ev->fd, slot->read_generation,
+                                   NXT_IOU_DIR_READ, 1));
+
+    engine->u.io_uring.nsubmitted++;
+
+    nxt_debug(ev->task, "io_uring arm accept fd:%d gen:%uD",
+              ev->fd, (uint32_t) slot->read_generation);
+
+    return 1;
 }
 
 
@@ -2072,6 +2196,16 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
     }
 
     slot = &engine->u.io_uring.slots[idx];
+
+    /*
+     * A multishot-accept completion carries an accepted fd in res, not a poll
+     * mask, and is self-identified by the ACCEPT bit so it is routed correctly
+     * even after the slot's arming kind has changed (fd reuse).
+     */
+    if (nxt_iou_ud_accept(ud)) {
+        nxt_io_uring_accept_cqe(engine, slot, gen, cqe);
+        return;
+    }
 
     /* Reject completions for a stale (disabled/closed) arming. */
     if (dir == NXT_IOU_DIR_READ) {
@@ -2383,6 +2517,126 @@ nxt_io_uring_error(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
 
     nxt_work_queue_add(&engine->fast_work_queue, nxt_io_uring_error_handler,
                        ev->task, ev, ev->data);
+}
+
+
+/*
+ * Multishot-accept completion.  res is the accepted fd (>= 0) or a negative
+ * errno; F_MORE means the multishot is still armed.  Each CQE feeds an adapted
+ * nxt_conn_accept flow directly, replacing the poll-mode accept4 syscall.
+ */
+
+static void
+nxt_io_uring_accept_cqe(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
+    uint16_t gen, struct io_uring_cqe *cqe)
+{
+    int                 res;
+    socklen_t           socklen;
+    nxt_bool_t          more;
+    nxt_conn_t          *c;
+    nxt_fd_event_t      *ev;
+    nxt_listen_event_t  *lev;
+
+    res = cqe->res;
+    more = (cqe->flags & IORING_CQE_F_MORE) != 0;
+
+    /*
+     * Stale arming (cancelled by disable/close and possibly re-armed): reject
+     * on the generation mismatch -- the same load-bearing invariant used for
+     * poll CQEs -- but first close any fd the kernel already accepted for this
+     * arming so it is not leaked.  This is the accept analogue of "a stale recv
+     * CQE must return its buffer".
+     */
+    if (gen != slot->read_generation) {
+        if (res >= 0) {
+            (void) close(res);
+        }
+        return;
+    }
+
+    if (!more) {
+        slot->read_armed = 0;
+        slot->accept = 0;
+    }
+
+    ev = slot->ev;
+
+    if (nxt_slow_path(ev == NULL)) {
+        if (res >= 0) {
+            (void) close(res);
+        }
+        return;
+    }
+
+    lev = nxt_container_of(ev, nxt_listen_event_t, socket);
+
+    if (res < 0) {
+        /* -ECANCELED/-EBADF/-ENOENT: the multishot was cancelled; fd is gone. */
+        if (res == -ECANCELED || res == -EBADF || res == -ENOENT) {
+            return;
+        }
+
+        /*
+         * EMFILE/ENFILE/ENOBUFS/ENOMEM etc: the multishot accept terminated
+         * (!F_MORE).  nxt_conn_accept_error schedules the idle-conn reaper,
+         * arms the 100 ms listen timer and disables the listener; the timer's
+         * enable_accept re-arms the multishot.  Same error semantics as the
+         * poll/accept4 path.
+         */
+        nxt_conn_accept_error(ev->task, lev, "accept", -res);
+        return;
+    }
+
+    /* res >= 0: a newly accepted connection fd. */
+
+    c = lev->next;
+
+    if (nxt_slow_path(c == NULL)) {
+        /*
+         * No pre-allocated conn: a prior accept in this drain hit
+         * max_connections and close_idle already disabled (cancelled) the
+         * listener, but the kernel had accepted this fd before the cancel took
+         * effect.  Close it; backpressure is in force via the 100 ms timer.
+         */
+        (void) close(res);
+        return;
+    }
+
+    c->socket.fd = res;
+
+    /*
+     * Fill the remote sockaddr for this specific fd.  Multishot accept's shared
+     * addr buffer is overwritten asynchronously as further connections arrive
+     * and so is unreliable once the CQE is drained; getpeername() on the
+     * accepted fd is exact.  Failure (e.g. peer already reset) leaves the
+     * zeroed cache sockaddr and the conn's own read will surface the error.
+     */
+    socklen = c->remote->socklen;
+    (void) getpeername(res, &c->remote->u.sockaddr, &socklen);
+
+    nxt_debug(ev->task, "io_uring accept(%d): %d", ev->fd, res);
+
+    /*
+     * Adapted accept flow: nxt_conn_accept sets the conn up, enqueues the
+     * listen handler, and pre-allocates the next lev->next (or triggers
+     * close_idle backpressure, which disables/cancels this listener).  Its
+     * poll-mode re-arm tail is inert here: lev->socket.read_ready is never set
+     * in multishot mode, so it never reschedules the poll accept handler.
+     */
+    nxt_conn_accept(ev->task, lev, c);
+
+    /*
+     * Re-arm only if the kernel terminated the multishot (!F_MORE) and the
+     * listener is still active -- close_idle backpressure leaves it INACTIVE,
+     * and the listen timer will re-arm it instead.  A failed re-arm must not
+     * silently strand the listener: escalate to its error_handler (at most
+     * once per completion; the caller returns right after).
+     */
+    if (!more && ev->read == NXT_EVENT_ACTIVE) {
+        if (nxt_slow_path(!nxt_io_uring_arm_accept(engine, ev))) {
+            nxt_io_uring_arm_failed(engine, ev);
+        }
+    }
 }
 
 

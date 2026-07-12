@@ -253,33 +253,52 @@ typedef struct {
     uint8_t                       write_armed;     /* W poll live in kernel   */
 
     /*
-     * A re-arm (POLL_ADD) could not get an SQE (SQ ring exhausted).  Unlike a
+     * A re-arm could not get an SQE (SQ ring exhausted).  Unlike a
      * failed initial arm -- which escalates to the error_handler -- a failed
      * *re-arm* of a still-wanted direction (e.g. the per-batch listen POLL_ADD,
-     * or a kernel-dropped multishot) must retry rather than tear down: escalating
-     * it silently dies inside nxt_io_uring_error()'s per-drain dedupe (the fd
-     * already dispatched a handler this drain), leaving the direction ACTIVE with
-     * no poller.  Recorded here and retried from nxt_io_uring_poll() under the
-     * *current* generation (a deferred re-arm is identical to arming fresh);
-     * cleared by any disable/delete/close/oneshot on the direction.
+     * a kernel-dropped multishot, or a completion-mode accept re-arm) must
+     * retry rather than tear down: escalating it silently dies inside
+     * nxt_io_uring_error()'s per-drain dedupe (the fd already dispatched a
+     * handler this drain), leaving the direction ACTIVE with no poller.
+     * Recorded here and retried from nxt_io_uring_poll() under the *current*
+     * generation (a deferred re-arm is identical to arming fresh); cleared by
+     * any disable/delete/close/oneshot on the direction.  read_arm_accept
+     * records that the owed R re-arm is an accept op (reissue via arm_accept,
+     * not a POLL_ADD); write re-arms are always polls.
      */
     uint8_t                       read_arm_pending;
     uint8_t                       write_arm_pending;
+    uint8_t                       read_arm_accept;
 
     /*
-     * A POLL_REMOVE for a still-live kernel poll could not get an SQE (SQ ring
+     * A cancel for a still-live kernel arming could not get an SQE (SQ ring
      * exhausted while the CQ overflowed).  The direction's armed flag is already
      * cleared and its generation bumped -- so the slot is safe to re-arm or for
-     * the fd to be closed and reused at once -- but the leaked kernel poll must
-     * still be cancelled to drop its file reference.  The cancel is retried from
-     * nxt_io_uring_poll() and matches the live poll by the *pre-bump* generation
-     * recorded here, so it works even after the fd is closed and even if the
-     * direction has since been re-armed under a newer generation.
+     * the fd to be closed and reused at once -- but the leaked kernel arming
+     * must still be cancelled to drop its file reference.  The cancel is
+     * retried from nxt_io_uring_poll() and matches the live arming by the
+     * *pre-bump* generation recorded here, so it works even after the fd is
+     * closed and even if the direction has since been re-armed under a newer
+     * generation.  read_remove_accept records the condemned R arming's KIND:
+     * an accept arming must be reissued as ASYNC_CANCEL under the accept-bit
+     * user_data, a poll as POLL_REMOVE -- the wrong opcode/user_data would
+     * miss it (write armings are always polls).
      */
     uint8_t                       read_remove_pending;
     uint8_t                       write_remove_pending;
+    uint8_t                       read_remove_accept;
     uint32_t                      read_remove_gen;
     uint32_t                      write_remove_gen;
+
+    /*
+     * The live R arming is a multishot accept (IORING_ACCEPT_MULTISHOT), not a
+     * poll: its CQEs carry accepted fds in res, are cancelled (not
+     * POLL_REMOVE'd) on disable, and re-arm as multishot accept.  The ACCEPT
+     * bit in user_data makes each CQE self-describing regardless of this flag,
+     * so a stale accept CQE still closes its fd even after the slot's arming
+     * kind changes (fd reuse).
+     */
+    uint8_t                       accept;
 
     /*
      * Arming mode of the live R poll: 1 = multishot (conn fds), 0 = single

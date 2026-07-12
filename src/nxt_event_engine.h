@@ -291,12 +291,12 @@ typedef struct {
     uint32_t                      write_remove_gen;
 
     /*
-     * The live R arming is a multishot accept (IORING_ACCEPT_MULTISHOT), not a
-     * poll: its CQEs carry accepted fds in res, are cancelled (not
-     * POLL_REMOVE'd) on disable, and re-arm as multishot accept.  The ACCEPT
-     * bit in user_data makes each CQE self-describing regardless of this flag,
-     * so a stale accept CQE still closes its fd even after the slot's arming
-     * kind changes (fd reuse).
+     * The live R arming is a oneshot IORING_OP_ACCEPT, not a poll: its CQE
+     * carries the accepted fd in res, is cancelled (not POLL_REMOVE'd) on
+     * disable, and is re-armed per completion.  The ACCEPT bit in user_data
+     * makes each CQE self-describing regardless of this flag, so a stale
+     * accept CQE still closes its fd even after the slot's arming kind
+     * changes (fd reuse).
      */
     uint8_t                       accept;
 

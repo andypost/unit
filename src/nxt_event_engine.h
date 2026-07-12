@@ -241,8 +241,8 @@ typedef struct {
     nxt_fd_event_t                *ev;
     uint16_t                      read_generation;
     uint16_t                      write_generation;
-    uint8_t                       read_armed;   /* multishot R live in kernel */
-    uint8_t                       write_armed;  /* multishot W live in kernel */
+    uint8_t                       read_armed;      /* R poll live in kernel   */
+    uint8_t                       write_armed;     /* W poll live in kernel   */
 
     /*
      * A POLL_REMOVE for a still-live kernel poll could not get an SQE (SQ ring
@@ -258,6 +258,31 @@ typedef struct {
     uint8_t                       write_remove_pending;
     uint16_t                      read_remove_gen;
     uint16_t                      write_remove_gen;
+
+    /*
+     * Arming mode of the live R poll: 1 = multishot (conn fds), 0 = single
+     * POLL_ADD re-armed per event (listen fds; POLL_ADD re-checks readiness
+     * at submission, which emulates level trigger for the accept loop).
+     */
+    uint8_t                       read_multishot;
+
+    /*
+     * CQ-drain sequence numbers of the last read/write handler dispatch.
+     * Multishot poll posts one CQE per wait-queue wakeup without coalescing,
+     * so one drain can hold several CQEs for the same fd and direction;
+     * dispatching the handler more than once per drain would break epoll's
+     * one-event-per-fd-per-poll contract that Unit's handlers rely on.
+     */
+    uint64_t                      read_seq;
+    uint64_t                      write_seq;
+
+    /*
+     * CQ-drain sequence of the last error dispatch.  An errored socket wakes
+     * both its read and write pollers, so each posts its own error CQE; this
+     * dedupes them to a single error_handler per fd per drain, matching epoll
+     * where one event carries EPOLLERR|EPOLLHUP for the whole fd.
+     */
+    uint64_t                      error_seq;
 } nxt_io_uring_slot_t;
 
 
@@ -291,6 +316,9 @@ typedef struct {
      * in nxt_io_uring_poll() so it stays off the hot path: zero in steady state.
      */
     uint32_t                      npending_removes;
+
+    /* Current CQ-drain sequence; see nxt_io_uring_slot_t.read_seq. */
+    uint64_t                      drain_seq;
 
     nxt_work_handler_t            post_handler;
     nxt_fd_event_t                eventfd;

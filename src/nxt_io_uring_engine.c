@@ -13,8 +13,15 @@
  * epoll": a multishot IORING_OP_POLL_ADD per armed direction feeds the
  * existing read_ready/write_ready latches and per-direction work queues, and
  * all recv/send/accept syscalls stay in userspace exactly as with epoll.
- * The engine therefore reuses the generic nxt_unix_conn_io (level-emulating)
- * I/O layer and needs no edge-mode shims.
+ *
+ * Multishot poll delivery is EDGE-LIKE: the kernel posts one CQE per wait
+ * queue wakeup and does not re-report an fd that stays ready.  The engine is
+ * therefore the analogue of the epoll *edge* engine and ships the matching
+ * conn_io (nxt_io_uring_conn_io) whose recvbuf shim guarantees a pending EOF
+ * is observed when data and FIN arrive in a single wakeup.  Listen sockets
+ * are the exception: they are armed with a non-multishot POLL_ADD re-armed
+ * per accept batch, because POLL_ADD re-checks readiness at submission and
+ * so emulates the level-triggered re-fire the accept loop depends on.
  *
  * The load-bearing correctness invariant is the per-direction generation
  * counter encoded into each SQE's user_data (see nxt_io_uring_slot_t and the
@@ -139,6 +146,8 @@ static void nxt_io_uring_signal(nxt_event_engine_t *engine, nxt_uint_t signo);
 static void nxt_io_uring_poll(nxt_event_engine_t *engine, nxt_msec_t timeout);
 static void nxt_io_uring_handle_cqe(nxt_event_engine_t *engine,
     struct io_uring_cqe *cqe);
+static void nxt_io_uring_error(nxt_event_engine_t *engine,
+    nxt_io_uring_slot_t *slot, nxt_fd_event_t *ev);
 static void nxt_io_uring_internal_cqe(nxt_event_engine_t *engine,
     struct io_uring_cqe *cqe);
 
@@ -146,6 +155,35 @@ static void nxt_io_uring_internal_cqe(nxt_event_engine_t *engine,
 static void nxt_io_uring_conn_io_accept4(nxt_task_t *task, void *obj,
     void *data);
 #endif
+static ssize_t nxt_io_uring_conn_io_recvbuf(nxt_conn_t *c, nxt_buf_t *b);
+
+
+/*
+ * A copy of nxt_unix_conn_io with recvbuf overridden by the edge-mode EOF
+ * shim (see nxt_io_uring_conn_io_recvbuf); mirrors nxt_epoll_edge_conn_io.
+ * Not const: create() may switch .accept to the accept4 variant.
+ */
+
+static nxt_conn_io_t  nxt_io_uring_conn_io = {
+    .connect = nxt_conn_io_connect,
+    .accept = nxt_conn_io_accept,
+
+    .read = nxt_conn_io_read,
+    .recvbuf = nxt_io_uring_conn_io_recvbuf,
+    .recv = nxt_conn_io_recv,
+
+    .write = nxt_conn_io_write,
+    .sendbuf = nxt_conn_io_sendbuf,
+
+#if (NXT_HAVE_LINUX_SENDFILE)
+    .old_sendbuf = nxt_linux_event_conn_io_sendfile,
+#else
+    .old_sendbuf = nxt_event_conn_io_sendbuf,
+#endif
+
+    .writev = nxt_event_conn_io_writev,
+    .send = nxt_event_conn_io_send,
+};
 
 
 const nxt_event_interface_t  nxt_io_uring_engine = {
@@ -185,7 +223,7 @@ const nxt_event_interface_t  nxt_io_uring_engine = {
 #endif
     nxt_io_uring_poll,
 
-    &nxt_unix_conn_io,
+    &nxt_io_uring_conn_io,
 
     NXT_NO_FILE_EVENTS,
 
@@ -236,7 +274,7 @@ nxt_io_uring_create(nxt_event_engine_t *engine, nxt_uint_t mchanges,
         }
 #endif
 
-        nxt_io_uring_test_accept4(engine, &nxt_unix_conn_io);
+        nxt_io_uring_test_accept4(engine, &nxt_io_uring_conn_io);
     }
 
     return NXT_OK;
@@ -774,6 +812,7 @@ nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t dir,
         gen = slot->read_generation;
         mask = NXT_IOU_READ_MASK;
         slot->read_armed = 1;
+        slot->read_multishot = multishot;
 
     } else {
         gen = slot->write_generation;
@@ -1178,11 +1217,16 @@ nxt_io_uring_oneshot_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 
 
 /*
- * enable_accept arms a multishot POLL_ADD (POLLIN) on the listen socket.  A
- * multishot poll on a persistently-readable fd keeps posting CQEs while the
- * backlog is non-empty, giving the level-triggered re-fire the accept re-arm
- * loop depends on.  IORING_OP_POLL_ADD has no EPOLLEXCLUSIVE analogue, so the
- * cross-worker thundering herd is accepted for Stage 1.
+ * enable_accept arms a NON-multishot POLL_ADD (POLLIN) on the listen socket
+ * while keeping the state ACTIVE.  Multishot poll posts one CQE per wait
+ * queue wakeup and never re-reports a still-non-empty backlog, so a partial
+ * accept batch would strand the remaining connections (edge stall, contract
+ * item #5).  With a single POLL_ADD the CQE handler's !F_MORE branch re-arms
+ * after every event, and POLL_ADD re-checks readiness at submission -- firing
+ * immediately when the backlog is non-empty -- which emulates the required
+ * level-triggered re-fire at one SQE per accept batch.  IORING_OP_POLL_ADD
+ * has no EPOLLEXCLUSIVE analogue, so the cross-worker thundering herd is
+ * accepted for Stage 1.
  */
 
 static void
@@ -1199,7 +1243,7 @@ nxt_io_uring_enable_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     }
 
     if (!slot->read_armed
-        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 1)))
+        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 0)))
     {
         nxt_io_uring_arm_failed(engine, ev);
     }
@@ -1359,6 +1403,13 @@ nxt_io_uring_poll(nxt_event_engine_t *engine, nxt_msec_t timeout)
 
     count = 0;
 
+    /*
+     * A new drain sequence: at most one read and one write handler dispatch
+     * per fd for all CQEs of this drain, mirroring epoll's one event per fd
+     * per epoll_wait().  Queued handlers always run before the next poll.
+     */
+    iou->drain_seq++;
+
     io_uring_for_each_cqe(&iou->ring, head, cqe) {
         nxt_io_uring_handle_cqe(engine, cqe);
         count++;
@@ -1442,18 +1493,75 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
             return;
         }
 
+        /*
+         * The poll operation itself failed (not a socket-readiness error):
+         * treat the fd as dead and hand it to its error_handler exactly once,
+         * deduped across both direction pollers (see nxt_io_uring_error).
+         */
         ev->error = -res;
 
-        nxt_work_queue_add(&engine->fast_work_queue, ev->error_handler,
-                           ev->task, ev, ev->data);
+        nxt_io_uring_error(engine, slot, ev);
         return;
     }
 
     mask = (uint32_t) res;
 
+    /*
+     * Multishot poll posts one CQE per wait-queue wakeup and never
+     * re-reports a still-ready fd, so every "the wakeup was consumed"
+     * scenario must resolve without a further kernel notification:
+     *
+     * - Data + FIN in one wakeup: a single CQE carries POLLIN|POLLRDHUP.
+     *   recv() consuming the data as a short read clears read_ready (the
+     *   level contract), losing the pending EOF.  The epoll_eof mark below
+     *   plus the nxt_io_uring_conn_io_recvbuf shim force read_ready back on
+     *   so the caller loops and observes the EOF.  (The fix for the
+     *   proxy-keepalive stall.)
+     * - Full-buffer read (n == buffer size): recvbuf keeps read_ready set,
+     *   so the reader continues without a new CQE.  Safe.
+     * - Port-socket loops drain to EAGAIN while read_ready holds, so a
+     *   message + more-data single wakeup is fully consumed.  Safe.
+     * - Write EAGAIN then later writability: the socket-buffer drain is a
+     *   new wakeup, producing a new CQE on the still-armed W poll.  Safe.
+     * - BLOCKED fires -> disarm (below) -> enable_read re-arms a fresh
+     *   POLL_ADD, which re-checks readiness at submission and fires
+     *   immediately if the fd is still ready.  Safe.
+     * - Listen sockets: non-multishot POLL_ADD; the !F_MORE re-arm below
+     *   re-checks the backlog at submission.  Safe (contract item #5).
+     */
+
     if (dir == NXT_IOU_DIR_READ) {
 
-        if (mask & NXT_IOU_READ_MASK) {
+        /*
+         * Pending EOF under edge-like delivery; consumed by the recvbuf
+         * shim.  Set-only: CQEs are per-wakeup snapshots, not state-merged
+         * like epoll events, so a plain POLLIN CQE can be delivered after
+         * the POLLRDHUP one within a single drain and must not erase the
+         * latched EOF.  Socket EOF/error never un-happens; a fresh conn
+         * starts zeroed.
+         */
+        if (mask & (POLLRDHUP | POLLHUP)) {
+            ev->epoll_eof = 1;
+        }
+
+        if (mask & (POLLERR | POLLHUP)) {
+            ev->epoll_error = 1;
+        }
+
+        /*
+         * Single-dispatch policy (mirrors nxt_epoll_poll()).  Read and write
+         * are independently armed pollers whose masks both carry the error
+         * bits, so a dead socket posts a CQE on BOTH directions.  Dispatch the
+         * read_handler only on real read readiness -- POLLIN, i.e. data or a
+         * readable EOF whose recv() returns 0; a combined data+error CQE lands
+         * here too and recv() surfaces the error, exactly as epoll clears its
+         * `error` flag once it has queued read_handler.  An ERR/HUP-only CQE
+         * (no POLLIN) instead routes to a single ev->error_handler via
+         * nxt_io_uring_error(), which dedupes the two pollers' error CQEs so a
+         * socket error never runs both direction handlers -- the second on
+         * state the first handler may already have freed.
+         */
+        if (mask & POLLIN) {
             ev->read_ready = 1;
 
             if (ev->read == NXT_EVENT_BLOCKED) {
@@ -1466,28 +1574,56 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
                 ev->read = NXT_EVENT_DISABLED;
             }
 
-            if (ev->read != NXT_EVENT_INACTIVE) {
+            if (ev->read != NXT_EVENT_INACTIVE
+                && slot->read_seq != engine->u.io_uring.drain_seq)
+            {
+                slot->read_seq = engine->u.io_uring.drain_seq;
+
                 nxt_work_queue_add(ev->read_work_queue, ev->read_handler,
                                    ev->task, ev, ev->data);
             }
+
+        } else if (mask & (POLLERR | POLLHUP)) {
+
+            if (ev->read == NXT_EVENT_BLOCKED) {
+                nxt_io_uring_disable_read(engine, ev);
+                return;
+            }
+
+            nxt_io_uring_error(engine, slot, ev);
+            return;
         }
 
         /*
-         * A terminated multishot (!F_MORE) on a still-armed direction is
-         * re-issued here so no readiness is missed -- including for events
-         * such as the signalfd whose handler never calls enable_read.  A
-         * oneshot (now DISABLED) or a disabled direction is left alone.
+         * A terminated arming (!F_MORE) on a still-armed direction is
+         * re-issued so no readiness is missed: a kernel-dropped multishot,
+         * the per-batch listen POLL_ADD, and events such as the signalfd
+         * whose handler never calls enable_read.  The slot's recorded mode
+         * keeps listen sockets non-multishot.  A oneshot (now DISABLED) or
+         * a disabled direction is left alone.  If the re-arm cannot get an
+         * SQE, escalate to the error_handler so the direction is not stranded
+         * ACTIVE with no poller (nxt_io_uring_error self-dedupes, so an fd that
+         * already dispatched a handler this drain is left to that handler).
          */
         if (!more
             && ev->read != NXT_EVENT_INACTIVE
             && ev->read != NXT_EVENT_DISABLED)
         {
-            nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 1);
+            if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ,
+                                                slot->read_multishot)))
+            {
+                nxt_io_uring_error(engine, slot, ev);
+            }
         }
 
     } else {
 
-        if (mask & NXT_IOU_WRITE_MASK) {
+        if (mask & (POLLERR | POLLHUP)) {
+            ev->epoll_error = 1;
+        }
+
+        /* See the read direction's single-dispatch policy note above. */
+        if (mask & POLLOUT) {
             ev->write_ready = 1;
 
             if (ev->write == NXT_EVENT_BLOCKED) {
@@ -1499,19 +1635,80 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
                 ev->write = NXT_EVENT_DISABLED;
             }
 
-            if (ev->write != NXT_EVENT_INACTIVE) {
+            if (ev->write != NXT_EVENT_INACTIVE
+                && slot->write_seq != engine->u.io_uring.drain_seq)
+            {
+                slot->write_seq = engine->u.io_uring.drain_seq;
+
                 nxt_work_queue_add(ev->write_work_queue, ev->write_handler,
                                    ev->task, ev, ev->data);
             }
+
+        } else if (mask & (POLLERR | POLLHUP)) {
+
+            if (ev->write == NXT_EVENT_BLOCKED) {
+                nxt_io_uring_disable_write(engine, ev);
+                return;
+            }
+
+            nxt_io_uring_error(engine, slot, ev);
+            return;
         }
 
         if (!more
             && ev->write != NXT_EVENT_INACTIVE
             && ev->write != NXT_EVENT_DISABLED)
         {
-            nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_WRITE, 1);
+            if (nxt_slow_path(!nxt_io_uring_arm(engine, ev,
+                                                NXT_IOU_DIR_WRITE, 1)))
+            {
+                nxt_io_uring_error(engine, slot, ev);
+            }
         }
     }
+}
+
+
+/*
+ * Queue ev->error_handler once for an fd whose poll surfaced ERR/HUP with no
+ * actionable readiness, or whose re-arm could not get an SQE.  This is the
+ * bridge's analogue of nxt_epoll_poll()'s error path (which queues exactly one
+ * nxt_epoll_error_handler per event): epoll dispatches it only when a direction
+ * is still active and no read/write handler already ran for the fd, since a
+ * dispatched readiness handler will itself observe the error via recv()/send().
+ * The bridge's read and write pollers each raise the error separately, so gate
+ * on all three per-fd drain sequences -- skip if this fd already dispatched a
+ * read, write, or error handler this drain -- to keep the error_handler from
+ * running a second time on a connection an earlier handler may have freed.
+ */
+
+static void
+nxt_io_uring_error(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
+    nxt_fd_event_t *ev)
+{
+    uint64_t  seq;
+
+    if (!nxt_fd_event_is_active(ev->read)
+        && !nxt_fd_event_is_active(ev->write))
+    {
+        return;
+    }
+
+    seq = engine->u.io_uring.drain_seq;
+
+    if (slot->read_seq == seq || slot->write_seq == seq
+        || slot->error_seq == seq)
+    {
+        return;
+    }
+
+    slot->error_seq = seq;
+
+    ev->read_ready = 1;
+    ev->write_ready = 1;
+
+    nxt_work_queue_add(&engine->fast_work_queue, nxt_io_uring_error_handler,
+                       ev->task, ev, ev->data);
 }
 
 
@@ -1605,3 +1802,26 @@ nxt_io_uring_conn_io_accept4(nxt_task_t *task, void *obj, void *data)
 }
 
 #endif
+
+
+/*
+ * A wrapper around the standard nxt_conn_io_recvbuf() to enforce reading a
+ * pending EOF under the engine's edge-like delivery, identical to the epoll
+ * edge engine's shim: when data and FIN arrive in a single wakeup the kernel
+ * posts one CQE and never re-reports the fd, so a short read that clears
+ * read_ready would strand the EOF forever.
+ */
+
+static ssize_t
+nxt_io_uring_conn_io_recvbuf(nxt_conn_t *c, nxt_buf_t *b)
+{
+    ssize_t  n;
+
+    n = nxt_conn_io_recvbuf(c, b);
+
+    if (n > 0 && c->socket.epoll_eof) {
+        c->socket.read_ready = 1;
+    }
+
+    return n;
+}

@@ -39,8 +39,6 @@ static nxt_int_t nxt_epoll_level_create(nxt_event_engine_t *engine,
     nxt_uint_t mchanges, nxt_uint_t mevents);
 static nxt_int_t nxt_epoll_create(nxt_event_engine_t *engine,
     nxt_uint_t mchanges, nxt_uint_t mevents, nxt_conn_io_t *io, uint32_t mode);
-static void nxt_epoll_test_accept4(nxt_event_engine_t *engine,
-    nxt_conn_io_t *io);
 static void nxt_epoll_free(nxt_event_engine_t *engine);
 static void nxt_epoll_enable(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static void nxt_epoll_disable(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
@@ -71,7 +69,6 @@ static void nxt_epoll_commit_changes(nxt_event_engine_t *engine);
 static void nxt_epoll_error_handler(nxt_task_t *task, void *obj, void *data);
 #if (NXT_HAVE_SIGNALFD)
 static nxt_int_t nxt_epoll_add_signal(nxt_event_engine_t *engine);
-static void nxt_epoll_signalfd_handler(nxt_task_t *task, void *obj, void *data);
 #endif
 #if (NXT_HAVE_EVENTFD)
 static nxt_int_t nxt_epoll_enable_post(nxt_event_engine_t *engine,
@@ -93,7 +90,6 @@ static void nxt_epoll_edge_conn_io_connect(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_epoll_edge_conn_connected(nxt_task_t *task, void *obj,
     void *data);
-static ssize_t nxt_epoll_edge_conn_io_recvbuf(nxt_conn_t *c, nxt_buf_t *b);
 
 
 static nxt_conn_io_t  nxt_epoll_edge_conn_io = {
@@ -283,7 +279,7 @@ fail:
 }
 
 
-static void
+void
 nxt_epoll_test_accept4(nxt_event_engine_t *engine, nxt_conn_io_t *io)
 {
     static nxt_work_handler_t  handler;
@@ -668,11 +664,16 @@ nxt_epoll_error_handler(nxt_task_t *task, void *obj, void *data)
 
 #if (NXT_HAVE_SIGNALFD)
 
-static nxt_int_t
-nxt_epoll_add_signal(nxt_event_engine_t *engine)
+/*
+ * Create the signalfd and fill the fd event (handler, work queue, task);
+ * shared with the io_uring engine.  Registration of the created fd in the
+ * event facility is left to the caller.
+ */
+
+nxt_int_t
+nxt_epoll_signalfd_create(nxt_event_engine_t *engine, nxt_fd_event_t *sev)
 {
-    int                 fd;
-    struct epoll_event  ee;
+    int  fd;
 
     if (sigprocmask(SIG_BLOCK, &engine->signals->sigmask, NULL) != 0) {
         nxt_alert(&engine->task, "sigprocmask(SIG_BLOCK) failed %E", nxt_errno);
@@ -691,12 +692,11 @@ nxt_epoll_add_signal(nxt_event_engine_t *engine)
     fd = signalfd(-1, &engine->signals->sigmask, 0);
 
     if (fd == -1) {
-        nxt_alert(&engine->task, "signalfd(%d) failed %E",
-                  engine->u.epoll.signalfd.fd, nxt_errno);
+        nxt_alert(&engine->task, "signalfd(%d) failed %E", sev->fd, nxt_errno);
         return NXT_ERROR;
     }
 
-    engine->u.epoll.signalfd.fd = fd;
+    sev->fd = fd;
 
     if (nxt_fd_nonblocking(&engine->task, fd) != NXT_OK) {
         return NXT_ERROR;
@@ -704,18 +704,36 @@ nxt_epoll_add_signal(nxt_event_engine_t *engine)
 
     nxt_debug(&engine->task, "signalfd(): %d", fd);
 
-    engine->u.epoll.signalfd.data = engine->signals->handler;
-    engine->u.epoll.signalfd.read_work_queue = &engine->fast_work_queue;
-    engine->u.epoll.signalfd.read_handler = nxt_epoll_signalfd_handler;
-    engine->u.epoll.signalfd.log = engine->task.log;
-    engine->u.epoll.signalfd.task = &engine->task;
+    sev->data = engine->signals->handler;
+    sev->read_work_queue = &engine->fast_work_queue;
+    sev->read_handler = nxt_epoll_signalfd_handler;
+    sev->log = engine->task.log;
+    sev->task = &engine->task;
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_epoll_add_signal(nxt_event_engine_t *engine)
+{
+    struct epoll_event  ee;
+
+    if (nxt_epoll_signalfd_create(engine, &engine->u.epoll.signalfd)
+        != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
 
     ee.events = EPOLLIN;
     ee.data.ptr = &engine->u.epoll.signalfd;
 
-    if (epoll_ctl(engine->u.epoll.fd, EPOLL_CTL_ADD, fd, &ee) != 0) {
+    if (epoll_ctl(engine->u.epoll.fd, EPOLL_CTL_ADD,
+                  engine->u.epoll.signalfd.fd, &ee) != 0)
+    {
         nxt_alert(&engine->task, "epoll_ctl(%d, %d, %d) failed %E",
-                  engine->u.epoll.fd, EPOLL_CTL_ADD, fd, nxt_errno);
+                  engine->u.epoll.fd, EPOLL_CTL_ADD,
+                  engine->u.epoll.signalfd.fd, nxt_errno);
 
         return NXT_ERROR;
     }
@@ -724,7 +742,15 @@ nxt_epoll_add_signal(nxt_event_engine_t *engine)
 }
 
 
-static void
+/*
+ * Drain the signalfd completely, dispatching the handler once per queued
+ * siginfo.  Shared with the io_uring engine, whose edge-like multishot poll
+ * plus per-drain dedupe can announce several queued signals with a single
+ * handler run; under epoll's level-triggered registration the full drain is
+ * equally correct, just not required.
+ */
+
+void
 nxt_epoll_signalfd_handler(nxt_task_t *task, void *obj, void *data)
 {
     int                      n;
@@ -737,18 +763,24 @@ nxt_epoll_signalfd_handler(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "signalfd handler");
 
-    n = read(ev->fd, &sfd, sizeof(struct signalfd_siginfo));
+    for ( ;; ) {
+        n = read(ev->fd, &sfd, sizeof(struct signalfd_siginfo));
 
-    nxt_debug(task, "read signalfd(%d): %d", ev->fd, n);
+        nxt_debug(task, "read signalfd(%d): %d", ev->fd, n);
 
-    if (n != sizeof(struct signalfd_siginfo)) {
-        nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, nxt_errno);
-        return;
+        if (n != sizeof(struct signalfd_siginfo)) {
+            if (n == -1 && nxt_errno == NXT_EAGAIN) {
+                return;
+            }
+
+            nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, nxt_errno);
+            return;
+        }
+
+        nxt_debug(task, "signalfd(%d) signo:%d", ev->fd, sfd.ssi_signo);
+
+        handler(task, (void *) (uintptr_t) sfd.ssi_signo, NULL);
     }
-
-    nxt_debug(task, "signalfd(%d) signo:%d", ev->fd, sfd.ssi_signo);
-
-    handler(task, (void *) (uintptr_t) sfd.ssi_signo, NULL);
 }
 
 #endif
@@ -1163,7 +1195,7 @@ nxt_epoll_edge_conn_connected(nxt_task_t *task, void *obj, void *data)
  * in edge-triggered mode.
  */
 
-static ssize_t
+ssize_t
 nxt_epoll_edge_conn_io_recvbuf(nxt_conn_t *c, nxt_buf_t *b)
 {
     ssize_t  n;

@@ -51,7 +51,9 @@
  *   NXT_IO_URING_FORCE_TIER=accept  caps at completion-mode accept (oneshot
  *                                   IORING_OP_ACCEPT); recv stays on the
  *                                   poll+recv path.
- *   NXT_IO_URING_FORCE_TIER=recv    caps at buf-ring multishot recv.
+ *   NXT_IO_URING_FORCE_TIER=recv    accepted for compatibility; resolves to
+ *                                   the full implemented tier (ACCEPT until
+ *                                   the buf-ring recv path lands).
  *   NXT_IO_URING_FORCE_TIER=opt     (== recv == unset) the full feature tier.
  *
  * The cap never raises the tier above what the kernel actually supports; it
@@ -77,13 +79,12 @@
  *   NONE    io_uring unusable                       -> epoll fallback
  *   POLL    multishot POLL_ADD (5.13)               -> Stage-1 readiness bridge
  *   ACCEPT  + IORING_OP_ACCEPT (5.5, probed)        -> completion-mode accept
- *   RECV    + buf_ring (5.19) + multishot recv (6.0)-> completion-mode recv
- *   OPT     + SINGLE_ISSUER (6.0) + DEFER_TASKRUN (6.1) setup-flag optimisation
- *
- * OPT is not a distinct conn behaviour: it caps at the RECV feature set and
- * additionally enables the submission/completion setup flags.  FORCE_TIER=recv
- * therefore exercises the recv path *without* those flags, and =opt/unset with
- * them.
+ *   RECV    buf-ring multishot recv: reserved, not implemented (see the
+ *           deferral note below); "recv" is still accepted by FORCE_TIER and
+ *           resolves to the full implemented tier.
+ *   OPT     reserved; SINGLE_ISSUER/DEFER_TASKRUN turned out unusable with
+ *           Unit's off-thread engine creation (see nxt_io_uring_setup), so
+ *           "opt" equals the full implemented tier as well.
  */
 #define NXT_IOU_TIER_NONE    0
 #define NXT_IOU_TIER_POLL    1
@@ -93,8 +94,8 @@
 
 
 /*
- * RECV (buf-ring multishot recv) is DETECTED but the completion-mode recv conn
- * path is not yet wired: the operational tier is clamped to ACCEPT in setup().
+ * RECV (buf-ring multishot recv) is a reserved tier: the completion-mode recv
+ * conn path is not implemented, so the resolved tier tops out at ACCEPT.
  * The deferral is deliberate, not an oversight -- three constraints must be
  * resolved together before it is safe, and none is a small change:
  *
@@ -130,8 +131,8 @@
  * Because a subtly wrong recv path breaks the DEFAULT build's soak with
  * signal-11, wiring it is left to a focused follow-up with its own soak gate;
  * the ACCEPT tier already delivers the dominant measured win (herd removal).
- * The kernel RECV capability is still probed (nxt_io_uring_kernel_tier) so the
- * follow-up only has to flip the clamp and light up the tier >= RECV branch.
+ * The RECV probe was removed together with this deferral; the follow-up
+ * reintroduces a fresh capability probe with the actual implementation.
  */
 
 
@@ -225,20 +226,16 @@ static nxt_bool_t nxt_io_uring_env_disabled(void);
 static nxt_int_t nxt_io_uring_force_cap(void);
 static nxt_int_t nxt_io_uring_kernel_tier(void);
 static nxt_bool_t nxt_io_uring_accept_supported(struct io_uring *ring);
-static nxt_bool_t nxt_io_uring_recv_supported(struct io_uring *ring);
-static void nxt_io_uring_test_accept4(nxt_event_engine_t *engine,
-    nxt_conn_io_t *io);
 #if (NXT_HAVE_SIGNALFD)
 static nxt_int_t nxt_io_uring_add_signal(nxt_event_engine_t *engine);
-static void nxt_io_uring_signalfd_handler(nxt_task_t *task, void *obj,
-    void *data);
 #endif
 static void nxt_io_uring_free(nxt_event_engine_t *engine);
 static nxt_io_uring_slot_t *nxt_io_uring_slot(nxt_event_engine_t *engine,
     nxt_fd_t fd);
 static struct io_uring_sqe *nxt_io_uring_get_sqe(nxt_event_engine_t *engine);
 static nxt_bool_t nxt_io_uring_arm(nxt_event_engine_t *engine,
-    nxt_fd_event_t *ev, nxt_uint_t dir, nxt_bool_t multishot);
+    nxt_fd_event_t *ev, nxt_io_uring_slot_t *slot, nxt_uint_t dir,
+    nxt_bool_t multishot);
 static void nxt_io_uring_error_handler(nxt_task_t *task, void *obj, void *data);
 static void nxt_io_uring_arm_failed(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
@@ -292,17 +289,11 @@ static void nxt_io_uring_accept_cqe(nxt_event_engine_t *engine,
 static void nxt_io_uring_internal_cqe(nxt_event_engine_t *engine,
     struct io_uring_cqe *cqe);
 
-#if (NXT_HAVE_ACCEPT4)
-static void nxt_io_uring_conn_io_accept4(nxt_task_t *task, void *obj,
-    void *data);
-#endif
-static ssize_t nxt_io_uring_conn_io_recvbuf(nxt_conn_t *c, nxt_buf_t *b);
-
-
 /*
- * A copy of nxt_unix_conn_io with recvbuf overridden by the edge-mode EOF
- * shim (see nxt_io_uring_conn_io_recvbuf); mirrors nxt_epoll_edge_conn_io.
- * Not const: create() may switch .accept to the accept4 variant.
+ * nxt_unix_conn_io with recvbuf overridden by the epoll edge engine's EOF
+ * shim, which this engine shares because multishot poll delivery is equally
+ * edge-like.  Not const: create() may switch .accept to the shared accept4
+ * variant (nxt_epoll_test_accept4).
  */
 
 static nxt_conn_io_t  nxt_io_uring_conn_io = {
@@ -310,7 +301,7 @@ static nxt_conn_io_t  nxt_io_uring_conn_io = {
     .accept = nxt_conn_io_accept,
 
     .read = nxt_conn_io_read,
-    .recvbuf = nxt_io_uring_conn_io_recvbuf,
+    .recvbuf = nxt_epoll_edge_conn_io_recvbuf,
     .recv = nxt_conn_io_recv,
 
     .write = nxt_conn_io_write,
@@ -423,7 +414,7 @@ nxt_io_uring_create(nxt_event_engine_t *engine, nxt_uint_t mchanges,
         }
 #endif
 
-        nxt_io_uring_test_accept4(engine, &nxt_io_uring_conn_io);
+        nxt_epoll_test_accept4(engine, &nxt_io_uring_conn_io);
     }
 
     return NXT_OK;
@@ -544,16 +535,6 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
         tier = cap;
     }
 
-    /*
-     * Clamp the operational tier to ACCEPT: the completion-mode recv conn path
-     * is not yet wired (see the RECV deferral note near the tier defines), so
-     * the reported tier must reflect actual behaviour.  Kernel RECV support is
-     * still detected above for the follow-up that lifts this clamp.
-     */
-    if (tier > NXT_IOU_TIER_ACCEPT) {
-        tier = NXT_IOU_TIER_ACCEPT;
-    }
-
     iou->tier = tier;
 
     nxt_log(&engine->task, NXT_LOG_INFO,
@@ -632,8 +613,11 @@ nxt_io_uring_force_cap(void)
 
 /*
  * Kernel feature capability, probed once and cached process-wide (every engine
- * in a process shares the same kernel).  Never parses uname: IORING_OP_ACCEPT
- * and multishot recv are probed functionally on a throwaway ring.
+ * in a process shares the same kernel).  Never parses uname: multishot poll is
+ * probed functionally and IORING_OP_ACCEPT via the opcode probe, both on one
+ * throwaway ring.  The result tops out at ACCEPT: the RECV tier has no
+ * implementation yet (see the deferral note above), and its probe will be
+ * reintroduced together with the actual completion-mode recv path.
  */
 
 static nxt_int_t
@@ -659,10 +643,6 @@ nxt_io_uring_kernel_tier(void)
 
         if (nxt_io_uring_accept_supported(&ring)) {
             cached = NXT_IOU_TIER_ACCEPT;
-
-            if (nxt_io_uring_recv_supported(&ring)) {
-                cached = NXT_IOU_TIER_RECV;
-            }
         }
     }
 
@@ -673,175 +653,27 @@ nxt_io_uring_kernel_tier(void)
 
 
 /*
- * Functional probe for IORING_OP_ACCEPT (the accept tier uses ONESHOT accepts
- * re-armed per completion; see nxt_io_uring_enable_accept).  Arm one on a
- * throwaway listening socket: if the kernel rejects the opcode it posts an
- * immediate -EINVAL completion; if it is supported the accept simply waits
- * (no connection), so a short timeout with no CQE means "supported".
+ * IORING_OP_ACCEPT support (the accept tier uses ONESHOT accepts re-armed per
+ * completion; see nxt_io_uring_enable_accept) via the opcode probe -- accept
+ * is a first-class opcode, unlike multishot poll's flag bit, so no functional
+ * test or wait is needed.
  */
 
 static nxt_bool_t
 nxt_io_uring_accept_supported(struct io_uring *ring)
 {
-    int                       lfd, ret;
-    nxt_bool_t                ok;
-    struct io_uring_cqe       *cqe;
-    struct sockaddr_un        sa;
-    struct __kernel_timespec  ts;
-    struct io_uring_sqe       *sqe;
+    nxt_bool_t             ok;
+    struct io_uring_probe  *probe;
 
-    lfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (lfd == -1) {
+    probe = io_uring_get_probe_ring(ring);
+
+    if (probe == NULL) {
         return 0;
     }
 
-    /* Abstract-namespace name: no filesystem entry to clean up. */
-    nxt_memzero(&sa, sizeof(sa));
-    sa.sun_family = AF_UNIX;
-    sa.sun_path[0] = '\0';
-    (void) snprintf(&sa.sun_path[1], sizeof(sa.sun_path) - 1,
-                    "nxt_iou_probe_%d", (int) getpid());
+    ok = io_uring_opcode_supported(probe, IORING_OP_ACCEPT);
 
-    if (bind(lfd, (struct sockaddr *) &sa, sizeof(sa)) != 0
-        || listen(lfd, 1) != 0)
-    {
-        close(lfd);
-        return 0;
-    }
-
-    ok = 0;
-
-    sqe = io_uring_get_sqe(ring);
-    if (sqe == NULL) {
-        close(lfd);
-        return 0;
-    }
-
-    io_uring_prep_accept(sqe, lfd, NULL, NULL,
-                         SOCK_NONBLOCK | SOCK_CLOEXEC);
-    io_uring_sqe_set_data64(sqe, NXT_IOU_UD_REMOVE);
-
-    if (io_uring_submit(ring) < 0) {
-        close(lfd);
-        return 0;
-    }
-
-    ts.tv_sec = 0;
-    ts.tv_nsec = 20 * 1000000;
-
-    ret = io_uring_wait_cqe_timeout(ring, &cqe, &ts);
-
-    if (ret == -ETIME) {
-        /* No completion: the accept is armed and waiting. */
-        ok = 1;
-
-    } else if (ret == 0 && cqe != NULL) {
-        ok = (cqe->res != -EINVAL);
-        io_uring_cqe_seen(ring, cqe);
-    }
-
-    /* Cancel the accept before the listening fd goes away. */
-    sqe = io_uring_get_sqe(ring);
-    if (sqe != NULL) {
-        io_uring_prep_cancel64(sqe, NXT_IOU_UD_REMOVE, 0);
-        io_uring_sqe_set_data64(sqe, NXT_IOU_UD_REMOVE);
-        (void) io_uring_submit(ring);
-    }
-
-    close(lfd);
-
-    /* Drain any leftover completions (the cancel and its target). */
-    while (io_uring_peek_cqe(ring, &cqe) == 0 && cqe != NULL) {
-        io_uring_cqe_seen(ring, cqe);
-    }
-
-    return ok;
-}
-
-
-/*
- * Functional probe for buf_ring (5.19) + IORING_RECV_MULTISHOT (6.0): register
- * a tiny buffer ring, arm a multishot recv with buffer-select on a socketpair,
- * push one byte, and confirm the completion is delivered (not -EINVAL).
- */
-
-#define NXT_IOU_PROBE_BGID  0xFFFF
-
-static nxt_bool_t
-nxt_io_uring_recv_supported(struct io_uring *ring)
-{
-    int                       sv[2], err, ret;
-    char                      buf[64];
-    nxt_bool_t                ok;
-    struct io_uring_cqe       *cqe;
-    struct io_uring_sqe       *sqe;
-    struct io_uring_buf_ring  *br;
-    struct __kernel_timespec  ts;
-
-    br = io_uring_setup_buf_ring(ring, 4, NXT_IOU_PROBE_BGID, 0, &err);
-    if (br == NULL) {
-        return 0;
-    }
-
-    ok = 0;
-
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
-        goto free_ring;
-    }
-
-    io_uring_buf_ring_add(br, buf, sizeof(buf), 0, io_uring_buf_ring_mask(4), 0);
-    io_uring_buf_ring_advance(br, 1);
-
-    sqe = io_uring_get_sqe(ring);
-    if (sqe == NULL) {
-        goto close_sv;
-    }
-
-    io_uring_prep_recv_multishot(sqe, sv[0], NULL, 0, 0);
-    sqe->flags |= IOSQE_BUFFER_SELECT;
-    sqe->buf_group = NXT_IOU_PROBE_BGID;
-    io_uring_sqe_set_data64(sqe, NXT_IOU_UD_REMOVE);
-
-    if (io_uring_submit(ring) < 0) {
-        goto close_sv;
-    }
-
-    buf[0] = 'x';
-    if (write(sv[1], buf, 1) != 1) {
-        goto cancel;
-    }
-
-    ts.tv_sec = 0;
-    ts.tv_nsec = 20 * 1000000;
-
-    ret = io_uring_wait_cqe_timeout(ring, &cqe, &ts);
-
-    if (ret == 0 && cqe != NULL) {
-        ok = (cqe->res >= 0);
-        io_uring_cqe_seen(ring, cqe);
-    }
-
-cancel:
-
-    sqe = io_uring_get_sqe(ring);
-    if (sqe != NULL) {
-        io_uring_prep_cancel64(sqe, NXT_IOU_UD_REMOVE, 0);
-        io_uring_sqe_set_data64(sqe, NXT_IOU_UD_REMOVE);
-        (void) io_uring_submit(ring);
-    }
-
-close_sv:
-
-    close(sv[0]);
-    close(sv[1]);
-
-    while (io_uring_peek_cqe(ring, &cqe) == 0 && cqe != NULL) {
-        io_uring_cqe_seen(ring, cqe);
-    }
-
-free_ring:
-
-    io_uring_free_buf_ring(ring, br, 4, NXT_IOU_PROBE_BGID);
+    io_uring_free_probe(probe);
 
     return ok;
 }
@@ -959,34 +791,6 @@ nxt_io_uring_probe(void)
 }
 
 
-static void
-nxt_io_uring_test_accept4(nxt_event_engine_t *engine, nxt_conn_io_t *io)
-{
-    static nxt_work_handler_t  handler;
-
-    if (handler == NULL) {
-
-        handler = io->accept;
-
-#if (NXT_HAVE_ACCEPT4)
-
-        (void) accept4(-1, NULL, NULL, SOCK_NONBLOCK);
-
-        if (nxt_errno != NXT_ENOSYS) {
-            handler = nxt_io_uring_conn_io_accept4;
-
-        } else {
-            nxt_log(&engine->task, NXT_LOG_INFO, "accept4() failed %E",
-                    NXT_ENOSYS);
-        }
-
-#endif
-    }
-
-    io->accept = handler;
-}
-
-
 #if (NXT_HAVE_SIGNALFD)
 
 /*
@@ -1000,54 +804,41 @@ nxt_io_uring_test_accept4(nxt_event_engine_t *engine, nxt_conn_io_t *io)
 static nxt_int_t
 nxt_io_uring_add_signal(nxt_event_engine_t *engine)
 {
-    int                    fd;
+    nxt_io_uring_slot_t    *slot;
     nxt_io_uring_engine_t  *iou;
 
     iou = &engine->u.io_uring;
 
-    if (sigprocmask(SIG_BLOCK, &engine->signals->sigmask, NULL) != 0) {
-        nxt_alert(&engine->task, "sigprocmask(SIG_BLOCK) failed %E", nxt_errno);
+    /*
+     * The shared helper installs nxt_epoll_signalfd_handler, which drains the
+     * signalfd to EAGAIN -- required here because the engine's multishot poll
+     * is edge-like and the per-drain dedupe can collapse several queued
+     * signals into a single handler run.
+     */
+    if (nxt_epoll_signalfd_create(engine, &iou->signalfd) != NXT_OK) {
         return NXT_ERROR;
     }
-
-    fd = signalfd(-1, &engine->signals->sigmask, 0);
-
-    if (fd == -1) {
-        nxt_alert(&engine->task, "signalfd(%d) failed %E",
-                  iou->signalfd.fd, nxt_errno);
-        return NXT_ERROR;
-    }
-
-    iou->signalfd.fd = fd;
-
-    if (nxt_fd_nonblocking(&engine->task, fd) != NXT_OK) {
-        return NXT_ERROR;
-    }
-
-    nxt_debug(&engine->task, "io_uring signalfd(): %d", fd);
-
-    iou->signalfd.data = engine->signals->handler;
-    iou->signalfd.read_work_queue = &engine->fast_work_queue;
-    iou->signalfd.read_handler = nxt_io_uring_signalfd_handler;
-    iou->signalfd.log = engine->task.log;
-    iou->signalfd.task = &engine->task;
 
     /*
      * Arm the signalfd's multishot read poll through the fallible primitive
      * rather than nxt_io_uring_enable_read(): the latter reports a failed arm
      * only by queuing nxt_io_uring_error_handler, which is a no-op for an
      * internal fd (the signalfd has no error_handler).  A silently swallowed
-     * failure would let create() succeed with the signals blocked (sigprocmask
-     * above) but never delivered.  Propagate NXT_ERROR instead so create()
-     * unwinds -- nxt_io_uring_free() closes the signalfd, the sigmask stays
-     * blocked exactly as on the epoll engine's own signalfd failure paths --
-     * and the runtime falls back to epoll, whose add_signal() re-blocks and
-     * re-arms it, mirroring how epoll treats a failed epoll_ctl() there.
+     * failure would let create() succeed with the signals blocked (the shared
+     * helper's sigprocmask) but never delivered.  Propagate NXT_ERROR instead
+     * so create() unwinds -- nxt_io_uring_free() closes the signalfd, the
+     * sigmask stays blocked exactly as on the epoll engine's own signalfd
+     * failure paths -- and the runtime falls back to epoll, whose
+     * add_signal() re-blocks and re-arms it, mirroring how epoll treats a
+     * failed epoll_ctl() there.
      */
-    if (nxt_slow_path(!nxt_io_uring_arm(engine, &iou->signalfd,
+    slot = nxt_io_uring_slot(engine, iou->signalfd.fd);
+
+    if (nxt_slow_path(!nxt_io_uring_arm(engine, &iou->signalfd, slot,
                                         NXT_IOU_DIR_READ, 1)))
     {
-        nxt_alert(&engine->task, "io_uring failed to arm signalfd(%d)", fd);
+        nxt_alert(&engine->task, "io_uring failed to arm signalfd(%d)",
+                  iou->signalfd.fd);
         return NXT_ERROR;
     }
 
@@ -1056,51 +847,6 @@ nxt_io_uring_add_signal(nxt_event_engine_t *engine)
     return NXT_OK;
 }
 
-
-/*
- * Drain the signalfd completely, dispatching the handler once per queued
- * siginfo.  A single read per dispatch is NOT enough here: the engine's
- * multishot poll is edge-like and the per-drain dedupe collapses several
- * CQEs into one handler run, so a second pending signal (e.g. SIGTERM queued
- * behind SIGCHLD) would strand in the signalfd until some unrelated future
- * signal produced a new wakeup.  Looping to EAGAIN consumes everything the
- * wakeup(s) announced.
- */
-
-static void
-nxt_io_uring_signalfd_handler(nxt_task_t *task, void *obj, void *data)
-{
-    int                      n;
-    nxt_err_t                err;
-    nxt_fd_event_t           *ev;
-    nxt_work_handler_t       handler;
-    struct signalfd_siginfo  sfd;
-
-    ev = obj;
-    handler = data;
-
-    nxt_debug(task, "io_uring signalfd handler");
-
-    for ( ;; ) {
-        n = read(ev->fd, &sfd, sizeof(struct signalfd_siginfo));
-        err = (n == -1) ? nxt_errno : 0;
-
-        nxt_debug(task, "read signalfd(%d): %d", ev->fd, n);
-
-        if (n != sizeof(struct signalfd_siginfo)) {
-            if (n == -1 && err == NXT_EAGAIN) {
-                return;
-            }
-
-            nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, err);
-            return;
-        }
-
-        nxt_debug(task, "signalfd(%d) signo:%d", ev->fd, sfd.ssi_signo);
-
-        handler(task, (void *) (uintptr_t) sfd.ssi_signo, NULL);
-    }
-}
 
 #endif
 
@@ -1210,7 +956,6 @@ nxt_io_uring_get_sqe(nxt_event_engine_t *engine)
     if (nxt_slow_path(sqe == NULL)) {
         /* SQ ring full: submit the accumulated batch to free slots. */
         (void) io_uring_submit(&engine->u.io_uring.ring);
-        engine->u.io_uring.nsubmitted = 0;
 
         sqe = io_uring_get_sqe(&engine->u.io_uring.ring);
     }
@@ -1263,15 +1008,13 @@ nxt_io_uring_arm_failed(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 
 
 static nxt_bool_t
-nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t dir,
-    nxt_bool_t multishot)
+nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
+    nxt_io_uring_slot_t *slot, nxt_uint_t dir, nxt_bool_t multishot)
 {
     uint32_t             gen;
     uint32_t             mask;
     struct io_uring_sqe  *sqe;
-    nxt_io_uring_slot_t  *slot;
 
-    slot = nxt_io_uring_slot(engine, ev->fd);
     if (nxt_slow_path(slot == NULL)) {
         nxt_alert(ev->task, "io_uring slot alloc failed for fd %d", ev->fd);
         return 0;
@@ -1343,8 +1086,6 @@ nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t dir,
     }
 
     io_uring_sqe_set_data64(sqe, nxt_iou_ud(ev->fd, gen, dir, 0));
-
-    engine->u.io_uring.nsubmitted++;
 
     nxt_debug(ev->task, "io_uring arm fd:%d dir:%d ms:%d gen:%uD",
               ev->fd, (int) dir, (int) multishot, (uint32_t) gen);
@@ -1485,8 +1226,6 @@ nxt_io_uring_submit_remove(nxt_event_engine_t *engine, nxt_fd_t fd, uint32_t gen
     }
 
     io_uring_sqe_set_data64(sqe, NXT_IOU_UD_REMOVE);
-
-    engine->u.io_uring.nsubmitted++;
 
     return 1;
 }
@@ -1693,14 +1432,16 @@ nxt_io_uring_enable(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     }
 
     if (!slot->read_armed
-        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 1)))
+        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                           NXT_IOU_DIR_READ, 1)))
     {
         nxt_io_uring_arm_failed(engine, ev);
         return;
     }
 
     if (!slot->write_armed
-        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_WRITE, 1)))
+        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                           NXT_IOU_DIR_WRITE, 1)))
     {
         nxt_io_uring_arm_failed(engine, ev);
         return;
@@ -1760,10 +1501,8 @@ nxt_io_uring_close(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_io_uring_delete(engine, ev);
 
-    if (engine->u.io_uring.nsubmitted != 0) {
-        (void) io_uring_submit(&engine->u.io_uring.ring);
-        engine->u.io_uring.nsubmitted = 0;
-    }
+    /* liburing skips the io_uring_enter() syscall when the SQ is empty. */
+    (void) io_uring_submit(&engine->u.io_uring.ring);
 
     return ev->changing;
 }
@@ -1788,7 +1527,8 @@ nxt_io_uring_enable_read(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
      * syscall reduction over epoll's re-MOD.
      */
     if (!slot->read_armed
-        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 1)))
+        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                           NXT_IOU_DIR_READ, 1)))
     {
         nxt_io_uring_arm_failed(engine, ev);
         return;
@@ -1812,7 +1552,8 @@ nxt_io_uring_enable_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     }
 
     if (!slot->write_armed
-        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_WRITE, 1)))
+        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                           NXT_IOU_DIR_WRITE, 1)))
     {
         nxt_io_uring_arm_failed(engine, ev);
         return;
@@ -1908,7 +1649,9 @@ nxt_io_uring_oneshot_read(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     ev->read = NXT_EVENT_ONESHOT;
     ev->write = NXT_EVENT_INACTIVE;
 
-    if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 0))) {
+    if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                        NXT_IOU_DIR_READ, 0)))
+    {
         nxt_io_uring_arm_failed(engine, ev);
     }
 }
@@ -1934,7 +1677,9 @@ nxt_io_uring_oneshot_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     ev->read = NXT_EVENT_INACTIVE;
     ev->write = NXT_EVENT_ONESHOT;
 
-    if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_WRITE, 0))) {
+    if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                        NXT_IOU_DIR_WRITE, 0)))
+    {
         nxt_io_uring_arm_failed(engine, ev);
     }
 }
@@ -1982,7 +1727,7 @@ nxt_io_uring_oneshot_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
  */
 
 static nxt_bool_t nxt_io_uring_arm_accept(nxt_event_engine_t *engine,
-    nxt_fd_event_t *ev);
+    nxt_fd_event_t *ev, nxt_io_uring_slot_t *slot);
 
 
 static void
@@ -2005,7 +1750,7 @@ nxt_io_uring_enable_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     }
 
     if (engine->u.io_uring.tier >= NXT_IOU_TIER_ACCEPT) {
-        if (nxt_slow_path(!nxt_io_uring_arm_accept(engine, ev))) {
+        if (nxt_slow_path(!nxt_io_uring_arm_accept(engine, ev, slot))) {
             nxt_io_uring_arm_failed(engine, ev);
         }
         return;
@@ -2019,19 +1764,20 @@ nxt_io_uring_enable_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
      * immediately when the backlog is non-empty -- which the !F_MORE re-arm
      * turns into the required level-triggered re-fire at one SQE per batch.
      */
-    if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 0))) {
+    if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                        NXT_IOU_DIR_READ, 0)))
+    {
         nxt_io_uring_arm_failed(engine, ev);
     }
 }
 
 
 static nxt_bool_t
-nxt_io_uring_arm_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
+nxt_io_uring_arm_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
+    nxt_io_uring_slot_t *slot)
 {
     struct io_uring_sqe  *sqe;
-    nxt_io_uring_slot_t  *slot;
 
-    slot = nxt_io_uring_slot(engine, ev->fd);
     if (nxt_slow_path(slot == NULL)) {
         nxt_alert(ev->task, "io_uring slot alloc failed for fd %d", ev->fd);
         return 0;
@@ -2070,8 +1816,6 @@ nxt_io_uring_arm_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     io_uring_sqe_set_data64(sqe,
                         nxt_iou_ud(ev->fd, slot->read_generation,
                                    NXT_IOU_DIR_READ, 1));
-
-    engine->u.io_uring.nsubmitted++;
 
     nxt_debug(ev->task, "io_uring arm accept fd:%d gen:%uD",
               ev->fd, (uint32_t) slot->read_generation);
@@ -2113,8 +1857,6 @@ nxt_io_uring_enable_post(nxt_event_engine_t *engine, nxt_work_handler_t handler)
 
     io_uring_prep_poll_multishot(sqe, fd, POLLIN);
     io_uring_sqe_set_data64(sqe, NXT_IOU_UD_POST);
-
-    iou->nsubmitted++;
 
     return NXT_OK;
 }
@@ -2178,7 +1920,6 @@ nxt_io_uring_poll(nxt_event_engine_t *engine, nxt_msec_t timeout)
         if (sqe != NULL) {
             io_uring_prep_poll_multishot(sqe, iou->eventfd.fd, POLLIN);
             io_uring_sqe_set_data64(sqe, NXT_IOU_UD_POST);
-            iou->nsubmitted++;
             iou->post_rearm_pending = 0;
         }
     }
@@ -2224,8 +1965,6 @@ nxt_io_uring_poll(nxt_event_engine_t *engine, nxt_msec_t timeout)
 
     /* One syscall flushes the batched SQEs and waits for a completion. */
     ret = io_uring_submit_and_wait_timeout(&iou->ring, &cqe, 1, pts, NULL);
-
-    iou->nsubmitted = 0;
 
     nxt_thread_time_update(engine->task.thread);
 
@@ -2401,7 +2140,7 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
      * - Data + FIN in one wakeup: a single CQE carries POLLIN|POLLRDHUP.
      *   recv() consuming the data as a short read clears read_ready (the
      *   level contract), losing the pending EOF.  The epoll_eof mark below
-     *   plus the nxt_io_uring_conn_io_recvbuf shim force read_ready back on
+     *   plus the nxt_epoll_edge_conn_io_recvbuf shim force read_ready back on
      *   so the caller loops and observes the EOF.  (The fix for the
      *   proxy-keepalive stall.)
      * - Full-buffer read (n == buffer size): recvbuf keeps read_ready set,
@@ -2524,7 +2263,8 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
             && ev->read != NXT_EVENT_INACTIVE
             && ev->read != NXT_EVENT_DISABLED)
         {
-            if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ,
+            if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                                NXT_IOU_DIR_READ,
                                                 slot->read_multishot)))
             {
                 nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ);
@@ -2572,7 +2312,7 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
             && ev->write != NXT_EVENT_INACTIVE
             && ev->write != NXT_EVENT_DISABLED)
         {
-            if (nxt_slow_path(!nxt_io_uring_arm(engine, ev,
+            if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
                                                 NXT_IOU_DIR_WRITE, 1)))
             {
                 nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_WRITE);
@@ -2697,7 +2437,7 @@ nxt_io_uring_accept_cqe(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
         nxt_conn_accept_error(ev->task, lev, "accept", -res);
 
         if (ev->read == NXT_EVENT_ACTIVE) {
-            if (nxt_slow_path(!nxt_io_uring_arm_accept(engine, ev))) {
+            if (nxt_slow_path(!nxt_io_uring_arm_accept(engine, ev, slot))) {
                 nxt_io_uring_arm_failed(engine, ev);
             }
         }
@@ -2770,7 +2510,7 @@ nxt_io_uring_accept_cqe(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
      * error_handler (at most once per completion; the caller returns after).
      */
     if (ev->read == NXT_EVENT_ACTIVE && !slot->read_armed) {
-        if (nxt_slow_path(!nxt_io_uring_arm_accept(engine, ev))) {
+        if (nxt_slow_path(!nxt_io_uring_arm_accept(engine, ev, slot))) {
             nxt_io_uring_arm_failed(engine, ev);
         }
     }
@@ -2799,7 +2539,6 @@ nxt_io_uring_internal_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
         if (nxt_fast_path(sqe != NULL)) {
             io_uring_prep_poll_multishot(sqe, iou->eventfd.fd, POLLIN);
             io_uring_sqe_set_data64(sqe, NXT_IOU_UD_POST);
-            iou->nsubmitted++;
             iou->post_rearm_pending = 0;
 
         } else {
@@ -2814,79 +2553,29 @@ nxt_io_uring_internal_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
         }
     }
 
-    /* Drain the eventfd counter so the next post produces a fresh edge. */
-    do {
+    /*
+     * The maximum value after which write() to an eventfd descriptor blocks
+     * or returns EAGAIN is 0xFFFFFFFFFFFFFFFE, so the descriptor can be read
+     * once per many notifications, for example, once per 2^32-2
+     * notifications.  The multishot poll posts a CQE per write()-side wakeup
+     * regardless of the accumulated counter value, like EPOLLET in the epoll
+     * engine, so skipping the read never suppresses future doorbells.
+     */
+    if (iou->neventfd++ >= 0xFFFFFFFE) {
+        iou->neventfd = 0;
+
         n = read(iou->eventfd.fd, &value, sizeof(uint64_t));
-    } while (n == sizeof(uint64_t));
+
+        nxt_debug(&engine->task, "read(%d): %z events:%uL",
+                  iou->eventfd.fd, n, value);
+
+        if (n != sizeof(uint64_t)) {
+            nxt_alert(&engine->task, "read eventfd(%d) failed %E",
+                      iou->eventfd.fd, nxt_errno);
+        }
+    }
 
     if (iou->post_handler != NULL) {
         iou->post_handler(&engine->task, NULL, NULL);
     }
-}
-
-
-#if (NXT_HAVE_ACCEPT4)
-
-static void
-nxt_io_uring_conn_io_accept4(nxt_task_t *task, void *obj, void *data)
-{
-    socklen_t           socklen;
-    nxt_conn_t          *c;
-    nxt_socket_t        s;
-    struct sockaddr     *sa;
-    nxt_listen_event_t  *lev;
-
-    lev = obj;
-    c = lev->next;
-
-    lev->ready--;
-    lev->socket.read_ready = (lev->ready != 0);
-
-    sa = &c->remote->u.sockaddr;
-    socklen = c->remote->socklen;
-    /*
-     * The returned socklen is ignored here,
-     * see comment in nxt_conn_io_accept().
-     *
-     * SOCK_CLOEXEC keeps the accepted client socket from leaking into spawned
-     * application processes, matching the fcntl(FD_CLOEXEC) that the generic
-     * nxt_conn_io_accept() applies on the plain accept() path.
-     */
-    s = accept4(lev->socket.fd, sa, &socklen, SOCK_NONBLOCK | SOCK_CLOEXEC);
-
-    if (s != -1) {
-        c->socket.fd = s;
-
-        nxt_debug(task, "accept4(%d): %d", lev->socket.fd, s);
-
-        nxt_conn_accept(task, lev, c);
-        return;
-    }
-
-    nxt_conn_accept_error(task, lev, "accept4", nxt_errno);
-}
-
-#endif
-
-
-/*
- * A wrapper around the standard nxt_conn_io_recvbuf() to enforce reading a
- * pending EOF under the engine's edge-like delivery, identical to the epoll
- * edge engine's shim: when data and FIN arrive in a single wakeup the kernel
- * posts one CQE and never re-reports the fd, so a short read that clears
- * read_ready would strand the EOF forever.
- */
-
-static ssize_t
-nxt_io_uring_conn_io_recvbuf(nxt_conn_t *c, nxt_buf_t *b)
-{
-    ssize_t  n;
-
-    n = nxt_conn_io_recvbuf(c, b);
-
-    if (n > 0 && c->socket.epoll_eof) {
-        c->socket.read_ready = 1;
-    }
-
-    return n;
 }

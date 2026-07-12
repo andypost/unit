@@ -124,14 +124,16 @@ nxt_services_init(nxt_mp_t *mp)
 #if (NXT_HAVE_IO_URING)
 
     if (io_uring && !prepend) {
-        s = nxt_array_add(services);
-        if (nxt_slow_path(s == NULL)) {
+        static const nxt_service_t  io_uring_service = {
+            "engine", "io_uring", &nxt_io_uring_engine
+        };
+
+        /* nxt_service_add() also rejects a duplicate registration. */
+        if (nxt_slow_path(nxt_service_add(services, &io_uring_service)
+                          != NXT_OK))
+        {
             return NULL;
         }
-
-        s->type = "engine";
-        s->name = "io_uring";
-        s->service = &nxt_io_uring_engine;
     }
 
 #endif

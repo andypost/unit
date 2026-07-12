@@ -222,6 +222,25 @@ typedef struct {
 extern const nxt_event_interface_t  nxt_epoll_edge_engine;
 extern const nxt_event_interface_t  nxt_epoll_level_engine;
 
+/*
+ * Helpers shared with the io_uring engine, which reproduces epoll edge
+ * semantics (multishot poll is edge-like) and therefore needs the identical
+ * accept4 fast path, edge-mode recvbuf EOF shim, and signalfd plumbing.
+ * Definitions live in nxt_epoll_engine.c; engine-specific registration of
+ * the created signalfd stays in each engine.
+ */
+void nxt_epoll_test_accept4(nxt_event_engine_t *engine, nxt_conn_io_t *io);
+
+#if (NXT_HAVE_EPOLL_EDGE)
+ssize_t nxt_epoll_edge_conn_io_recvbuf(nxt_conn_t *c, nxt_buf_t *b);
+#endif
+
+#if (NXT_HAVE_SIGNALFD)
+nxt_int_t nxt_epoll_signalfd_create(nxt_event_engine_t *engine,
+    nxt_fd_event_t *sev);
+void nxt_epoll_signalfd_handler(nxt_task_t *task, void *obj, void *data);
+#endif
+
 #endif
 
 
@@ -356,11 +375,8 @@ typedef struct {
     nxt_io_uring_slot_t           *slots;
     uint32_t                      nslots;
 
-    /* Pending SQEs accumulated since the last submit. */
-    nxt_uint_t                    nsubmitted;
-
     /*
-     * Count of slot directions with a POLL_REMOVE owed but not yet submitted
+     * Count of slot directions with a cancel owed but not yet submitted
      * (see nxt_io_uring_slot_t.read_remove_pending).  Gates the recovery scan
      * in nxt_io_uring_poll() so it stays off the hot path: zero in steady state.
      */
@@ -378,6 +394,7 @@ typedef struct {
 
     nxt_work_handler_t            post_handler;
     nxt_fd_event_t                eventfd;
+    uint32_t                      neventfd;
 
 #if (NXT_HAVE_SIGNALFD)
     nxt_fd_event_t                signalfd;

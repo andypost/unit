@@ -204,6 +204,10 @@
 #include <sys/eventfd.h>
 #endif
 
+#if (NXT_HAVE_IO_URING)
+#include <liburing.h>
+#endif
+
 #if (NXT_HAVE_KQUEUE)
 #include <sys/event.h>
 #endif

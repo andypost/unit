@@ -67,23 +67,42 @@ nxt_services_init(nxt_mp_t *mp)
 
     services = nxt_array_create(mp, 32, sizeof(nxt_service_t));
 
-    if (nxt_fast_path(services != NULL)) {
-
-        service = nxt_services;
-        n = nxt_nitems(nxt_services);
-
-        while (n != 0) {
-            s = nxt_array_add(services);
-            if (nxt_slow_path(s == NULL)) {
-                return NULL;
-            }
-
-            *s = *service;
-
-            service++;
-            n--;
-        }
+    if (nxt_slow_path(services == NULL)) {
+        return NULL;
     }
+
+    service = nxt_services;
+    n = nxt_nitems(nxt_services);
+
+    while (n != 0) {
+        s = nxt_array_add(services);
+        if (nxt_slow_path(s == NULL)) {
+            return NULL;
+        }
+
+        *s = *service;
+
+        service++;
+        n--;
+    }
+
+#if (NXT_HAVE_IO_URING)
+
+    /*
+     * Register the io_uring engine by name.  It is appended, so the default
+     * engine (the first "engine" service, epoll on Linux) is unchanged.
+     */
+
+    s = nxt_array_add(services);
+    if (nxt_slow_path(s == NULL)) {
+        return NULL;
+    }
+
+    s->type = "engine";
+    s->name = "io_uring";
+    s->service = &nxt_io_uring_engine;
+
+#endif
 
     return services;
 }

@@ -121,6 +121,8 @@ nxt_event_engine_create(nxt_task_t *task,
 
     engine->event = *interface;
 
+    nxt_log(task, NXT_LOG_INFO, "using \"%s\" event engine", interface->name);
+
     if (nxt_event_engine_post_init(engine) != NXT_OK) {
         goto post_fail;
     }

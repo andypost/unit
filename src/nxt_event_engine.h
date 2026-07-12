@@ -225,6 +225,75 @@ extern const nxt_event_interface_t  nxt_epoll_level_engine;
 #endif
 
 
+#if (NXT_HAVE_IO_URING)
+
+/*
+ * Per-fd io_uring bookkeeping.  The slot is indexed directly by the file
+ * descriptor number and its {generation, direction} is encoded into the SQE
+ * user_data so that completions produced before a disable/close (and thus
+ * possibly for a reused fd) are rejected.  Generations are per-direction so
+ * disabling one direction while the other stays armed does not drop the
+ * surviving direction's completions.
+ */
+
+typedef struct {
+    /* The event owning this fd's pollers; recovered in the CQE handler. */
+    nxt_fd_event_t                *ev;
+    uint16_t                      read_generation;
+    uint16_t                      write_generation;
+    uint8_t                       read_armed;   /* multishot R live in kernel */
+    uint8_t                       write_armed;  /* multishot W live in kernel */
+
+    /*
+     * A POLL_REMOVE for a still-live kernel poll could not get an SQE (SQ ring
+     * exhausted while the CQ overflowed).  The direction's armed flag is already
+     * cleared and its generation bumped -- so the slot is safe to re-arm or for
+     * the fd to be closed and reused at once -- but the leaked kernel poll must
+     * still be cancelled to drop its file reference.  The cancel is retried from
+     * nxt_io_uring_poll() and matches the live poll by the *pre-bump* generation
+     * recorded here, so it works even after the fd is closed and even if the
+     * direction has since been re-armed under a newer generation.
+     */
+    uint8_t                       read_remove_pending;
+    uint8_t                       write_remove_pending;
+    uint16_t                      read_remove_gen;
+    uint16_t                      write_remove_gen;
+} nxt_io_uring_slot_t;
+
+
+typedef struct {
+    struct io_uring               ring;
+
+    uint32_t                      sq_entries;
+    uint32_t                      cq_entries;
+
+    uint8_t                       tier;         /* NXT_IOU_TIER_*             */
+    uint8_t                       overflowed;   /* 1 bit                      */
+
+    /* Side table of pollers, indexed by fd; grown on demand. */
+    nxt_io_uring_slot_t           *slots;
+    uint32_t                      nslots;
+
+    /* Pending SQEs accumulated since the last submit. */
+    nxt_uint_t                    nsubmitted;
+
+    /*
+     * Count of slot directions with a POLL_REMOVE owed but not yet submitted
+     * (see nxt_io_uring_slot_t.read_remove_pending).  Gates the recovery scan
+     * in nxt_io_uring_poll() so it stays off the hot path: zero in steady state.
+     */
+    uint32_t                      npending_removes;
+
+    nxt_work_handler_t            post_handler;
+    nxt_fd_event_t                eventfd;
+} nxt_io_uring_engine_t;
+
+
+extern const nxt_event_interface_t  nxt_io_uring_engine;
+
+#endif
+
+
 #if (NXT_HAVE_EVENTPORT)
 
 typedef struct {
@@ -428,6 +497,9 @@ struct nxt_event_engine_s {
 #endif
 #if (NXT_HAVE_EPOLL)
         nxt_epoll_engine_t     epoll;
+#endif
+#if (NXT_HAVE_IO_URING)
+        nxt_io_uring_engine_t  io_uring;
 #endif
 #if (NXT_HAVE_EVENTPORT)
         nxt_eventport_engine_t eventport;

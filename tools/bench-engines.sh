@@ -268,10 +268,13 @@ put_config_php() {  # runsock port phproot -> writes conf result, returns rc
 }
 
 # ---- engine assertion -------------------------------------------------------
-detect_engine() {  # logfile -> engine name (or "unknown")
-    local log=$1 name
+detect_engine() {  # rundir -> engine name (or "unknown")
+    local run=$1 name
     # implementation branch logs:  using "epoll" event engine
-    name=$(grep -oE 'using "[^"]+" event engine' "$log" 2>/dev/null | head -1 \
+    # The main process emits it on stderr (before the log file opens); router
+    # workers emit it into unit.log later. Check both.
+    name=$(cat "$run/stderr.log" "$run/unit.log" 2>/dev/null \
+           | grep -oE 'using "[^"]+" event engine' | head -1 \
            | sed -E 's/using "([^"]+)".*/\1/')
     [ -n "$name" ] && echo "$name" || echo "unknown"
 }
@@ -287,12 +290,14 @@ start_unitd() {  # label build run -> sets UNITD_PID, ROUTER, ENGINE[label]
     fi
     # Pin the whole server tree at spawn (children inherit affinity); the
     # later router re-pin is then just a no-op safety net.
+    # stderr must be captured: the main process logs the engine line before
+    # the log file is opened, so it only ever appears on stderr.
     taskset -c "$SERVER_CORES" "$build/sbin/unitd" --no-daemon \
         --control "unix:$run/control.sock" \
         --pid "$run/unit.pid" --log "$run/unit.log" \
         --statedir "$run/state" --tmpdir "$run" \
         --modulesdir "$mods" \
-        >/dev/null 2>&1 &
+        >/dev/null 2>"$run/stderr.log" &
     UNITD_PID=$!
     # wait for the control socket instead of a bare sleep
     local i=0
@@ -301,7 +306,7 @@ start_unitd() {  # label build run -> sets UNITD_PID, ROUTER, ENGINE[label]
         i=$((i+1)); sleep 0.1
     done
     [ -S "$run/control.sock" ] || { echo "no control socket ($label)"; return 1; }
-    ENGINE[$label]=$(detect_engine "$run/unit.log")
+    ENGINE[$label]=$(detect_engine "$run")
     return 0
 }
 

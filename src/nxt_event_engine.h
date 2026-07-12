@@ -316,6 +316,7 @@ typedef struct {
 
     uint8_t                       tier;         /* NXT_IOU_TIER_*             */
     uint8_t                       overflowed;   /* 1 bit                      */
+    uint8_t                       opt;          /* SINGLE_ISSUER|DEFER applied*/
 
     /*
      * The eventfd doorbell's multishot poll terminated and its re-arm could not

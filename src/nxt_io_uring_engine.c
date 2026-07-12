@@ -43,12 +43,48 @@
  *   NXT_IO_URING_FORCE_TIER=create  passes the probe but fails create(),
  *                                   exercising the in-create epoll fallback
  *                                   (nxt_event_engine_create/_change).
+ *   NXT_IO_URING_FORCE_TIER=poll    caps at the Stage-1 poll-mode bridge:
+ *                                   accept and recv stay on poll+syscall.
+ *   NXT_IO_URING_FORCE_TIER=accept  caps at multishot accept; recv stays on
+ *                                   the poll+recv path.
+ *   NXT_IO_URING_FORCE_TIER=recv    caps at buf-ring multishot recv.
+ *   NXT_IO_URING_FORCE_TIER=opt     (== recv == unset) the full feature tier.
+ *
+ * The cap never raises the tier above what the kernel actually supports; it
+ * only lowers it, so a modern kernel can drive every degraded path.
+ *
+ *   NXT_IO_URING_SETUP_OPT          opt-in for the SINGLE_ISSUER/DEFER_TASKRUN
+ *                                   setup flags (see nxt_io_uring_setup): OFF
+ *                                   by default because the kernel binds the
+ *                                   ring's submitter task at setup time and
+ *                                   Unit creates router-worker engines off the
+ *                                   polling thread.
  */
 
 
-/* Resolved feature tiers.  Stage 1 only needs multishot POLL_ADD. */
+/*
+ * Resolved feature tiers.  Each is cumulative and degrades independently to the
+ * poll-mode Stage-1 path: RECV implies ACCEPT implies POLL.  The kernel
+ * capability is probed once (never by uname) and then capped by the debug
+ * NXT_IO_URING_FORCE_TIER override so every degraded path is exercisable on a
+ * modern kernel.
+ *
+ *   NONE    io_uring unusable                       -> epoll fallback
+ *   POLL    multishot POLL_ADD (5.13)               -> Stage-1 readiness bridge
+ *   ACCEPT  + multishot accept (5.19)               -> completion-mode accept
+ *   RECV    + buf_ring (5.19) + multishot recv (6.0)-> completion-mode recv
+ *   OPT     + SINGLE_ISSUER (6.0) + DEFER_TASKRUN (6.1) setup-flag optimisation
+ *
+ * OPT is not a distinct conn behaviour: it caps at the RECV feature set and
+ * additionally enables the submission/completion setup flags.  FORCE_TIER=recv
+ * therefore exercises the recv path *without* those flags, and =opt/unset with
+ * them.
+ */
 #define NXT_IOU_TIER_NONE    0
 #define NXT_IOU_TIER_POLL    1
+#define NXT_IOU_TIER_ACCEPT  2
+#define NXT_IOU_TIER_RECV    3
+#define NXT_IOU_TIER_OPT     4
 
 
 /*
@@ -115,6 +151,10 @@ static nxt_int_t nxt_io_uring_create(nxt_event_engine_t *engine,
 static nxt_int_t nxt_io_uring_setup(nxt_event_engine_t *engine,
     nxt_uint_t mchanges, nxt_uint_t mevents);
 static nxt_bool_t nxt_io_uring_multishot_supported(struct io_uring *ring);
+static nxt_int_t nxt_io_uring_force_cap(void);
+static nxt_int_t nxt_io_uring_kernel_tier(void);
+static nxt_bool_t nxt_io_uring_accept_supported(struct io_uring *ring);
+static nxt_bool_t nxt_io_uring_recv_supported(struct io_uring *ring);
 static void nxt_io_uring_test_accept4(nxt_event_engine_t *engine,
     nxt_conn_io_t *io);
 #if (NXT_HAVE_SIGNALFD)
@@ -323,7 +363,9 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
 {
     int                     ret;
     char                    *force;
-    uint32_t                nslots;
+    uint32_t                nslots, flags;
+    nxt_int_t               cap, tier;
+    nxt_bool_t              want_opt;
     struct io_uring_params  params;
     nxt_io_uring_engine_t   *iou;
 
@@ -344,19 +386,16 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
     }
 
     /*
-     * Debug override: NXT_IO_URING_FORCE_TIER=none (also failing the probe)
-     * or =create (probe passes, create fails) force this create() to fail
-     * cleanly so the caller degrades to epoll.  Any other value keeps the
-     * resolved tier (Stage 1 caps at POLL regardless).
+     * Debug override: NXT_IO_URING_FORCE_TIER caps the resolved tier.  =none
+     * (also failing the registration probe) and =create force this create() to
+     * fail cleanly so the caller degrades to epoll.  Any other value is a cap
+     * that never raises the tier above kernel support.
      */
-    force = getenv("NXT_IO_URING_FORCE_TIER");
+    cap = nxt_io_uring_force_cap();
 
-    if (force != NULL
-        && (nxt_strcmp(force, "none") == 0
-            || nxt_strcmp(force, "create") == 0))
-    {
+    if (cap == NXT_IOU_TIER_NONE) {
         nxt_log(&engine->task, NXT_LOG_INFO,
-                "io_uring disabled by NXT_IO_URING_FORCE_TIER=%s", force);
+                "io_uring disabled by NXT_IO_URING_FORCE_TIER");
         return NXT_ERROR;
     }
 
@@ -369,14 +408,54 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
     iou->sq_entries = nxt_io_uring_pow2(nxt_max(mchanges, 256));
     iou->cq_entries = nxt_io_uring_pow2(nxt_max(8 * (uint32_t) mevents, 4096));
 
-    nxt_memzero(&params, sizeof(struct io_uring_params));
+    /*
+     * SINGLE_ISSUER (lock elision when a single task submits) and DEFER_TASKRUN
+     * (completion task-work deferred to io_uring_enter time, which poll() calls
+     * every loop) cut submission-lock and completion-latency jitter.  They are
+     * kernel >= 6.0/6.1; on an older kernel queue_init returns -EINVAL, so drop
+     * them and retry (DEFER_TASKRUN requires SINGLE_ISSUER, so both are added
+     * and dropped together).
+     *
+     * OFF BY DEFAULT.  The kernel binds the ring's permitted submitter task at
+     * io_uring_setup() time (verified on 7.0: -EEXIST on any submit from
+     * another task, even for SINGLE_ISSUER alone).  Unit creates each router
+     * worker's engine on the router-MAIN thread (nxt_event_engine_create in
+     * nxt_router_engines_create) and only later runs poll() on the spawned
+     * worker thread (nxt_event_engine_start) -- a different task.  Enabling the
+     * flags therefore busy-loops every worker's poll() on -EEXIST.  The
+     * design's "one thread owns each engine" (§2.5) is true for the poll loop
+     * but NOT for engine creation, which the flags key off.  So the flags are
+     * gated behind an explicit opt-in (NXT_IO_URING_SETUP_OPT) for deployments
+     * where every engine is polled on its creating thread (the main/controller/
+     * application processes, not router workers).
+     */
+    want_opt = (getenv("NXT_IO_URING_SETUP_OPT") != NULL);
 
-    params.flags = IORING_SETUP_CQSIZE;
-    params.cq_entries = iou->cq_entries;
+    flags = IORING_SETUP_CQSIZE;
 
-    ret = io_uring_queue_init_params(iou->sq_entries, &iou->ring, &params);
+    if (want_opt) {
+        flags |= IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+    }
 
-    if (ret < 0) {
+    for ( ;; ) {
+        nxt_memzero(&params, sizeof(struct io_uring_params));
+        params.flags = flags;
+        params.cq_entries = iou->cq_entries;
+
+        ret = io_uring_queue_init_params(iou->sq_entries, &iou->ring, &params);
+
+        if (ret == 0) {
+            break;
+        }
+
+        if (ret == -EINVAL
+            && (flags & IORING_SETUP_SINGLE_ISSUER) != 0)
+        {
+            /* Optimisation flags unsupported on this kernel: drop and retry. */
+            flags &= ~(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
+            continue;
+        }
+
         /*
          * EPERM (seccomp / kernel.io_uring_disabled), ENOSYS (too old / built
          * out), EMFILE/ENFILE (fd exhaustion) and ENOMEM (memlock pressure)
@@ -390,16 +469,41 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
 
     iou->ring_inited = 1;
 
-    nxt_debug(&engine->task, "io_uring_queue_init(): sq:%uD cq:%uD features:%uxD",
-              iou->sq_entries, params.cq_entries, params.features);
+    iou->opt = (flags & IORING_SETUP_SINGLE_ISSUER) != 0;
 
-    if (!nxt_io_uring_multishot_supported(&iou->ring)) {
+    nxt_debug(&engine->task,
+              "io_uring_queue_init(): sq:%uD cq:%uD features:%uxD opt:%d",
+              iou->sq_entries, params.cq_entries, params.features,
+              (int) iou->opt);
+
+    /*
+     * Resolve the kernel capability from a cached throwaway-ring probe rather
+     * than probing this engine's ring: with IORING_SETUP_SINGLE_ISSUER the
+     * kernel binds the ring to the FIRST submitting task, and Unit creates the
+     * router-worker engines on the router-main thread while poll() runs on the
+     * spawned worker thread (nxt_router.c: nxt_event_engine_create at engine
+     * setup vs nxt_event_engine_start on the worker).  Submitting a probe SQE
+     * here would bind the ring to the wrong thread and every worker submit
+     * would then fail with -EEXIST.  So create() performs NO submission; the
+     * first submit happens in poll() on the owning thread.  Multishot POLL_ADD
+     * is the floor; without it there is no point.
+     */
+    tier = nxt_io_uring_kernel_tier();
+
+    if (tier < NXT_IOU_TIER_POLL) {
         nxt_log(&engine->task, NXT_LOG_INFO,
                 "io_uring multishot poll is not supported");
         return NXT_ERROR;
     }
 
-    iou->tier = NXT_IOU_TIER_POLL;
+    if (tier > cap) {
+        tier = cap;
+    }
+
+    iou->tier = tier;
+
+    nxt_log(&engine->task, NXT_LOG_INFO,
+            "io_uring tier %d (opt:%d)", (int) iou->tier, (int) iou->opt);
 
     /* Slots are indexed by fd number; start small and grow on demand. */
     nslots = nxt_max((uint32_t) mevents * 2, 128);
@@ -412,6 +516,259 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
     iou->nslots = nslots;
 
     return NXT_OK;
+}
+
+
+/*
+ * Parse NXT_IO_URING_FORCE_TIER into a tier cap.  Returns NXT_IOU_TIER_NONE for
+ * "none"/"create" (create() must fail), otherwise the capped feature tier.
+ * Unset, "opt", or an unrecognised value means the full feature tier (RECV).
+ * The SINGLE_ISSUER/DEFER_TASKRUN setup flags are governed separately (see
+ * nxt_io_uring_setup); "opt" and "recv" therefore resolve to the same feature
+ * set, the design's OPT tier being RECV plus those flags.
+ */
+
+static nxt_int_t
+nxt_io_uring_force_cap(void)
+{
+    char  *force;
+
+    force = getenv("NXT_IO_URING_FORCE_TIER");
+
+    if (force == NULL) {
+        return NXT_IOU_TIER_RECV;
+    }
+
+    if (nxt_strcmp(force, "none") == 0 || nxt_strcmp(force, "create") == 0) {
+        return NXT_IOU_TIER_NONE;
+    }
+
+    if (nxt_strcmp(force, "poll") == 0) {
+        return NXT_IOU_TIER_POLL;
+    }
+
+    if (nxt_strcmp(force, "accept") == 0) {
+        return NXT_IOU_TIER_ACCEPT;
+    }
+
+    /* "recv", "opt", unset, or unrecognised: full feature tier. */
+    return NXT_IOU_TIER_RECV;
+}
+
+
+/*
+ * Kernel feature capability, probed once and cached process-wide (every engine
+ * in a process shares the same kernel).  Never parses uname: multishot accept
+ * and multishot recv are probed functionally on a throwaway ring.
+ */
+
+static nxt_int_t
+nxt_io_uring_kernel_tier(void)
+{
+    int                     ret;
+    struct io_uring         ring;
+    static nxt_int_t        cached = -1;
+
+    if (cached >= 0) {
+        return cached;
+    }
+
+    cached = NXT_IOU_TIER_NONE;
+
+    ret = io_uring_queue_init(64, &ring, 0);
+    if (ret < 0) {
+        return cached;
+    }
+
+    if (nxt_io_uring_multishot_supported(&ring)) {
+        cached = NXT_IOU_TIER_POLL;
+
+        if (nxt_io_uring_accept_supported(&ring)) {
+            cached = NXT_IOU_TIER_ACCEPT;
+
+            if (nxt_io_uring_recv_supported(&ring)) {
+                cached = NXT_IOU_TIER_RECV;
+            }
+        }
+    }
+
+    io_uring_queue_exit(&ring);
+
+    return cached;
+}
+
+
+/*
+ * Functional probe for IORING_ACCEPT_MULTISHOT (kernel >= 5.19).  Multishot is
+ * a flag bit rather than an opcode, so arm one on a throwaway listening socket:
+ * if the kernel rejects the flag it posts an immediate -EINVAL completion; if
+ * it is supported the accept simply waits (no connection), so a short timeout
+ * with no CQE means "supported".
+ */
+
+static nxt_bool_t
+nxt_io_uring_accept_supported(struct io_uring *ring)
+{
+    int                       lfd, ret;
+    nxt_bool_t                ok;
+    struct io_uring_cqe       *cqe;
+    struct sockaddr_un        sa;
+    struct __kernel_timespec  ts;
+    struct io_uring_sqe       *sqe;
+
+    lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (lfd == -1) {
+        return 0;
+    }
+
+    /* Abstract-namespace name: no filesystem entry to clean up. */
+    nxt_memzero(&sa, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    sa.sun_path[0] = '\0';
+    (void) snprintf(&sa.sun_path[1], sizeof(sa.sun_path) - 1,
+                    "nxt_iou_probe_%d", (int) getpid());
+
+    if (bind(lfd, (struct sockaddr *) &sa, sizeof(sa)) != 0
+        || listen(lfd, 1) != 0)
+    {
+        close(lfd);
+        return 0;
+    }
+
+    ok = 0;
+
+    sqe = io_uring_get_sqe(ring);
+    if (sqe == NULL) {
+        close(lfd);
+        return 0;
+    }
+
+    io_uring_prep_multishot_accept(sqe, lfd, NULL, NULL, SOCK_NONBLOCK);
+    io_uring_sqe_set_data64(sqe, NXT_IOU_UD_REMOVE);
+
+    if (io_uring_submit(ring) < 0) {
+        close(lfd);
+        return 0;
+    }
+
+    ts.tv_sec = 0;
+    ts.tv_nsec = 20 * 1000000;
+
+    ret = io_uring_wait_cqe_timeout(ring, &cqe, &ts);
+
+    if (ret == -ETIME) {
+        /* No completion: the multishot accept is armed and waiting. */
+        ok = 1;
+
+    } else if (ret == 0 && cqe != NULL) {
+        ok = (cqe->res != -EINVAL);
+        io_uring_cqe_seen(ring, cqe);
+    }
+
+    /* Cancel the accept before the listening fd goes away. */
+    sqe = io_uring_get_sqe(ring);
+    if (sqe != NULL) {
+        io_uring_prep_cancel64(sqe, NXT_IOU_UD_REMOVE, 0);
+        io_uring_sqe_set_data64(sqe, NXT_IOU_UD_REMOVE);
+        (void) io_uring_submit(ring);
+    }
+
+    close(lfd);
+
+    /* Drain any leftover completions (the cancel and its target). */
+    while (io_uring_peek_cqe(ring, &cqe) == 0 && cqe != NULL) {
+        io_uring_cqe_seen(ring, cqe);
+    }
+
+    return ok;
+}
+
+
+/*
+ * Functional probe for buf_ring (5.19) + IORING_RECV_MULTISHOT (6.0): register
+ * a tiny buffer ring, arm a multishot recv with buffer-select on a socketpair,
+ * push one byte, and confirm the completion is delivered (not -EINVAL).
+ */
+
+#define NXT_IOU_PROBE_BGID  0xFFFF
+
+static nxt_bool_t
+nxt_io_uring_recv_supported(struct io_uring *ring)
+{
+    int                       sv[2], err, ret;
+    char                      buf[64];
+    nxt_bool_t                ok;
+    struct io_uring_cqe       *cqe;
+    struct io_uring_sqe       *sqe;
+    struct io_uring_buf_ring  *br;
+    struct __kernel_timespec  ts;
+
+    br = io_uring_setup_buf_ring(ring, 4, NXT_IOU_PROBE_BGID, 0, &err);
+    if (br == NULL) {
+        return 0;
+    }
+
+    ok = 0;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        goto free_ring;
+    }
+
+    io_uring_buf_ring_add(br, buf, sizeof(buf), 0, io_uring_buf_ring_mask(4), 0);
+    io_uring_buf_ring_advance(br, 1);
+
+    sqe = io_uring_get_sqe(ring);
+    if (sqe == NULL) {
+        goto close_sv;
+    }
+
+    io_uring_prep_recv_multishot(sqe, sv[0], NULL, 0, 0);
+    sqe->flags |= IOSQE_BUFFER_SELECT;
+    sqe->buf_group = NXT_IOU_PROBE_BGID;
+    io_uring_sqe_set_data64(sqe, NXT_IOU_UD_REMOVE);
+
+    if (io_uring_submit(ring) < 0) {
+        goto close_sv;
+    }
+
+    buf[0] = 'x';
+    if (write(sv[1], buf, 1) != 1) {
+        goto cancel;
+    }
+
+    ts.tv_sec = 0;
+    ts.tv_nsec = 20 * 1000000;
+
+    ret = io_uring_wait_cqe_timeout(ring, &cqe, &ts);
+
+    if (ret == 0 && cqe != NULL) {
+        ok = (cqe->res >= 0);
+        io_uring_cqe_seen(ring, cqe);
+    }
+
+cancel:
+
+    sqe = io_uring_get_sqe(ring);
+    if (sqe != NULL) {
+        io_uring_prep_cancel64(sqe, NXT_IOU_UD_REMOVE, 0);
+        io_uring_sqe_set_data64(sqe, NXT_IOU_UD_REMOVE);
+        (void) io_uring_submit(ring);
+    }
+
+close_sv:
+
+    close(sv[0]);
+    close(sv[1]);
+
+    while (io_uring_peek_cqe(ring, &cqe) == 0 && cqe != NULL) {
+        io_uring_cqe_seen(ring, cqe);
+    }
+
+free_ring:
+
+    io_uring_free_buf_ring(ring, br, 4, NXT_IOU_PROBE_BGID);
+
+    return ok;
 }
 
 

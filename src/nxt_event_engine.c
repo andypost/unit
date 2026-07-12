@@ -116,7 +116,24 @@ nxt_event_engine_create(nxt_task_t *task,
     events = (batch != 0) ? batch : 32;
 
     if (interface->create(engine, 4 * events, events) != NXT_OK) {
+
+#if (NXT_HAVE_IO_URING && NXT_HAVE_EPOLL_EDGE)
+        /*
+         * io_uring resources (ring memory, fds) can run out at any process
+         * fork or router worker start long after the startup probe passed,
+         * so degrade this engine to epoll instead of failing the process.
+         */
+        if (interface != &nxt_io_uring_engine
+            || nxt_epoll_edge_engine.create(engine, 4 * events, events)
+               != NXT_OK)
+        {
+            goto event_set_fail;
+        }
+
+        interface = &nxt_epoll_edge_engine;
+#else
         goto event_set_fail;
+#endif
     }
 
     engine->event = *interface;
@@ -421,10 +438,26 @@ nxt_event_engine_change(nxt_event_engine_t *engine,
     events = (batch != 0) ? batch : 32;
 
     if (interface->create(engine, 4 * events, events) != NXT_OK) {
+
+#if (NXT_HAVE_IO_URING && NXT_HAVE_EPOLL_EDGE)
+        /* As in nxt_event_engine_create(): degrade to epoll, do not die. */
+        if (interface != &nxt_io_uring_engine
+            || nxt_epoll_edge_engine.create(engine, 4 * events, events)
+               != NXT_OK)
+        {
+            return NXT_ERROR;
+        }
+
+        interface = &nxt_epoll_edge_engine;
+#else
         return NXT_ERROR;
+#endif
     }
 
     engine->event = *interface;
+
+    nxt_log(&engine->task, NXT_LOG_INFO, "using \"%s\" event engine",
+            interface->name);
 
     if (nxt_event_engine_post_init(engine) != NXT_OK) {
         return NXT_ERROR;

@@ -30,9 +30,19 @@
  * fd is closed and its number reused -- is dropped before the event object is
  * touched.
  *
- * Debug-only override:
- *   NXT_IO_URING_FORCE_TIER=none  forces the create()-time probe to fail so
- *                                 the runtime falls back to epoll.
+ * Runtime control:
+ *   NXT_IO_URING=0                  operational kill switch: forces epoll for
+ *                                   the whole process tree with no rebuild
+ *                                   (insurance against a kernel/seccomp
+ *                                   io_uring regression).  Honored by both the
+ *                                   registration probe and create().
+ *
+ * Debug-only overrides:
+ *   NXT_IO_URING_FORCE_TIER=none    fails both the registration probe and
+ *                                   create() so the runtime uses epoll.
+ *   NXT_IO_URING_FORCE_TIER=create  passes the probe but fails create(),
+ *                                   exercising the in-create epoll fallback
+ *                                   (nxt_event_engine_create/_change).
  */
 
 
@@ -294,15 +304,33 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
     iou = &engine->u.io_uring;
 
     /*
-     * Debug override: NXT_IO_URING_FORCE_TIER=none forces this create() to
-     * fail cleanly so the runtime falls back to epoll.  Any other value keeps
-     * the resolved tier (Stage 1 caps at POLL regardless).
+     * Operational kill switch: NXT_IO_URING=0 forces the epoll fallback with
+     * no rebuild.  Checked here as well as in the registration probe so an
+     * io_uring engine selected explicitly (bypassing the probe-gated default)
+     * still degrades cleanly.
+     */
+    force = getenv("NXT_IO_URING");
+
+    if (force != NULL && nxt_strcmp(force, "0") == 0) {
+        nxt_log(&engine->task, NXT_LOG_INFO,
+                "io_uring disabled by NXT_IO_URING=0");
+        return NXT_ERROR;
+    }
+
+    /*
+     * Debug override: NXT_IO_URING_FORCE_TIER=none (also failing the probe)
+     * or =create (probe passes, create fails) force this create() to fail
+     * cleanly so the caller degrades to epoll.  Any other value keeps the
+     * resolved tier (Stage 1 caps at POLL regardless).
      */
     force = getenv("NXT_IO_URING_FORCE_TIER");
 
-    if (force != NULL && nxt_strcmp(force, "none") == 0) {
+    if (force != NULL
+        && (nxt_strcmp(force, "none") == 0
+            || nxt_strcmp(force, "create") == 0))
+    {
         nxt_log(&engine->task, NXT_LOG_INFO,
-                "io_uring disabled by NXT_IO_URING_FORCE_TIER=none");
+                "io_uring disabled by NXT_IO_URING_FORCE_TIER=%s", force);
         return NXT_ERROR;
     }
 

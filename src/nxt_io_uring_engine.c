@@ -2171,9 +2171,10 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
      *   message + more-data single wakeup is fully consumed.  Safe.
      * - Write EAGAIN then later writability: the socket-buffer drain is a
      *   new wakeup, producing a new CQE on the still-armed W poll.  Safe.
-     * - BLOCKED fires -> disarm (below) -> enable_read re-arms a fresh
-     *   POLL_ADD, which re-checks readiness at submission and fires
-     *   immediately if the fd is still ready.  Safe.
+     * - BLOCKED fires -> latch read_ready only, poll stays armed (edge-like
+     *   multishot cannot re-report steady state, so no busy loop); the conn
+     *   read discipline consumes the latch on its next voluntary read and the
+     *   subsequent enable_read is a free state write.  Safe.
      * - Listen sockets: non-multishot POLL_ADD; the !F_MORE re-arm below
      *   re-checks the backlog at submission.  Safe (contract item #5).
      */
@@ -2219,17 +2220,30 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
         if (mask & POLLIN) {
             ev->read_ready = 1;
 
-            if (ev->read == NXT_EVENT_BLOCKED) {
-                /* Level-style: disarm to avoid a busy-loop of BLOCKED CQEs. */
-                nxt_io_uring_disable_read(engine, ev);
-                return;
-            }
-
             if (ev->read == NXT_EVENT_ONESHOT) {
                 ev->read = NXT_EVENT_DISABLED;
             }
 
+            /*
+             * Dispatch only an active, non-BLOCKED direction, once per drain.
+             *
+             * A BLOCKED direction latches read_ready above but is NOT
+             * dispatched and -- the Stage-1 refinement -- is NOT disarmed: the
+             * multishot poll stays armed exactly as epoll leaves a blocked fd
+             * in its set (block_read makes no syscall).  Multishot poll is
+             * edge-like (one CQE per new wait-queue wakeup, never a re-report
+             * of steady state), so a BLOCKED direction cannot busy-loop the way
+             * the Stage-1 disarm feared; staying armed makes the following
+             * enable_read a pure state write (zero SQEs), removing the
+             * POLL_REMOVE + POLL_ADD pair Stage 1 paid per read.  The load-
+             * bearing invariants are unchanged: dispatch is gated on state
+             * (never BLOCKED) and on the per-drain read_seq dedupe, generations
+             * still reject stale CQEs, and the conn read discipline consumes
+             * the latched read_ready on its next voluntary read.  DISABLED
+             * (a just-fired oneshot) still dispatches its single event.
+             */
             if (ev->read != NXT_EVENT_INACTIVE
+                && ev->read != NXT_EVENT_BLOCKED
                 && slot->read_seq != engine->u.io_uring.drain_seq
                 && slot->error_seq != engine->u.io_uring.drain_seq)
             {
@@ -2288,16 +2302,13 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
         if (mask & POLLOUT) {
             ev->write_ready = 1;
 
-            if (ev->write == NXT_EVENT_BLOCKED) {
-                nxt_io_uring_disable_write(engine, ev);
-                return;
-            }
-
             if (ev->write == NXT_EVENT_ONESHOT) {
                 ev->write = NXT_EVENT_DISABLED;
             }
 
+            /* Stay-armed-while-BLOCKED, latch only (see the read branch). */
             if (ev->write != NXT_EVENT_INACTIVE
+                && ev->write != NXT_EVENT_BLOCKED
                 && slot->write_seq != engine->u.io_uring.drain_seq
                 && slot->error_seq != engine->u.io_uring.drain_seq)
             {

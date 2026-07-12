@@ -60,7 +60,13 @@ cat << END
                        transport is chosen by settings/telemetry/protocol)
 
   --io-uring           enable Linux io_uring event engine (opt-in, requires
-                       liburing); available by name, epoll stays default
+                       liburing); available by name, epoll stays default.
+                       Note: such builds call io_uring_setup(2) once at
+                       startup to probe kernel support; under a seccomp
+                       policy that KILLS on io_uring syscalls (rather than
+                       returning an error) this terminates the process --
+                       set NXT_IO_URING=0 in the environment to skip the
+                       probe, or build without this option
   --no-io-uring        disable the io_uring event engine (default)
   --io-uring-default   enable io_uring and make it the default event engine
                        (implies --io-uring; epoll used as fallback)

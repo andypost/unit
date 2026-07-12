@@ -31,11 +31,14 @@
  * touched.
  *
  * Runtime control:
- *   NXT_IO_URING=0                  operational kill switch: forces epoll for
+ *   NXT_IO_URING=0 (or =off)        operational kill switch: forces epoll for
  *                                   the whole process tree with no rebuild
  *                                   (insurance against a kernel/seccomp
- *                                   io_uring regression).  Honored by both the
- *                                   registration probe and create().
+ *                                   io_uring regression).  Checked BEFORE any
+ *                                   io_uring syscall by both the registration
+ *                                   probe and create(), so the runtime uses
+ *                                   epoll without ever entering
+ *                                   io_uring_setup(2).
  *
  * Debug-only overrides:
  *   NXT_IO_URING_FORCE_TIER=none    fails both the registration probe and
@@ -54,12 +57,13 @@
  * The cap never raises the tier above what the kernel actually supports; it
  * only lowers it, so a modern kernel can drive every degraded path.
  *
- *   NXT_IO_URING_SETUP_OPT          opt-in for the SINGLE_ISSUER/DEFER_TASKRUN
- *                                   setup flags (see nxt_io_uring_setup): OFF
- *                                   by default because the kernel binds the
- *                                   ring's submitter task at setup time and
- *                                   Unit creates router-worker engines off the
- *                                   polling thread.
+ * SECCOMP CAVEAT: the registration probe calls io_uring_setup(2) once at
+ * startup in every --io-uring build.  A seccomp policy that answers io_uring
+ * syscalls with SCMP_ACT_ERRNO is handled (the probe fails, epoll is used),
+ * but a SCMP_ACT_KILL / SCMP_ACT_KILL_PROCESS policy delivers an uncatchable
+ * SIGSYS and kills the process at startup.  On such systems either build
+ * without --io-uring or set NXT_IO_URING=0 in the environment, which skips
+ * the probe entirely.
  */
 
 
@@ -217,6 +221,7 @@ static nxt_int_t nxt_io_uring_create(nxt_event_engine_t *engine,
 static nxt_int_t nxt_io_uring_setup(nxt_event_engine_t *engine,
     nxt_uint_t mchanges, nxt_uint_t mevents);
 static nxt_bool_t nxt_io_uring_multishot_supported(struct io_uring *ring);
+static nxt_bool_t nxt_io_uring_env_disabled(void);
 static nxt_int_t nxt_io_uring_force_cap(void);
 static nxt_int_t nxt_io_uring_kernel_tier(void);
 static nxt_bool_t nxt_io_uring_accept_supported(struct io_uring *ring);
@@ -430,26 +435,27 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
     nxt_uint_t mevents)
 {
     int                     ret;
-    char                    *force;
-    uint32_t                nslots, flags;
+    uint32_t                nslots;
     nxt_int_t               cap, tier;
-    nxt_bool_t              want_opt;
     struct io_uring_params  params;
     nxt_io_uring_engine_t   *iou;
 
     iou = &engine->u.io_uring;
 
-    /*
-     * Operational kill switch: NXT_IO_URING=0 forces the epoll fallback with
-     * no rebuild.  Checked here as well as in the registration probe so an
-     * io_uring engine selected explicitly (bypassing the probe-gated default)
-     * still degrades cleanly.
-     */
-    force = getenv("NXT_IO_URING");
+#if !(NXT_HAVE_SIGNALFD)
+    /* Belt-and-braces: the probe already refuses to register (see there). */
+    return NXT_ERROR;
+#endif
 
-    if (force != NULL && nxt_strcmp(force, "0") == 0) {
+    /*
+     * Operational kill switch, checked before any io_uring syscall: forces
+     * the epoll fallback with no rebuild.  Checked here as well as in the
+     * registration probe so an io_uring engine selected explicitly (bypassing
+     * the probe-gated default) still degrades cleanly.
+     */
+    if (nxt_io_uring_env_disabled()) {
         nxt_log(&engine->task, NXT_LOG_INFO,
-                "io_uring disabled by NXT_IO_URING=0");
+                "io_uring disabled by NXT_IO_URING environment variable");
         return NXT_ERROR;
     }
 
@@ -477,54 +483,26 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
     iou->cq_entries = nxt_io_uring_pow2(nxt_max(8 * (uint32_t) mevents, 4096));
 
     /*
-     * SINGLE_ISSUER (lock elision when a single task submits) and DEFER_TASKRUN
-     * (completion task-work deferred to io_uring_enter time, which poll() calls
-     * every loop) cut submission-lock and completion-latency jitter.  They are
-     * kernel >= 6.0/6.1; on an older kernel queue_init returns -EINVAL, so drop
-     * them and retry (DEFER_TASKRUN requires SINGLE_ISSUER, so both are added
-     * and dropped together).
-     *
-     * OFF BY DEFAULT.  The kernel binds the ring's permitted submitter task at
-     * io_uring_setup() time (verified on 7.0: -EEXIST on any submit from
-     * another task, even for SINGLE_ISSUER alone).  Unit creates each router
-     * worker's engine on the router-MAIN thread (nxt_event_engine_create in
+     * IORING_SETUP_SINGLE_ISSUER / IORING_SETUP_DEFER_TASKRUN are deliberately
+     * NOT used.  Finding (design §2.5 correction): the kernel binds the ring's
+     * permitted submitter task at io_uring_setup() time -- verified on a 7.0
+     * kernel as -EEXIST on any submit from another task, even for
+     * SINGLE_ISSUER without DEFER_TASKRUN.  Unit creates each router worker's
+     * engine on the router-MAIN thread (nxt_event_engine_create in
      * nxt_router_engines_create) and only later runs poll() on the spawned
-     * worker thread (nxt_event_engine_start) -- a different task.  Enabling the
-     * flags therefore busy-loops every worker's poll() on -EEXIST.  The
-     * design's "one thread owns each engine" (§2.5) is true for the poll loop
-     * but NOT for engine creation, which the flags key off.  So the flags are
-     * gated behind an explicit opt-in (NXT_IO_URING_SETUP_OPT) for deployments
-     * where every engine is polled on its creating thread (the main/controller/
-     * application processes, not router workers).
+     * worker thread (nxt_event_engine_start) -- a different task -- so the
+     * flags busy-loop every worker's poll() on -EEXIST.  "One thread owns each
+     * engine" holds for the poll loop but NOT for engine creation, which the
+     * flags key off.  Revisit only if ring creation moves onto the polling
+     * thread.
      */
-    want_opt = (getenv("NXT_IO_URING_SETUP_OPT") != NULL);
+    nxt_memzero(&params, sizeof(struct io_uring_params));
+    params.flags = IORING_SETUP_CQSIZE;
+    params.cq_entries = iou->cq_entries;
 
-    flags = IORING_SETUP_CQSIZE;
+    ret = io_uring_queue_init_params(iou->sq_entries, &iou->ring, &params);
 
-    if (want_opt) {
-        flags |= IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
-    }
-
-    for ( ;; ) {
-        nxt_memzero(&params, sizeof(struct io_uring_params));
-        params.flags = flags;
-        params.cq_entries = iou->cq_entries;
-
-        ret = io_uring_queue_init_params(iou->sq_entries, &iou->ring, &params);
-
-        if (ret == 0) {
-            iou->ring_inited = 1;
-            break;
-        }
-
-        if (ret == -EINVAL
-            && (flags & IORING_SETUP_SINGLE_ISSUER) != 0)
-        {
-            /* Optimisation flags unsupported on this kernel: drop and retry. */
-            flags &= ~(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
-            continue;
-        }
-
+    if (ret < 0) {
         /*
          * EPERM (seccomp / kernel.io_uring_disabled), ENOSYS (too old / built
          * out), EMFILE/ENFILE (fd exhaustion) and ENOMEM (memlock pressure)
@@ -538,12 +516,9 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
 
     iou->ring_inited = 1;
 
-    iou->opt = (flags & IORING_SETUP_SINGLE_ISSUER) != 0;
-
     nxt_debug(&engine->task,
-              "io_uring_queue_init(): sq:%uD cq:%uD features:%uxD opt:%d",
-              iou->sq_entries, params.cq_entries, params.features,
-              (int) iou->opt);
+              "io_uring_queue_init(): sq:%uD cq:%uD features:%uxD",
+              iou->sq_entries, params.cq_entries, params.features);
 
     /*
      * Resolve the kernel capability from a cached throwaway-ring probe rather
@@ -582,7 +557,7 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
     iou->tier = tier;
 
     nxt_log(&engine->task, NXT_LOG_INFO,
-            "io_uring tier %d (opt:%d)", (int) iou->tier, (int) iou->opt);
+            "io_uring tier %d", (int) iou->tier);
 
     /* Slots are indexed by fd number; start small and grow on demand. */
     nslots = nxt_max((uint32_t) mevents * 2, 128);
@@ -595,6 +570,26 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
     iou->nslots = nslots;
 
     return NXT_OK;
+}
+
+
+/*
+ * Operational kill-switch: NXT_IO_URING=0 or =off disables the engine before
+ * ANY io_uring syscall is made.  This is the escape hatch for seccomp
+ * SCMP_ACT_KILL policies (see the header comment): the probe and create()
+ * both consult it first, so a deployment can neutralise the startup
+ * io_uring_setup(2) without rebuilding.
+ */
+
+static nxt_bool_t
+nxt_io_uring_env_disabled(void)
+{
+    char  *v;
+
+    v = getenv("NXT_IO_URING");
+
+    return (v != NULL
+            && (nxt_strcmp(v, "0") == 0 || nxt_strcmp(v, "off") == 0));
 }
 
 
@@ -930,20 +925,25 @@ done:
 nxt_int_t
 nxt_io_uring_probe(void)
 {
-    int              ret;
-    char             *force;
-    nxt_bool_t       ok;
-    struct io_uring  ring;
+#if !(NXT_HAVE_SIGNALFD)
+    /*
+     * Without signalfd the engine cannot deliver Unix signals: its eventfd
+     * doorbell carries no signo, so the sigwait()-thread fallback that
+     * signal_support=0 engines rely on would silently drop every signal
+     * routed through engine->event.signal().  Do not register the engine.
+     */
+    return NXT_ERROR;
+#else
+    char  *force;
 
     /*
-     * NXT_IO_URING=0 is the operational kill switch: it forces epoll for the
-     * whole process tree (the engine is never registered) with no rebuild --
-     * cheap insurance against a kernel/seccomp io_uring regression.
-     * NXT_IO_URING_FORCE_TIER=none is the debug-only equivalent.
+     * NXT_IO_URING=0 (or =off) is the operational kill switch: it forces
+     * epoll for the whole process tree (the engine is never registered) with
+     * no rebuild -- cheap insurance against a kernel/seccomp io_uring
+     * regression.  Checked BEFORE any io_uring syscall; see the header
+     * comment.  NXT_IO_URING_FORCE_TIER=none is the debug-only equivalent.
      */
-    force = getenv("NXT_IO_URING");
-
-    if (force != NULL && nxt_strcmp(force, "0") == 0) {
+    if (nxt_io_uring_env_disabled()) {
         return NXT_ERROR;
     }
 
@@ -953,16 +953,9 @@ nxt_io_uring_probe(void)
         return NXT_ERROR;
     }
 
-    ret = io_uring_queue_init(8, &ring, 0);
-    if (ret < 0) {
-        return NXT_ERROR;
-    }
-
-    ok = nxt_io_uring_multishot_supported(&ring);
-
-    io_uring_queue_exit(&ring);
-
-    return ok ? NXT_OK : NXT_ERROR;
+    return (nxt_io_uring_kernel_tier() >= NXT_IOU_TIER_POLL)
+           ? NXT_OK : NXT_ERROR;
+#endif
 }
 
 
@@ -1064,6 +1057,16 @@ nxt_io_uring_add_signal(nxt_event_engine_t *engine)
 }
 
 
+/*
+ * Drain the signalfd completely, dispatching the handler once per queued
+ * siginfo.  A single read per dispatch is NOT enough here: the engine's
+ * multishot poll is edge-like and the per-drain dedupe collapses several
+ * CQEs into one handler run, so a second pending signal (e.g. SIGTERM queued
+ * behind SIGCHLD) would strand in the signalfd until some unrelated future
+ * signal produced a new wakeup.  Looping to EAGAIN consumes everything the
+ * wakeup(s) announced.
+ */
+
 static void
 nxt_io_uring_signalfd_handler(nxt_task_t *task, void *obj, void *data)
 {
@@ -1078,13 +1081,6 @@ nxt_io_uring_signalfd_handler(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "io_uring signalfd handler");
 
-    /*
-     * Drain the signalfd to EAGAIN: multishot poll delivery is edge-like
-     * (one CQE per wakeup) and the CQ drain dedupes to one handler call, so
-     * a single read() would strand any additional queued siginfo records
-     * (e.g. a SIGTERM arriving while a SIGCHLD is already pending) until
-     * some later, unrelated wakeup.
-     */
     for ( ;; ) {
         n = read(ev->fd, &sfd, sizeof(struct signalfd_siginfo));
         err = (n == -1) ? nxt_errno : 0;

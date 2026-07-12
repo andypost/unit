@@ -70,6 +70,15 @@
 #define NXT_IOU_READ_MASK    (POLLIN | POLLRDHUP | POLLERR | POLLHUP)
 #define NXT_IOU_WRITE_MASK   (POLLOUT | POLLERR | POLLHUP)
 
+/*
+ * Upper bound on the poll wait while the eventfd doorbell's re-arm is owed
+ * (post_rearm_pending): a cross-thread post writes the eventfd but produces no
+ * CQE against the terminated poll, so the loop must wake on its own to retry
+ * the re-arm and drain locked_work_queue.  Bounds the worst-case post latency
+ * in that transient degraded state; off the hot path once the re-arm succeeds.
+ */
+#define NXT_IOU_POST_REARM_CAP_MSEC  100
+
 
 static nxt_int_t nxt_io_uring_create(nxt_event_engine_t *engine,
     nxt_uint_t mchanges, nxt_uint_t mevents);
@@ -78,6 +87,11 @@ static nxt_int_t nxt_io_uring_setup(nxt_event_engine_t *engine,
 static nxt_bool_t nxt_io_uring_multishot_supported(struct io_uring *ring);
 static void nxt_io_uring_test_accept4(nxt_event_engine_t *engine,
     nxt_conn_io_t *io);
+#if (NXT_HAVE_SIGNALFD)
+static nxt_int_t nxt_io_uring_add_signal(nxt_event_engine_t *engine);
+static void nxt_io_uring_signalfd_handler(nxt_task_t *task, void *obj,
+    void *data);
+#endif
 static void nxt_io_uring_free(nxt_event_engine_t *engine);
 static nxt_io_uring_slot_t *nxt_io_uring_slot(nxt_event_engine_t *engine,
     nxt_fd_t fd);
@@ -117,9 +131,11 @@ static void nxt_io_uring_oneshot_write(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static void nxt_io_uring_enable_accept(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
+#if (NXT_HAVE_SIGNALFD)
 static nxt_int_t nxt_io_uring_enable_post(nxt_event_engine_t *engine,
     nxt_work_handler_t handler);
 static void nxt_io_uring_signal(nxt_event_engine_t *engine, nxt_uint_t signo);
+#endif
 static void nxt_io_uring_poll(nxt_event_engine_t *engine, nxt_msec_t timeout);
 static void nxt_io_uring_handle_cqe(nxt_event_engine_t *engine,
     struct io_uring_cqe *cqe);
@@ -151,14 +167,33 @@ const nxt_event_interface_t  nxt_io_uring_engine = {
     nxt_io_uring_enable_accept,
     NULL,
     NULL,
+    /*
+     * enable_post + signal are the eventfd doorbell.  Install them only when
+     * signalfd delivers real signals: nxt_event_engine_signal() prefers a
+     * non-NULL .signal, and the eventfd doorbell cannot carry a signo, so
+     * without signalfd the sigwait() thread's process-control signals would be
+     * dropped.  Leaving both NULL routes post AND signals through the generic
+     * signal pipe, exactly as the epoll engine does when its eventfd -- which
+     * on Linux always accompanies signalfd -- is unavailable.
+     */
+#if (NXT_HAVE_SIGNALFD)
     nxt_io_uring_enable_post,
     nxt_io_uring_signal,
+#else
+    NULL,
+    NULL,
+#endif
     nxt_io_uring_poll,
 
     &nxt_unix_conn_io,
 
     NXT_NO_FILE_EVENTS,
+
+#if (NXT_HAVE_SIGNALFD)
+    NXT_SIGNAL_EVENTS,
+#else
     NXT_NO_SIGNAL_EVENTS,
+#endif
 };
 
 
@@ -183,6 +218,9 @@ nxt_io_uring_create(nxt_event_engine_t *engine, nxt_uint_t mchanges,
 {
     engine->u.io_uring.tier = NXT_IOU_TIER_NONE;
     engine->u.io_uring.eventfd.fd = -1;
+#if (NXT_HAVE_SIGNALFD)
+    engine->u.io_uring.signalfd.fd = -1;
+#endif
 
     if (nxt_io_uring_setup(engine, mchanges, mevents) != NXT_OK) {
         nxt_io_uring_free(engine);
@@ -190,6 +228,14 @@ nxt_io_uring_create(nxt_event_engine_t *engine, nxt_uint_t mchanges,
     }
 
     if (engine->signals != NULL) {
+
+#if (NXT_HAVE_SIGNALFD)
+        if (nxt_io_uring_add_signal(engine) != NXT_OK) {
+            nxt_io_uring_free(engine);
+            return NXT_ERROR;
+        }
+#endif
+
         nxt_io_uring_test_accept4(engine, &nxt_unix_conn_io);
     }
 
@@ -417,6 +463,106 @@ nxt_io_uring_test_accept4(nxt_event_engine_t *engine, nxt_conn_io_t *io)
 }
 
 
+#if (NXT_HAVE_SIGNALFD)
+
+/*
+ * io_uring has no signalfd analogue of its own, so -- exactly like epoll --
+ * real Unix signals are delivered through a signalfd registered as an ordinary
+ * read event (a multishot poll).  Providing this makes signal_support true, so
+ * nxt_event_engine_create() never spawns the sigwait() thread whose
+ * signo-carrying signal() the ring's eventfd doorbell cannot reproduce.
+ */
+
+static nxt_int_t
+nxt_io_uring_add_signal(nxt_event_engine_t *engine)
+{
+    int                    fd;
+    nxt_io_uring_engine_t  *iou;
+
+    iou = &engine->u.io_uring;
+
+    if (sigprocmask(SIG_BLOCK, &engine->signals->sigmask, NULL) != 0) {
+        nxt_alert(&engine->task, "sigprocmask(SIG_BLOCK) failed %E", nxt_errno);
+        return NXT_ERROR;
+    }
+
+    fd = signalfd(-1, &engine->signals->sigmask, 0);
+
+    if (fd == -1) {
+        nxt_alert(&engine->task, "signalfd(%d) failed %E",
+                  iou->signalfd.fd, nxt_errno);
+        return NXT_ERROR;
+    }
+
+    iou->signalfd.fd = fd;
+
+    if (nxt_fd_nonblocking(&engine->task, fd) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    nxt_debug(&engine->task, "io_uring signalfd(): %d", fd);
+
+    iou->signalfd.data = engine->signals->handler;
+    iou->signalfd.read_work_queue = &engine->fast_work_queue;
+    iou->signalfd.read_handler = nxt_io_uring_signalfd_handler;
+    iou->signalfd.log = engine->task.log;
+    iou->signalfd.task = &engine->task;
+
+    /*
+     * Arm the signalfd's multishot read poll through the fallible primitive
+     * rather than nxt_io_uring_enable_read(): the latter reports a failed arm
+     * only by queuing nxt_io_uring_error_handler, which is a no-op for an
+     * internal fd (the signalfd has no error_handler).  A silently swallowed
+     * failure would let create() succeed with the signals blocked (sigprocmask
+     * above) but never delivered.  Propagate NXT_ERROR instead so create()
+     * unwinds -- nxt_io_uring_free() closes the signalfd, the sigmask stays
+     * blocked exactly as on the epoll engine's own signalfd failure paths --
+     * and the runtime falls back to epoll, whose add_signal() re-blocks and
+     * re-arms it, mirroring how epoll treats a failed epoll_ctl() there.
+     */
+    if (nxt_slow_path(!nxt_io_uring_arm(engine, &iou->signalfd,
+                                        NXT_IOU_DIR_READ, 1)))
+    {
+        nxt_alert(&engine->task, "io_uring failed to arm signalfd(%d)", fd);
+        return NXT_ERROR;
+    }
+
+    iou->signalfd.read = NXT_EVENT_ACTIVE;
+
+    return NXT_OK;
+}
+
+
+static void
+nxt_io_uring_signalfd_handler(nxt_task_t *task, void *obj, void *data)
+{
+    int                      n;
+    nxt_fd_event_t           *ev;
+    nxt_work_handler_t       handler;
+    struct signalfd_siginfo  sfd;
+
+    ev = obj;
+    handler = data;
+
+    nxt_debug(task, "io_uring signalfd handler");
+
+    n = read(ev->fd, &sfd, sizeof(struct signalfd_siginfo));
+
+    nxt_debug(task, "read signalfd(%d): %d", ev->fd, n);
+
+    if (n != sizeof(struct signalfd_siginfo)) {
+        nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, nxt_errno);
+        return;
+    }
+
+    nxt_debug(task, "signalfd(%d) signo:%d", ev->fd, sfd.ssi_signo);
+
+    handler(task, (void *) (uintptr_t) sfd.ssi_signo, NULL);
+}
+
+#endif
+
+
 static void
 nxt_io_uring_free(nxt_event_engine_t *engine)
 {
@@ -426,6 +572,16 @@ nxt_io_uring_free(nxt_event_engine_t *engine)
     iou = &engine->u.io_uring;
 
     nxt_debug(&engine->task, "io_uring free");
+
+#if (NXT_HAVE_SIGNALFD)
+
+    fd = iou->signalfd.fd;
+
+    if (fd != -1 && close(fd) != 0) {
+        nxt_alert(&engine->task, "signalfd close(%d) failed %E", fd, nxt_errno);
+    }
+
+#endif
 
     fd = iou->eventfd.fd;
 
@@ -1050,6 +1206,8 @@ nxt_io_uring_enable_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 }
 
 
+#if (NXT_HAVE_SIGNALFD)
+
 static nxt_int_t
 nxt_io_uring_enable_post(nxt_event_engine_t *engine, nxt_work_handler_t handler)
 {
@@ -1110,6 +1268,8 @@ nxt_io_uring_signal(nxt_event_engine_t *engine, nxt_uint_t signo)
     }
 }
 
+#endif
+
 
 static void
 nxt_io_uring_poll(nxt_event_engine_t *engine, nxt_msec_t timeout)
@@ -1123,12 +1283,26 @@ nxt_io_uring_poll(nxt_event_engine_t *engine, nxt_msec_t timeout)
     iou = &engine->u.io_uring;
 
     /*
-     * Recover the POLL_REMOVEs that an exhausted SQ ring refused when their
-     * direction was disabled/deleted/closed; their SQEs ride this iteration's
-     * submit_and_wait.  Gated so the slot scan costs nothing in steady state.
+     * Recover the SQEs that an exhausted SQ ring refused earlier.  Both retries
+     * run before the timeout is computed (post_rearm_pending may still be set
+     * after the doorbell retry and then caps the wait) and their SQEs ride this
+     * iteration's submit_and_wait.  Both are gated/flagged so they cost nothing
+     * in steady state.
      */
     if (nxt_slow_path(iou->npending_removes != 0)) {
         nxt_io_uring_retry_pending_removes(engine);
+    }
+
+    if (nxt_slow_path(iou->post_rearm_pending)) {
+        struct io_uring_sqe  *sqe;
+
+        sqe = nxt_io_uring_get_sqe(engine);
+        if (sqe != NULL) {
+            io_uring_prep_poll_multishot(sqe, iou->eventfd.fd, POLLIN);
+            io_uring_sqe_set_data64(sqe, NXT_IOU_UD_POST);
+            iou->nsubmitted++;
+            iou->post_rearm_pending = 0;
+        }
     }
 
     if (timeout == NXT_INFINITE_MSEC) {
@@ -1137,6 +1311,23 @@ nxt_io_uring_poll(nxt_event_engine_t *engine, nxt_msec_t timeout)
     } else {
         ts.tv_sec = timeout / 1000;
         ts.tv_nsec = (long) (timeout % 1000) * 1000000;
+        pts = &ts;
+    }
+
+    /*
+     * The eventfd doorbell's re-arm is still owed (SQ still exhausted above).
+     * A cross-thread post writes the eventfd but yields no CQE against the dead
+     * poll, so bound the wait: on the capped wake the doorbell retry above
+     * re-arms a multishot POLL_ADD, which re-checks the still-signaled eventfd
+     * at submission and fires at once, draining locked_work_queue.  Without the
+     * cap a NXT_INFINITE_MSEC wait could strand posted work indefinitely.  Only
+     * ever tightens the wait.
+     */
+    if (nxt_slow_path(iou->post_rearm_pending)
+        && (pts == NULL || timeout > NXT_IOU_POST_REARM_CAP_MSEC))
+    {
+        ts.tv_sec = 0;
+        ts.tv_nsec = (long) NXT_IOU_POST_REARM_CAP_MSEC * 1000000;
         pts = &ts;
     }
 
@@ -1189,7 +1380,7 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
     uint32_t               idx, mask;
     uint64_t               ud;
     nxt_uint_t             dir;
-    nxt_bool_t             more, ready;
+    nxt_bool_t             more;
     nxt_fd_event_t         *ev;
     nxt_io_uring_slot_t    *slot;
 
@@ -1261,75 +1452,64 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
     mask = (uint32_t) res;
 
     if (dir == NXT_IOU_DIR_READ) {
-        ready = (mask & NXT_IOU_READ_MASK) != 0;
 
-        if (!ready) {
-            goto rearm;
+        if (mask & NXT_IOU_READ_MASK) {
+            ev->read_ready = 1;
+
+            if (ev->read == NXT_EVENT_BLOCKED) {
+                /* Level-style: disarm to avoid a busy-loop of BLOCKED CQEs. */
+                nxt_io_uring_disable_read(engine, ev);
+                return;
+            }
+
+            if (ev->read == NXT_EVENT_ONESHOT) {
+                ev->read = NXT_EVENT_DISABLED;
+            }
+
+            if (ev->read != NXT_EVENT_INACTIVE) {
+                nxt_work_queue_add(ev->read_work_queue, ev->read_handler,
+                                   ev->task, ev, ev->data);
+            }
         }
 
-        ev->read_ready = 1;
-
-        if (ev->read == NXT_EVENT_BLOCKED) {
-            /* Level-style: disarm to avoid a busy-loop of BLOCKED CQEs. */
-            nxt_io_uring_disable_read(engine, ev);
-            return;
-        }
-
-        if (ev->read == NXT_EVENT_ONESHOT) {
-            ev->read = NXT_EVENT_DISABLED;
-        }
-
-        if (ev->read != NXT_EVENT_INACTIVE) {
-            nxt_work_queue_add(ev->read_work_queue, ev->read_handler,
-                               ev->task, ev, ev->data);
+        /*
+         * A terminated multishot (!F_MORE) on a still-armed direction is
+         * re-issued here so no readiness is missed -- including for events
+         * such as the signalfd whose handler never calls enable_read.  A
+         * oneshot (now DISABLED) or a disabled direction is left alone.
+         */
+        if (!more
+            && ev->read != NXT_EVENT_INACTIVE
+            && ev->read != NXT_EVENT_DISABLED)
+        {
+            nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 1);
         }
 
     } else {
-        ready = (mask & NXT_IOU_WRITE_MASK) != 0;
 
-        if (!ready) {
-            goto rearm;
-        }
+        if (mask & NXT_IOU_WRITE_MASK) {
+            ev->write_ready = 1;
 
-        ev->write_ready = 1;
-
-        if (ev->write == NXT_EVENT_BLOCKED) {
-            nxt_io_uring_disable_write(engine, ev);
-            return;
-        }
-
-        if (ev->write == NXT_EVENT_ONESHOT) {
-            ev->write = NXT_EVENT_DISABLED;
-        }
-
-        if (ev->write != NXT_EVENT_INACTIVE) {
-            nxt_work_queue_add(ev->write_work_queue, ev->write_handler,
-                               ev->task, ev, ev->data);
-        }
-    }
-
-    return;
-
-rearm:
-
-    /*
-     * Multishot terminated early while the direction is still logically armed:
-     * re-issue the poll so we do not miss subsequent readiness.
-     */
-    if (!more) {
-        if (dir == NXT_IOU_DIR_READ) {
-            if (ev->read != NXT_EVENT_INACTIVE
-                && ev->read != NXT_EVENT_DISABLED)
-            {
-                nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 1);
+            if (ev->write == NXT_EVENT_BLOCKED) {
+                nxt_io_uring_disable_write(engine, ev);
+                return;
             }
 
-        } else {
-            if (ev->write != NXT_EVENT_INACTIVE
-                && ev->write != NXT_EVENT_DISABLED)
-            {
-                nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_WRITE, 1);
+            if (ev->write == NXT_EVENT_ONESHOT) {
+                ev->write = NXT_EVENT_DISABLED;
             }
+
+            if (ev->write != NXT_EVENT_INACTIVE) {
+                nxt_work_queue_add(ev->write_work_queue, ev->write_handler,
+                                   ev->task, ev, ev->data);
+            }
+        }
+
+        if (!more
+            && ev->write != NXT_EVENT_INACTIVE
+            && ev->write != NXT_EVENT_DISABLED)
+        {
+            nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_WRITE, 1);
         }
     }
 }
@@ -1340,6 +1520,7 @@ nxt_io_uring_internal_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
 {
     ssize_t                n;
     uint64_t               value;
+    struct io_uring_sqe    *sqe;
     nxt_io_uring_engine_t  *iou;
 
     iou = &engine->u.io_uring;
@@ -1347,6 +1528,28 @@ nxt_io_uring_internal_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
     if (cqe->user_data != NXT_IOU_UD_POST) {
         /* POLL_REMOVE / cancel completions: nothing to do. */
         return;
+    }
+
+    /* Re-arm the doorbell if the kernel dropped the multishot eventfd poll. */
+    if ((cqe->flags & IORING_CQE_F_MORE) == 0) {
+        sqe = nxt_io_uring_get_sqe(engine);
+
+        if (nxt_fast_path(sqe != NULL)) {
+            io_uring_prep_poll_multishot(sqe, iou->eventfd.fd, POLLIN);
+            io_uring_sqe_set_data64(sqe, NXT_IOU_UD_POST);
+            iou->nsubmitted++;
+            iou->post_rearm_pending = 0;
+
+        } else {
+            /*
+             * SQ exhausted: the doorbell would otherwise be silently dead, and a
+             * dead doorbell means a cross-thread post writes the eventfd but
+             * wakes nothing -- an unbounded sleep with locked_work_queue work
+             * stranded.  Flag the owed re-arm; nxt_io_uring_poll() retries it
+             * and, until it lands, caps the wait so the miss is bounded.
+             */
+            iou->post_rearm_pending = 1;
+        }
     }
 
     /* Drain the eventfd counter so the next post produces a fresh edge. */

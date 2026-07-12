@@ -270,6 +270,14 @@ typedef struct {
     uint8_t                       tier;         /* NXT_IOU_TIER_*             */
     uint8_t                       overflowed;   /* 1 bit                      */
 
+    /*
+     * The eventfd doorbell's multishot poll terminated and its re-arm could not
+     * get an SQE.  Retried at the top of nxt_io_uring_poll(); while set, the
+     * poll wait is capped so a cross-thread post that wrote the eventfd but
+     * produced no CQE against the dead poll cannot cause an unbounded sleep.
+     */
+    uint8_t                       post_rearm_pending;
+
     /* Side table of pollers, indexed by fd; grown on demand. */
     nxt_io_uring_slot_t           *slots;
     uint32_t                      nslots;
@@ -286,6 +294,10 @@ typedef struct {
 
     nxt_work_handler_t            post_handler;
     nxt_fd_event_t                eventfd;
+
+#if (NXT_HAVE_SIGNALFD)
+    nxt_fd_event_t                signalfd;
+#endif
 } nxt_io_uring_engine_t;
 
 

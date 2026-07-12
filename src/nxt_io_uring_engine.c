@@ -340,6 +340,55 @@ done:
 }
 
 
+/*
+ * Registration-time functional probe: stand up a throwaway ring and verify
+ * multishot poll actually works.  All "unsupported" conditions -- EPERM
+ * (seccomp / kernel.io_uring_disabled), ENOSYS (too old / built out),
+ * EMFILE/ENFILE (fd exhaustion) and ENOMEM (memlock) -- surface as
+ * io_uring_queue_init() returning a negative errno and map to NXT_ERROR, so
+ * the caller keeps epoll as the default.  NXT_IO_URING_FORCE_TIER=none forces
+ * failure for testing the fallback path.
+ */
+
+nxt_int_t
+nxt_io_uring_probe(void)
+{
+    int              ret;
+    char             *force;
+    nxt_bool_t       ok;
+    struct io_uring  ring;
+
+    /*
+     * NXT_IO_URING=0 is the operational kill switch: it forces epoll for the
+     * whole process tree (the engine is never registered) with no rebuild --
+     * cheap insurance against a kernel/seccomp io_uring regression.
+     * NXT_IO_URING_FORCE_TIER=none is the debug-only equivalent.
+     */
+    force = getenv("NXT_IO_URING");
+
+    if (force != NULL && nxt_strcmp(force, "0") == 0) {
+        return NXT_ERROR;
+    }
+
+    force = getenv("NXT_IO_URING_FORCE_TIER");
+
+    if (force != NULL && nxt_strcmp(force, "none") == 0) {
+        return NXT_ERROR;
+    }
+
+    ret = io_uring_queue_init(8, &ring, 0);
+    if (ret < 0) {
+        return NXT_ERROR;
+    }
+
+    ok = nxt_io_uring_multishot_supported(&ring);
+
+    io_uring_queue_exit(&ring);
+
+    return ok ? NXT_OK : NXT_ERROR;
+}
+
+
 static void
 nxt_io_uring_test_accept4(nxt_event_engine_t *engine, nxt_conn_io_t *io)
 {

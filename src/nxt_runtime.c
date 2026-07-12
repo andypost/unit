@@ -292,6 +292,24 @@ nxt_runtime_event_engines(nxt_task_t *task, nxt_runtime_t *rt)
     engine = nxt_event_engine_create(task, interface,
                                      nxt_main_process_signals, 0, 0);
 
+#if (NXT_HAVE_IO_URING)
+    /*
+     * Close the probe-vs-create TOCTOU window: if the io_uring engine was
+     * selected as default but its create() failed (e.g. RLIMIT changed since
+     * the probe), fall back to epoll rather than aborting startup.
+     */
+    if (nxt_slow_path(engine == NULL)
+        && nxt_strcmp(interface->name, "io_uring") == 0)
+    {
+        interface = nxt_service_get(rt->services, "engine", "epoll");
+
+        if (interface != NULL) {
+            engine = nxt_event_engine_create(task, interface,
+                                             nxt_main_process_signals, 0, 0);
+        }
+    }
+#endif
+
     if (nxt_slow_path(engine == NULL)) {
         return NXT_ERROR;
     }

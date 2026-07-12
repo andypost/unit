@@ -89,18 +89,22 @@ nxt_services_init(nxt_mp_t *mp)
 #if (NXT_HAVE_IO_URING)
 
     /*
-     * Register the io_uring engine by name.  It is appended, so the default
-     * engine (the first "engine" service, epoll on Linux) is unchanged.
+     * Register the io_uring engine only when a runtime probe confirms multishot
+     * poll works, so an unavailable io_uring (old/hardened kernel) never
+     * exposes a broken engine.  It is appended, so the default engine (the
+     * first "engine" service, epoll on Linux) is unchanged.
      */
 
-    s = nxt_array_add(services);
-    if (nxt_slow_path(s == NULL)) {
-        return NULL;
-    }
+    if (nxt_io_uring_probe() == NXT_OK) {
+        s = nxt_array_add(services);
+        if (nxt_slow_path(s == NULL)) {
+            return NULL;
+        }
 
-    s->type = "engine";
-    s->name = "io_uring";
-    s->service = &nxt_io_uring_engine;
+        s->type = "engine";
+        s->name = "io_uring";
+        s->service = &nxt_io_uring_engine;
+    }
 
 #endif
 

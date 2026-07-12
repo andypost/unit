@@ -291,6 +291,13 @@ typedef struct {
 
 extern const nxt_event_interface_t  nxt_io_uring_engine;
 
+/*
+ * Runtime functional probe: NXT_OK if a throwaway ring supports multishot
+ * poll, NXT_ERROR for every "unsupported" condition (used to keep epoll as the
+ * default when io_uring is unavailable).
+ */
+nxt_int_t nxt_io_uring_probe(void);
+
 #endif
 
 

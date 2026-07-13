@@ -616,12 +616,17 @@ def unit_stop():
     except subprocess.TimeoutExpired:
         # Graceful quit overran STOP_TIMEOUT: escalate to the process GROUP
         # (SIGTERM, then SIGKILL) so the router/controller/app workers die even
-        # when main itself is wedged.
+        # when main itself is wedged.  A successful forced reap is still an
+        # ERROR: SIGQUIT not completing in time is a graceful-shutdown hang
+        # (a real bug class), and returning success here would mask it.
         _reap_group(p, pgid, timeout=5)
         if _group_alive(p, pgid):
             return 'Could not terminate unit'
         _forget_pgid(p, pgid)
-        return
+        return (
+            f'Unit did not exit within {stop_timeout}s after SIGQUIT '
+            '(process group reaped forcibly)'
+        )
 
     # A clean master exit does not prove the group is empty: a router/
     # controller/app worker can outlive it and would silently survive into

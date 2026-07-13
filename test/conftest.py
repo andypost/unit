@@ -76,9 +76,12 @@ def pytest_addoption(parser):
 unit_instance = {}
 _processes = []
 # Every unitd process-group id (== leader pid, see start_new_session in
-# unit_run) we have spawned this session.  Reaped best-effort at interpreter
-# exit so an error path that bypassed unit_stop can never leak a unitd tree.
-_pgids = set()
+# unit_run) we have spawned this session, mapped to its temp dir so BOTH kill
+# contracts — the in-memory id and the on-disk unitd.pgid file — can be
+# retired together once the group is confirmed gone.  Reaped best-effort at
+# interpreter exit so an error path that bypassed unit_stop can never leak a
+# unitd tree.
+_pgids = {}
 _fds_info = {
     'main': {'fds': 0, 'skip': False},
     'router': {'name': 'unit: router', 'pid': -1, 'fds': 0, 'skip': False},
@@ -286,20 +289,19 @@ def _write_pgid(temp_dir, pgid):
         pass
 
 
-def _register_pgid(pgid):
+def _register_pgid(pgid, temp_dir=None):
     if pgid and pgid > 1:
-        _pgids.add(pgid)
+        _pgids[pgid] = temp_dir
 
 
-def _forget_pgid(p, pgid, temp_dir=None):
-    # Drop a pgid from the atexit/SIGTERM sweep set once its tree is confirmed
-    # gone: the kernel reuses pid/pgid numbers, and sweeping a stale entry at
-    # interpreter exit could TERM/KILL an unrelated process group that
-    # inherited the number (long --restart sessions make this reachable).
-    # The on-disk pgid file is the same kind of stale kill contract for
-    # EXTERNAL sweepers (--save-log keeps temp dirs around), so remove it too.
+def _forget_pgid(p, pgid):
+    # Retire BOTH kill contracts for a pgid once its tree is confirmed gone:
+    # the in-memory id (the kernel reuses pid/pgid numbers, and sweeping a
+    # stale entry at interpreter exit could TERM/KILL an unrelated process
+    # group) and the on-disk unitd.pgid file (--save-log and aborted runs
+    # retain temp dirs, and external sweepers are documented to consume it).
     if pgid and not _group_alive(p, pgid):
-        _pgids.discard(pgid)
+        temp_dir = _pgids.pop(pgid, None)
 
         if temp_dir is not None:
             try:
@@ -430,7 +432,11 @@ def _reap_all_pgids():
             _reap_group(None, pgid, timeout=3)
         except Exception:
             pass
-        _pgids.discard(pgid)
+        # Retire the on-disk kill contract too: this safety net runs exactly
+        # in the aborted-session cases where temp dirs stay behind, and a
+        # stale unitd.pgid there could point an external sweeper at a reused
+        # process group.
+        _forget_pgid(None, pgid)
 
 
 def _sigterm_reap(signum, frame):
@@ -510,7 +516,7 @@ def unit_run(state_dir=None):
     # Record the group id (== leader pid) immediately, on disk and in-memory,
     # before we risk a startup timeout below.
     unit_instance['pgid'] = p.pid
-    _register_pgid(p.pid)
+    _register_pgid(p.pid, temporary_dir)
     _write_pgid(temporary_dir, p.pid)
 
     # Start budget is env-tunable for slow/32-bit builders; the default of 5 s
@@ -580,7 +586,7 @@ def unit_stop():
         # Main already exited — make sure no group member (router, controller,
         # app worker) lingers behind it.
         _reap_group(p, pgid, timeout=5)
-        _forget_pgid(p, pgid, unit_instance.get('temp_dir'))
+        _forget_pgid(p, pgid)
         return
 
     # Graceful shutdown first: SIGQUIT asks main to quit cleanly and reap its
@@ -597,14 +603,14 @@ def unit_stop():
             # Abnormal graceful shutdown can leave router/controller/app
             # workers behind in the group; reap them before reporting.
             _reap_group(p, pgid, timeout=5)
-            _forget_pgid(p, pgid, unit_instance.get('temp_dir'))
+            _forget_pgid(p, pgid)
             return f'Child process terminated with code {retcode}'
 
     except KeyboardInterrupt:
         # Ctrl-C mid-shutdown: reap the whole group before re-raising so we
         # never leak the unitd tree.
         _reap_group(p, pgid, timeout=5)
-        _forget_pgid(p, pgid, unit_instance.get('temp_dir'))
+        _forget_pgid(p, pgid)
         raise
 
     except subprocess.TimeoutExpired:
@@ -614,10 +620,15 @@ def unit_stop():
         _reap_group(p, pgid, timeout=5)
         if _group_alive(p, pgid):
             return 'Could not terminate unit'
-        _forget_pgid(p, pgid, unit_instance.get('temp_dir'))
+        _forget_pgid(p, pgid)
         return
 
-    _forget_pgid(p, pgid, unit_instance.get('temp_dir'))
+    # A clean master exit does not prove the group is empty: a router/
+    # controller/app worker can outlive it and would silently survive into
+    # the next test (reparented, so _check_processes' ppid filter misses it).
+    # _reap_group is a no-op when the group is already gone.
+    _reap_group(p, pgid, timeout=5)
+    _forget_pgid(p, pgid)
 
 
 @print_log_on_assert

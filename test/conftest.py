@@ -291,13 +291,21 @@ def _register_pgid(pgid):
         _pgids.add(pgid)
 
 
-def _forget_pgid(p, pgid):
+def _forget_pgid(p, pgid, temp_dir=None):
     # Drop a pgid from the atexit/SIGTERM sweep set once its tree is confirmed
     # gone: the kernel reuses pid/pgid numbers, and sweeping a stale entry at
     # interpreter exit could TERM/KILL an unrelated process group that
     # inherited the number (long --restart sessions make this reachable).
+    # The on-disk pgid file is the same kind of stale kill contract for
+    # EXTERNAL sweepers (--save-log keeps temp dirs around), so remove it too.
     if pgid and not _group_alive(p, pgid):
         _pgids.discard(pgid)
+
+        if temp_dir is not None:
+            try:
+                Path(f'{temp_dir}/unitd.pgid').unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _signal_group(pgid, sig):
@@ -324,30 +332,48 @@ def _group_alive(p, pgid):
     if not pgid or pgid <= 1:
         return False
 
-    # Enumerate the group from /proc rather than pgrep: no subprocess per
-    # 0.2 s poll tick (this loop exists for slow builders), and no ambiguity
-    # between "pgrep found nothing" and "pgrep failed/absent" — a failure
-    # mistaken for an empty group would skip the TERM/KILL escalation and
-    # leak the tree.
+    # Portable fast path first: signal 0 probes group membership on every
+    # POSIX platform the suite supports.  ESRCH == nothing left at all.
     try:
-        for entry in os.listdir('/proc'):
-            if not entry.isdigit():
-                continue
-            try:
-                stat = Path(f'/proc/{entry}/stat').read_text(
-                    encoding='utf-8', errors='ignore'
-                )
-                # comm (field 2) may contain spaces and ')'; parse from the
-                # LAST ')'.  After it: state, ppid, pgrp, ...
-                fields = stat[stat.rfind(')') + 1 :].split()
-                if int(fields[2]) == pgid and not fields[0].startswith('Z'):
-                    return True
-            except (OSError, IndexError, ValueError):
-                continue
-    except OSError:
-        # /proc unavailable: assume alive so the ladder still signals the
-        # group (killpg needs no /proc); worst case is a full timeout wait.
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # someone in the group is alive but not ours to signal — treat as
+        # alive; the ladder's killpg will hit the same wall and time out
         return True
+
+    # killpg(0) succeeds even when only zombies remain (they are still group
+    # members), so on Linux refine via /proc to avoid waiting a full ladder
+    # timeout on an already-dead tree.  No subprocess per 0.2 s poll tick
+    # (this loop exists for slow builders), and no pgrep failed-vs-empty
+    # ambiguity.
+    try:
+        entries = os.listdir('/proc')
+    except OSError:
+        # No procfs (macOS, some BSD setups): killpg succeeded, so report
+        # alive.  Worst case is a zombie-only group riding out one ladder
+        # timeout; our own leader zombie is already reaped by poll() above.
+        return True
+
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            stat = Path(f'/proc/{entry}/stat').read_text(
+                encoding='utf-8', errors='ignore'
+            )
+            # comm (field 2) may contain spaces and ')'; parse from the
+            # LAST ')'.  After it: state, ppid, pgrp, ...
+            fields = stat[stat.rfind(')') + 1 :].split()
+            if int(fields[2]) == pgid and not fields[0].startswith('Z'):
+                return True
+        except FileNotFoundError:
+            # vanished between listdir and read: a routine race, keep going
+            continue
+        except (OSError, IndexError, ValueError):
+            # unrecognized procfs layout (non-Linux): trust the killpg verdict
+            return True
 
     return False
 
@@ -554,7 +580,7 @@ def unit_stop():
         # Main already exited — make sure no group member (router, controller,
         # app worker) lingers behind it.
         _reap_group(p, pgid, timeout=5)
-        _forget_pgid(p, pgid)
+        _forget_pgid(p, pgid, unit_instance.get('temp_dir'))
         return
 
     # Graceful shutdown first: SIGQUIT asks main to quit cleanly and reap its
@@ -571,14 +597,14 @@ def unit_stop():
             # Abnormal graceful shutdown can leave router/controller/app
             # workers behind in the group; reap them before reporting.
             _reap_group(p, pgid, timeout=5)
-            _forget_pgid(p, pgid)
+            _forget_pgid(p, pgid, unit_instance.get('temp_dir'))
             return f'Child process terminated with code {retcode}'
 
     except KeyboardInterrupt:
         # Ctrl-C mid-shutdown: reap the whole group before re-raising so we
         # never leak the unitd tree.
         _reap_group(p, pgid, timeout=5)
-        _forget_pgid(p, pgid)
+        _forget_pgid(p, pgid, unit_instance.get('temp_dir'))
         raise
 
     except subprocess.TimeoutExpired:
@@ -588,10 +614,10 @@ def unit_stop():
         _reap_group(p, pgid, timeout=5)
         if _group_alive(p, pgid):
             return 'Could not terminate unit'
-        _forget_pgid(p, pgid)
+        _forget_pgid(p, pgid, unit_instance.get('temp_dir'))
         return
 
-    _forget_pgid(p, pgid)
+    _forget_pgid(p, pgid, unit_instance.get('temp_dir'))
 
 
 @print_log_on_assert

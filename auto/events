@@ -101,6 +101,7 @@ if [ "$NXT_IO_URING" = "YES" ]; then
                               if (sqe != NULL) {
                                   io_uring_prep_poll_multishot(sqe, 0, POLLIN);
                                   io_uring_sqe_set_data64(sqe, 0);
+                                  io_uring_prep_cancel64(sqe, 0, 0);
                               }
                               (void) io_uring_cq_has_overflow(&ring);
                               io_uring_queue_exit(&ring);

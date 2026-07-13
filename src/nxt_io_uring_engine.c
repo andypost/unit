@@ -186,19 +186,6 @@
 #define nxt_iou_ud_gen(ud)    ((uint32_t) (((ud) >> 3) & NXT_IOU_GEN_MASK))
 #define nxt_iou_ud_idx(ud)    ((uint32_t) ((ud) >> 35))
 
-/*
- * The slot stores generations as free-running uint16_t counters while
- * user_data carries only their low 13 bits, so every stale-CQE comparison
- * must reduce the slot value with this macro; comparing against the raw
- * counter would reject ALL completions once a generation passes 8191,
- * leaving the fd permanently dead.  Generation arithmetic is modulo 2^13:
- * a stale CQE is mis-accepted only if exactly 8192 disable/enable cycles
- * complete while that CQE is still in flight, which cannot happen -- CQEs
- * in flight are bounded by one CQ-drain window and each cycle costs at
- * least one submitted SQE.
- */
-#define nxt_iou_gen(g)        ((uint16_t) ((g) & NXT_IOU_GEN_MASK))
-
 /* Internal sentinel user_data values (KIND == INTERNAL). */
 #define NXT_IOU_UD_POST      ((uint64_t) 0x2)   /* eventfd post channel     */
 #define NXT_IOU_UD_REMOVE    ((uint64_t) 0x6)   /* POLL_REMOVE/cancel CQEs  */
@@ -245,8 +232,10 @@ static nxt_bool_t nxt_io_uring_submit_remove(nxt_event_engine_t *engine,
     nxt_fd_t fd, uint32_t gen, nxt_uint_t dir, nxt_bool_t accept);
 static void nxt_io_uring_retry_pending_removes(nxt_event_engine_t *engine);
 static void nxt_io_uring_arm_pend(nxt_event_engine_t *engine,
-    nxt_io_uring_slot_t *slot, nxt_uint_t dir);
+    nxt_io_uring_slot_t *slot, nxt_uint_t dir, nxt_bool_t accept);
 static void nxt_io_uring_retry_pending_arms(nxt_event_engine_t *engine);
+static nxt_bool_t nxt_io_uring_arm_accept(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev, nxt_io_uring_slot_t *slot);
 static void nxt_io_uring_slot_reconcile(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 
@@ -274,6 +263,8 @@ static void nxt_io_uring_oneshot_write(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static void nxt_io_uring_enable_accept(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
+static void nxt_io_uring_conn_io_accept(nxt_task_t *task, void *obj,
+    void *data);
 #if (NXT_HAVE_SIGNALFD)
 static nxt_int_t nxt_io_uring_enable_post(nxt_event_engine_t *engine,
     nxt_work_handler_t handler);
@@ -285,7 +276,7 @@ static void nxt_io_uring_handle_cqe(nxt_event_engine_t *engine,
 static void nxt_io_uring_error(nxt_event_engine_t *engine,
     nxt_io_uring_slot_t *slot, nxt_fd_event_t *ev);
 static void nxt_io_uring_accept_cqe(nxt_event_engine_t *engine,
-    nxt_io_uring_slot_t *slot, uint16_t gen, struct io_uring_cqe *cqe);
+    nxt_io_uring_slot_t *slot, uint32_t gen, struct io_uring_cqe *cqe);
 static void nxt_io_uring_internal_cqe(nxt_event_engine_t *engine,
     struct io_uring_cqe *cqe);
 
@@ -415,6 +406,16 @@ nxt_io_uring_create(nxt_event_engine_t *engine, nxt_uint_t mchanges,
 #endif
 
         nxt_epoll_test_accept4(engine, &nxt_io_uring_conn_io);
+    }
+
+    /*
+     * In the ACCEPT tier connections arrive through IORING_OP_ACCEPT CQEs;
+     * the synchronous accept(2)/accept4() conn_io path must never run (see
+     * nxt_io_uring_conn_io_accept).  Installed after the accept4 probe so
+     * this override wins.
+     */
+    if (engine->u.io_uring.tier >= NXT_IOU_TIER_ACCEPT) {
+        nxt_io_uring_conn_io.accept = nxt_io_uring_conn_io_accept;
     }
 
     return NXT_OK;
@@ -1287,13 +1288,21 @@ nxt_io_uring_retry_pending_removes(nxt_event_engine_t *engine)
 
 static void
 nxt_io_uring_arm_pend(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
-    nxt_uint_t dir)
+    nxt_uint_t dir, nxt_bool_t accept)
 {
     if (dir == NXT_IOU_DIR_READ) {
         if (!slot->read_arm_pending) {
             slot->read_arm_pending = 1;
             engine->u.io_uring.npending_arms++;
         }
+
+        /*
+         * Record whether the owed R re-arm is a completion-mode accept op so
+         * the poll-loop retry reissues it via arm_accept (ASYNC_CANCEL-able,
+         * res carries the fd) rather than a POLL_ADD.  Write re-arms are never
+         * accepts.
+         */
+        slot->read_arm_accept = accept;
 
     } else {
         if (!slot->write_arm_pending) {
@@ -1337,9 +1346,15 @@ nxt_io_uring_retry_pending_arms(nxt_event_engine_t *engine)
             if (ev == NULL
                 || ev->read == NXT_EVENT_INACTIVE
                 || ev->read == NXT_EVENT_DISABLED
-                || slot->read_armed
-                || nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ,
-                                    slot->read_multishot))
+                || slot->read_armed)
+            {
+                slot->read_arm_pending = 0;
+                iou->npending_arms--;
+
+            } else if (slot->read_arm_accept
+                       ? nxt_io_uring_arm_accept(engine, ev, slot)
+                       : nxt_io_uring_arm(engine, ev, slot, NXT_IOU_DIR_READ,
+                                          slot->read_multishot))
             {
                 slot->read_arm_pending = 0;
                 iou->npending_arms--;
@@ -1353,7 +1368,7 @@ nxt_io_uring_retry_pending_arms(nxt_event_engine_t *engine)
                 || ev->write == NXT_EVENT_INACTIVE
                 || ev->write == NXT_EVENT_DISABLED
                 || slot->write_armed
-                || nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_WRITE, 1))
+                || nxt_io_uring_arm(engine, ev, slot, NXT_IOU_DIR_WRITE, 1))
             {
                 slot->write_arm_pending = 0;
                 iou->npending_arms--;
@@ -1824,6 +1839,33 @@ nxt_io_uring_arm_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
 }
 
 
+/*
+ * conn_io accept handler for the ACCEPT tier (installed by create(); the
+ * conn_io struct is process-global, matching the process-global tier
+ * resolution).  The generic nxt_conn_io_accept() drains the backlog with
+ * synchronous accept(2) batches driven by lev->ready, which completion mode
+ * never initializes: invoked from the 100 ms listen-timer retry path
+ * (nxt_conn_listen_timer_handler calls the cached lev->accept right after
+ * enable_accept) it would decrement lev->ready from zero, latch
+ * read_ready = 1 off the wrapped counter and loop the legacy accept path
+ * until EAGAIN -- monopolizing the whole backlog on the recovering worker
+ * while the IORING_OP_ACCEPT that enable_accept just armed is also pending.
+ * Connections only ever arrive through accept CQEs in this tier, so the
+ * handler's sole job is to guarantee a pending accept exists; enable_accept
+ * is idempotent (a no-op when already armed).
+ */
+
+static void
+nxt_io_uring_conn_io_accept(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_listen_event_t  *lev;
+
+    lev = obj;
+
+    nxt_io_uring_enable_accept(task->thread->engine, &lev->socket);
+}
+
+
 #if (NXT_HAVE_SIGNALFD)
 
 static nxt_int_t
@@ -2103,10 +2145,10 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
                       "re-arming", ev->fd, -res);
 
             if (!slot->read_armed
-                && nxt_slow_path(!nxt_io_uring_arm(engine, ev,
+                && nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
                                                    NXT_IOU_DIR_READ, 1)))
             {
-                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ);
+                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ, 0);
             }
 
             return;
@@ -2267,7 +2309,7 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
                                                 NXT_IOU_DIR_READ,
                                                 slot->read_multishot)))
             {
-                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ);
+                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ, 0);
             }
         }
 
@@ -2315,7 +2357,7 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
             if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
                                                 NXT_IOU_DIR_WRITE, 1)))
             {
-                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_WRITE);
+                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_WRITE, 0);
             }
         }
     }
@@ -2378,7 +2420,7 @@ nxt_io_uring_error(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
 
 static void
 nxt_io_uring_accept_cqe(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
-    uint16_t gen, struct io_uring_cqe *cqe)
+    uint32_t gen, struct io_uring_cqe *cqe)
 {
     int                 res;
     socklen_t           socklen;
@@ -2438,7 +2480,7 @@ nxt_io_uring_accept_cqe(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
 
         if (ev->read == NXT_EVENT_ACTIVE) {
             if (nxt_slow_path(!nxt_io_uring_arm_accept(engine, ev, slot))) {
-                nxt_io_uring_arm_failed(engine, ev);
+                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ, 1);
             }
         }
 
@@ -2506,12 +2548,14 @@ nxt_io_uring_accept_cqe(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
      * re-arm to a work item behind the listen handler was measured to give an
      * identical per-thread accept distribution (SQ batching already delays
      * both to the same submit), so the inline form is kept as the simpler one.
-     * A failed re-arm must not silently strand the listener: escalate to its
-     * error_handler (at most once per completion; the caller returns after).
+     * A failed re-arm must not silently strand the listener.  Unlike an initial
+     * arm, escalating a *re-arm* through the error path is swallowed by the
+     * per-drain dedupe (this fd just dispatched an accept), so defer it to the
+     * pending-arm retry, which reissues the accept via arm_accept next poll.
      */
     if (ev->read == NXT_EVENT_ACTIVE && !slot->read_armed) {
         if (nxt_slow_path(!nxt_io_uring_arm_accept(engine, ev, slot))) {
-            nxt_io_uring_arm_failed(engine, ev);
+            nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ, 1);
         }
     }
 }
@@ -2522,6 +2566,7 @@ nxt_io_uring_internal_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
 {
     ssize_t                n;
     uint64_t               value;
+    nxt_err_t              err;
     struct io_uring_sqe    *sqe;
     nxt_io_uring_engine_t  *iou;
 
@@ -2566,12 +2611,15 @@ nxt_io_uring_internal_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
 
         n = read(iou->eventfd.fd, &value, sizeof(uint64_t));
 
+        /* Save errno before nxt_debug(): logging may clobber it. */
+        err = (n == -1) ? nxt_errno : 0;
+
         nxt_debug(&engine->task, "read(%d): %z events:%uL",
                   iou->eventfd.fd, n, value);
 
         if (n != sizeof(uint64_t)) {
             nxt_alert(&engine->task, "read eventfd(%d) failed %E",
-                      iou->eventfd.fd, nxt_errno);
+                      iou->eventfd.fd, err);
         }
     }
 

@@ -88,6 +88,18 @@ LABEL_A=${POS[0]}; BUILD_A=${POS[1]}
 LABEL_B=${POS[2]}; BUILD_B=${POS[3]}
 ROUNDS=${POS[4]:-4}
 
+# rounds feeds seq and arithmetic below; a bad value would silently run zero
+# rounds (empty results, exit 0) instead of erroring.
+case "$ROUNDS" in
+    ''|*[!0-9]*) echo "rounds must be a positive integer, got '$ROUNDS'" >&2; exit 2 ;;
+esac
+[ "$ROUNDS" -gt 0 ] || { echo "rounds must be a positive integer, got '$ROUNDS'" >&2; exit 2; }
+# An odd count leaves the A-first/B-first positions unbalanced (e.g. 5 rounds =
+# A first 3x, B first 2x), so a repeatable position effect stays correlated
+# with build identity. Allow it (quick smoke tests use 1), but say so.
+[ $((ROUNDS % 2)) = 0 ] || \
+    echo "NOTE: odd rounds=$ROUNDS leaves A/B start positions unbalanced; use an even count for measurement runs"
+
 for b in "$BUILD_A" "$BUILD_B"; do
     [ -x "$b/sbin/unitd" ] || { echo "no executable $b/sbin/unitd" >&2; exit 2; }
 done
@@ -173,7 +185,9 @@ if [ -n "${CORE_OVERLAP% }" ]; then
 fi
 
 mkdir -p "$RUNBASE"
-: > "$RESULTS"
+# fail fast: an unwritable results file would otherwise only surface after
+# the first measurement (or lose every tee -a silently under set +e)
+: > "$RESULTS" || { echo "cannot write results file $RESULTS" >&2; exit 2; }
 
 # ---- tool discovery ---------------------------------------------------------
 HAVE_JQ=0; command -v jq >/dev/null 2>&1 && HAVE_JQ=1
@@ -252,32 +266,48 @@ tree_cpu_ticks() {  # unitd main + all descendants (router + app workers)
 # ---- oha JSON parsing -------------------------------------------------------
 # oha --no-tui --output-format json emits: .summary.requestsPerSec, .summary.successRate,
 # .latencyPercentiles.p50 / .p99 (seconds), .statusCodeDistribution.
+# failed counts every non-2xx status (3xx included) plus transport errors, so
+# it matches ab's "Non-2xx responses" accounting below.
+# The REQUIRED fields (requestsPerSec, p50, p99, statusCodeDistribution) must be
+# present and numeric/object: a valid-JSON document without them (e.g. after an
+# oha output-schema change) prints NOTHING, so the caller's empty-rps check
+# fails the measurement instead of recording an all-zero row.
 parse_oha() {  # jsonfile -> "rps p50ms p99ms failed"
     local f=$1
     if [ "$HAVE_JQ" = 1 ]; then
         jq -r '
           def ms(x): (x*1000);
-          [ (.summary.requestsPerSec // 0),
-            (ms(.latencyPercentiles."p50" // 0)),
-            (ms(.latencyPercentiles."p99" // 0)),
-            ( (( [ .statusCodeDistribution // {} | to_entries[]
-                   | select((.key|tonumber) >= 400 or (.key|tonumber) < 200) | .value ]
+          if   (.summary.requestsPerSec  | type) != "number"
+            or (.latencyPercentiles."p50" | type) != "number"
+            or (.latencyPercentiles."p99" | type) != "number"
+            or (.statusCodeDistribution   | type) != "object"
+          then empty
+          else
+          [ .summary.requestsPerSec,
+            (ms(.latencyPercentiles."p50")),
+            (ms(.latencyPercentiles."p99")),
+            ( (( [ .statusCodeDistribution | to_entries[]
+                   | select((.key|tonumber) >= 300 or (.key|tonumber) < 200) | .value ]
                  | add) // 0)
               + (( [ .errorDistribution // {} | to_entries[] | .value ] | add) // 0) )
-          ] | @tsv' "$f"
+          ] | @tsv
+          end' "$f"
     else
         python3 - "$f" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
 s=d.get("summary",{})
 lp=d.get("latencyPercentiles",{})
-rps=s.get("requestsPerSec",0) or 0
-p50=(lp.get("p50",0) or 0)*1000
-p99=(lp.get("p99",0) or 0)*1000
-scd=d.get("statusCodeDistribution",{}) or {}
-failed=sum(v for k,v in scd.items() if str(k).isdigit() and (int(k)>=400 or int(k)<200))
+rps=s.get("requestsPerSec")
+p50=lp.get("p50")
+p99=lp.get("p99")
+scd=d.get("statusCodeDistribution")
+def num(x): return isinstance(x,(int,float)) and not isinstance(x,bool)
+if not (num(rps) and num(p50) and num(p99) and isinstance(scd,dict)):
+    sys.exit(0)   # print nothing: required fields missing -> caller fails
+failed=sum(v for k,v in scd.items() if str(k).isdigit() and (int(k)>=300 or int(k)<200))
 failed+=sum((d.get("errorDistribution",{}) or {}).values())
-print(f"{rps}\t{p50}\t{p99}\t{failed}")
+print(f"{rps}\t{p50*1000}\t{p99*1000}\t{failed}")
 PY
     fi
 }
@@ -377,16 +407,23 @@ pin_router() {  # run -> sets ROUTER, pins to server cores
 #   mode = router | tree   (which CPU accounting)
 oha_one() {
     local run=$1 label=$2 scen=$3 url=$4 n=$5 c=$6 ka=$7 mode=$8
-    local t0 t1 js="$run/oha-$scen.json"
+    local t0 t1 rc js="$run/oha-$scen.json"
     local ohaka=()
     [ "$ka" = 1 ] && ohaka=(-c "$c") || ohaka=(-c "$c" --disable-keepalive)
     if [ "$mode" = tree ]; then t0=$(tree_cpu_ticks); else t0=$(router_cpu_ticks); fi
     taskset -c "$LOAD_CORES" "$OHA" --no-tui --output-format json -t "$OHA_TIMEOUT" \
         -n "$n" "${ohaka[@]}" "$url" \
         > "$js" 2>"$run/oha-$scen.err"
+    rc=$?
     if [ "$mode" = tree ]; then t1=$(tree_cpu_ticks); else t1=$(router_cpu_ticks); fi
     local rps p50 p99 failed
     IFS=$'\t' read -r rps p50 p99 failed < <(parse_oha "$js")
+    # A dead/unstartable oha (or unparsable JSON) must fail the measurement:
+    # otherwise printf records an all-zero row and the round looks green.
+    if [ "$rc" -ne 0 ] || [ -z "$rps" ]; then
+        echo "oha measurement failed: $label $scen (rc=$rc, see $run/oha-$scen.err)" >&2
+        return 1
+    fi
     local us
     us=$(LC_ALL=C awk -v a="$t0" -v b="$t1" -v clk="$CLK" -v n="$n" \
         'BEGIN{printf "%.2f", (b-a)*1000000/clk/n}')
@@ -399,14 +436,20 @@ oha_one() {
 ab_one() {
     local run=$1 label=$2 scen=$3 url=$4 n=$5 c=$6 ka=$7 mode=$8
     [ "$SKIP_AB" = 1 ] && return 0
-    local t0 t1 out="$run/ab-$scen.txt" extra=""
+    local t0 t1 rc out="$run/ab-$scen.txt" extra=""
     [ "$ka" = 1 ] && extra="-k"
     if [ "$mode" = tree ]; then t0=$(tree_cpu_ticks); else t0=$(router_cpu_ticks); fi
     # shellcheck disable=SC2086
     taskset -c "$LOAD_CORES" ab $extra -n "$n" -c "$c" -q "$url" > "$out" 2>&1
+    rc=$?
     if [ "$mode" = tree ]; then t1=$(tree_cpu_ticks); else t1=$(router_cpu_ticks); fi
     local rps p99 failed non2xx us
     rps=$(awk '/Requests per second/{print $4}' "$out")
+    # Same rationale as oha_one: a failed ab must not record a zero-value row.
+    if [ "$rc" -ne 0 ] || [ -z "$rps" ]; then
+        echo "ab measurement failed: $label $scen (rc=$rc, see $out)" >&2
+        return 1
+    fi
     p99=$(awk '/ 99%/{print $2}' "$out")
     # ab reports HTTP-status failures on a separate "Non-2xx responses" line,
     # NOT in "Failed requests"; count both or 5xx regressions record failed=0.
@@ -423,7 +466,7 @@ ab_one() {
 # ---- per-build round --------------------------------------------------------
 run_build_round() {
     local label=$1 build=$2 slot=$3 rnd=$4
-    local port pport pphp mods run
+    local port pport pphp mods run meas_failed=0
     if [ "$slot" = A ]; then
         port=$PORT_A; pport=$PORT_A_PROXY; pphp=$PORT_A_PHP
     else
@@ -433,8 +476,9 @@ run_build_round() {
     mods="$build/lib/unit/modules"
     [ -d "$mods" ] || mods="$run/modules"
 
-    # refuse if ports busy
-    for p in "$port" "$pport"; do
+    # refuse if ports busy (php port too: a bound $pphp would otherwise
+    # degrade to the php SKIP path instead of aborting the round)
+    for p in "$port" "$pport" "$pphp"; do
         if port_busy "$p"; then echo "port $p busy, aborting" >&2; return 1; fi
     done
 
@@ -455,14 +499,16 @@ run_build_round() {
     taskset -c "$LOAD_CORES" "$OHA" --no-tui --output-format json -t "$OHA_TIMEOUT" -n 2000 -c 16 \
         "http://127.0.0.1:$port/" >/dev/null 2>&1
 
-    oha_one "$run" "$label" ret200_ka_hi "http://127.0.0.1:$port/"  "$N_HIGH"  256 1 router
-    ab_one  "$run" "$label" ret200_ka_hi "http://127.0.0.1:$port/"  "$N_HIGH"  256 1 router
-    oha_one "$run" "$label" ret200_ka_lo "http://127.0.0.1:$port/"  "$N_LOW"     8 1 router
-    ab_one  "$run" "$label" ret200_ka_lo "http://127.0.0.1:$port/"  "$N_LOW"     8 1 router
-    oha_one "$run" "$label" ret200_close "http://127.0.0.1:$port/"  "$N_CLOSE"  16 0 router
-    ab_one  "$run" "$label" ret200_close "http://127.0.0.1:$port/"  "$N_CLOSE"  16 0 router
-    oha_one "$run" "$label" proxy_ka     "http://127.0.0.1:$pport/" "$N_PROXY"  64 1 router
-    ab_one  "$run" "$label" proxy_ka     "http://127.0.0.1:$pport/" "$N_PROXY"  64 1 router
+    # Collect measurement failures instead of aborting mid-round: the round
+    # must still tear down cleanly, then report failure via FAILED_ROUNDS.
+    oha_one "$run" "$label" ret200_ka_hi "http://127.0.0.1:$port/"  "$N_HIGH"  256 1 router || meas_failed=1
+    ab_one  "$run" "$label" ret200_ka_hi "http://127.0.0.1:$port/"  "$N_HIGH"  256 1 router || meas_failed=1
+    oha_one "$run" "$label" ret200_ka_lo "http://127.0.0.1:$port/"  "$N_LOW"     8 1 router || meas_failed=1
+    ab_one  "$run" "$label" ret200_ka_lo "http://127.0.0.1:$port/"  "$N_LOW"     8 1 router || meas_failed=1
+    oha_one "$run" "$label" ret200_close "http://127.0.0.1:$port/"  "$N_CLOSE"  16 0 router || meas_failed=1
+    ab_one  "$run" "$label" ret200_close "http://127.0.0.1:$port/"  "$N_CLOSE"  16 0 router || meas_failed=1
+    oha_one "$run" "$label" proxy_ka     "http://127.0.0.1:$pport/" "$N_PROXY"  64 1 router || meas_failed=1
+    ab_one  "$run" "$label" proxy_ka     "http://127.0.0.1:$pport/" "$N_PROXY"  64 1 router || meas_failed=1
 
     # --- PHP scenario (optional) ---
     local php_mod=""
@@ -475,8 +521,8 @@ run_build_round() {
             if cleanup_http_reconfig "$run" "$pphp" "$root"; then
                 taskset -c "$LOAD_CORES" "$OHA" --no-tui --output-format json -t "$OHA_TIMEOUT" -n 5000 -c 8 \
                     "http://127.0.0.1:$pphp/" >/dev/null 2>&1
-                oha_one "$run" "$label" php_ka "http://127.0.0.1:$pphp/" "$N_PHP" 8 1 tree
-                ab_one  "$run" "$label" php_ka "http://127.0.0.1:$pphp/" "$N_PHP" 8 1 tree
+                oha_one "$run" "$label" php_ka "http://127.0.0.1:$pphp/" "$N_PHP" 8 1 tree || meas_failed=1
+                ab_one  "$run" "$label" php_ka "http://127.0.0.1:$pphp/" "$N_PHP" 8 1 tree || meas_failed=1
             else
                 # module + app dir are BOTH present, so a config/listener
                 # failure is a real regression in this build, not a missing
@@ -493,6 +539,9 @@ run_build_round() {
     fi
 
     cleanup
+    # Fail the round if any measurement failed, so the caller's FAILED_ROUNDS
+    # accounting (and the final non-zero exit) catches incomplete data.
+    [ "$meas_failed" -eq 0 ]
 }
 
 cleanup_http_reconfig() {  # reuse the running unitd, swap to php config on pphp

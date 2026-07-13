@@ -26,6 +26,8 @@
 #                        into it). Auto-created under RUNBASE only when unset.
 #     ALLOW_SAME=1       permit both builds to report the SAME engine (A/A mode)
 #     SKIP_AB=1          skip the secondary ApacheBench pass
+#     MAX_FAILED=N       max failed requests a single measurement may record
+#                        before it fails the round/run (default 0)
 #     N_HIGH, N_LOW, N_CLOSE, N_PROXY, N_PHP   request counts (reproducibility knob)
 #     OHA_TIMEOUT=dur    per-request oha timeout (default 30s; e.g. 5s, 500ms)
 #     CURL_MAXTIME=secs  control-socket PUT transfer timeout (default 30)
@@ -88,6 +90,14 @@ LABEL_A=${POS[0]}; BUILD_A=${POS[1]}
 LABEL_B=${POS[2]}; BUILD_B=${POS[3]}
 ROUNDS=${POS[4]:-4}
 
+# Labels become whitespace-delimited result-row fields; whitespace or glob chars
+# silently break the summarizer (rows skipped, run still exits 0). Reject early.
+for l in "$LABEL_A" "$LABEL_B"; do
+    case "$l" in
+        *[!A-Za-z0-9._-]*|'') echo "invalid label '$l' (allowed: A-Za-z0-9._-)" >&2; exit 2 ;;
+    esac
+done
+
 # rounds feeds seq and arithmetic below; a bad value would silently run zero
 # rounds (empty results, exit 0) instead of erroring.
 case "$ROUNDS" in
@@ -142,6 +152,17 @@ N_LOW=${N_LOW:-20000}
 N_CLOSE=${N_CLOSE:-20000}
 N_PROXY=${N_PROXY:-50000}
 N_PHP=${N_PHP:-50000}
+
+# Max failed requests a measurement may record before it fails the round/run.
+# The summary tables don't surface `failed`, so without this an all-non-2xx run
+# looks green as long as the tool exits 0.
+MAX_FAILED=${MAX_FAILED:-0}
+# A non-numeric MAX_FAILED makes the `-gt` comparison in oha_one/ab_one print an
+# error and evaluate false, silently accepting a measurement that DID record
+# failures. Require a non-negative integer up front, like rounds above.
+case "$MAX_FAILED" in
+    ''|*[!0-9]*) echo "MAX_FAILED must be a non-negative integer, got '$MAX_FAILED'" >&2; exit 2 ;;
+esac
 
 # CPU partition: server tree vs load generators.  The defaults encode the
 # reference-box methodology (8 cores, 0-3/4-7); override via env on other
@@ -199,7 +220,9 @@ command -v "$OHA" >/dev/null 2>&1 || OHA=$(command -v oha 2>/dev/null || true)
 if [ "$HAVE_JQ" = 0 ] && [ "$HAVE_PY" = 0 ]; then
     echo "need jq or python3 to parse oha JSON" >&2; exit 2
 fi
-[ "$SKIP_AB" = 1 ] || [ "$HAVE_AB" = 1 ] || { echo "ab not found (use --skip-ab)" >&2; SKIP_AB=1; }
+# Don't silently halve the matrix: a missing ab must abort unless the caller
+# explicitly opted out via --skip-ab/SKIP_AB=1.
+[ "$SKIP_AB" = 1 ] || [ "$HAVE_AB" = 1 ] || { echo "ab not found (use --skip-ab)" >&2; exit 2; }
 
 # ---- state ------------------------------------------------------------------
 UNITD_PID=""
@@ -236,7 +259,13 @@ cleanup() {
     fi
     UNITD_PID=""
 }
-trap cleanup EXIT INT TERM
+# INT/TERM must EXIT, not just clean up: after the handler returns bash would
+# otherwise resume the script into later measurements with unitd already killed.
+# cleanup is idempotent (clears UNITD_PID), so the subsequent EXIT trap is a
+# harmless no-op.
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 router_cpu_ticks() {  # utime+stime of the router process; comm has a space
     # Default to 0 if the process vanished between checks: an empty value
@@ -416,6 +445,13 @@ oha_one() {
         > "$js" 2>"$run/oha-$scen.err"
     rc=$?
     if [ "$mode" = tree ]; then t1=$(tree_cpu_ticks); else t1=$(router_cpu_ticks); fi
+    # Router mode: a crash/restart mid-measurement makes router_cpu_ticks default
+    # to 0, yielding a bogus 0/negative CPU sample that would still pass. Fail if
+    # the router is gone. (Tree mode: app worker churn is the daemon's business.)
+    if [ "$mode" = router ] && [ ! -r "/proc/$ROUTER/stat" ]; then
+        echo "router pid $ROUTER vanished mid-measurement: $label $scen" >&2
+        return 1
+    fi
     local rps p50 p99 failed
     IFS=$'\t' read -r rps p50 p99 failed < <(parse_oha "$js")
     # A dead/unstartable oha (or unparsable JSON) must fail the measurement:
@@ -427,9 +463,21 @@ oha_one() {
     local us
     us=$(LC_ALL=C awk -v a="$t0" -v b="$t1" -v clk="$CLK" -v n="$n" \
         'BEGIN{printf "%.2f", (b-a)*1000000/clk/n}')
-    printf '%s %s oha rps=%.0f p50ms=%.3f p99ms=%.3f failed=%s cpu_us_per_req=%s engine=%s\n' \
-        "$label" "$scen" "$rps" "$p50" "$p99" "${failed:-0}" "$us" "${ENGINE[$label]}" \
-        | tee -a "$RESULTS"
+    # A failing append (e.g. RESULTS on a full disk) must fail the measurement:
+    # the trailing failed-check below would otherwise overwrite the pipeline
+    # status and the row would be lost while oha_one still returned success.
+    if ! printf '%s %s oha rps=%.0f p50ms=%.3f p99ms=%.3f failed=%s cpu_us_per_req=%s engine=%s\n' \
+            "$label" "$scen" "$rps" "$p50" "$p99" "${failed:-0}" "$us" "${ENGINE[$label]}" \
+            | tee -a "$RESULTS"; then
+        echo "failed to append measurement row to $RESULTS: $label $scen" >&2
+        return 1
+    fi
+    # Recorded the row for forensics; now fail the measurement if it saw request
+    # failures (non-2xx/transport) — the summary tables don't surface `failed`.
+    if [ "${failed:-0}" -gt "$MAX_FAILED" ]; then
+        echo "oha measurement recorded ${failed:-0} failed request(s) (>MAX_FAILED=$MAX_FAILED): $label $scen" >&2
+        return 1
+    fi
 }
 
 # ab_one: secondary continuity metric (keepalive matching bench-ab.sh numbers)
@@ -443,6 +491,13 @@ ab_one() {
     taskset -c "$LOAD_CORES" ab $extra -n "$n" -c "$c" -q "$url" > "$out" 2>&1
     rc=$?
     if [ "$mode" = tree ]; then t1=$(tree_cpu_ticks); else t1=$(router_cpu_ticks); fi
+    # Router mode: a crash/restart mid-measurement makes router_cpu_ticks default
+    # to 0, yielding a bogus 0/negative CPU sample that would still pass. Fail if
+    # the router is gone. (Tree mode: app worker churn is the daemon's business.)
+    if [ "$mode" = router ] && [ ! -r "/proc/$ROUTER/stat" ]; then
+        echo "router pid $ROUTER vanished mid-measurement: $label $scen" >&2
+        return 1
+    fi
     local rps p99 failed non2xx us
     rps=$(awk '/Requests per second/{print $4}' "$out")
     # Same rationale as oha_one: a failed ab must not record a zero-value row.
@@ -458,9 +513,43 @@ ab_one() {
     failed=$(( ${failed:-0} + ${non2xx:-0} ))
     us=$(LC_ALL=C awk -v a="$t0" -v b="$t1" -v clk="$CLK" -v n="$n" \
         'BEGIN{printf "%.2f", (b-a)*1000000/clk/n}')
-    printf '%s %s ab rps=%s p50ms=NA p99ms=%s failed=%s cpu_us_per_req=%s engine=%s\n' \
-        "$label" "$scen" "${rps:-0}" "${p99:-NA}" "${failed:-0}" "$us" "${ENGINE[$label]}" \
-        | tee -a "$RESULTS"
+    # Same rationale as oha_one: a failing append must fail the measurement, or
+    # the trailing failed-check overwrites the pipeline status and the row is lost.
+    if ! printf '%s %s ab rps=%s p50ms=NA p99ms=%s failed=%s cpu_us_per_req=%s engine=%s\n' \
+            "$label" "$scen" "${rps:-0}" "${p99:-NA}" "${failed:-0}" "$us" "${ENGINE[$label]}" \
+            | tee -a "$RESULTS"; then
+        echo "failed to append measurement row to $RESULTS: $label $scen" >&2
+        return 1
+    fi
+    # Recorded the row for forensics; now fail the measurement if it saw request
+    # failures (Failed requests + Non-2xx) — the summary tables don't surface it.
+    if [ "${failed:-0}" -gt "$MAX_FAILED" ]; then
+        echo "ab measurement recorded ${failed:-0} failed request(s) (>MAX_FAILED=$MAX_FAILED): $label $scen" >&2
+        return 1
+    fi
+}
+
+# warmup_one: a VALIDATED warmup pass. oha's default discards status and JSON, so
+# a warmup that errors or returns non-2xx would silently precede the first
+# measurement, leaving it to run against a cold or still-recovering build. Apply
+# the same request-failure policy as a measurement (exit status + failed-count vs
+# MAX_FAILED); record no result row. Non-zero return fails the build-round.
+warmup_one() {  # run label tag url nreq conc
+    local run=$1 label=$2 tag=$3 url=$4 n=$5 c=$6
+    local rc rps p50 p99 failed js="$run/warmup-$tag.json"
+    taskset -c "$LOAD_CORES" "$OHA" --no-tui --output-format json -t "$OHA_TIMEOUT" \
+        -n "$n" -c "$c" "$url" > "$js" 2>"$run/warmup-$tag.err"
+    rc=$?
+    IFS=$'\t' read -r rps p50 p99 failed < <(parse_oha "$js")
+    if [ "$rc" -ne 0 ] || [ -z "$rps" ]; then
+        echo "warmup failed: $label $tag (rc=$rc, see $run/warmup-$tag.err)" >&2
+        return 1
+    fi
+    if [ "${failed:-0}" -gt "$MAX_FAILED" ]; then
+        echo "warmup recorded ${failed:-0} failed request(s) (>MAX_FAILED=$MAX_FAILED): $label $tag" >&2
+        return 1
+    fi
+    return 0
 }
 
 # ---- per-build round --------------------------------------------------------
@@ -495,9 +584,9 @@ run_build_round() {
         || { echo "listener $port never came up"; cleanup; return 1; }
     pin_router "$run" || { cleanup; return 1; }
 
-    # warmup
-    taskset -c "$LOAD_CORES" "$OHA" --no-tui --output-format json -t "$OHA_TIMEOUT" -n 2000 -c 16 \
-        "http://127.0.0.1:$port/" >/dev/null 2>&1
+    # warmup (validated: a cold/erroring warmup fails the round instead of
+    # silently preceding the first measurement)
+    warmup_one "$run" "$label" http "http://127.0.0.1:$port/" 2000 16 || meas_failed=1
 
     # Collect measurement failures instead of aborting mid-round: the round
     # must still tear down cleanly, then report failure via FAILED_ROUNDS.
@@ -519,8 +608,7 @@ run_build_round() {
         root=$(ensure_phpapp) || root=""
         if [ -n "$root" ]; then
             if cleanup_http_reconfig "$run" "$pphp" "$root"; then
-                taskset -c "$LOAD_CORES" "$OHA" --no-tui --output-format json -t "$OHA_TIMEOUT" -n 5000 -c 8 \
-                    "http://127.0.0.1:$pphp/" >/dev/null 2>&1
+                warmup_one "$run" "$label" php "http://127.0.0.1:$pphp/" 5000 8 || meas_failed=1
                 oha_one "$run" "$label" php_ka "http://127.0.0.1:$pphp/" "$N_PHP" 8 1 tree || meas_failed=1
                 ab_one  "$run" "$label" php_ka "http://127.0.0.1:$pphp/" "$N_PHP" 8 1 tree || meas_failed=1
             else

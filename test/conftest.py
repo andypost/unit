@@ -328,19 +328,19 @@ def _group_alive(p, pgid):
         return False
 
     for pid in pids:
+        # Read the state straight from /proc: this runs per pid per 0.2 s poll
+        # tick, and spawning a ps for each adds real load on exactly the slow
+        # builders the ladder timeouts exist for.  comm (field 2) may contain
+        # spaces and ')', so parse from the LAST ')'.
         try:
-            state = (
-                subprocess.check_output(
-                    ['ps', '-o', 'state=', '-p', pid],
-                    stderr=subprocess.DEVNULL,
-                )
-                .decode()
-                .strip()
+            stat = Path(f'/proc/{pid}/stat').read_text(
+                encoding='utf-8', errors='ignore'
             )
-        except (subprocess.CalledProcessError, FileNotFoundError):
+            state = stat[stat.rfind(')') + 1 :].split()[0]
+        except (OSError, IndexError):
             continue
 
-        if state and not state.startswith('Z'):
+        if not state.startswith('Z'):
             return True
 
     return False

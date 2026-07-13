@@ -1,3 +1,4 @@
+import atexit
 import fcntl
 import inspect
 import json
@@ -74,6 +75,10 @@ def pytest_addoption(parser):
 
 unit_instance = {}
 _processes = []
+# Every unitd process-group id (== leader pid, see start_new_session in
+# unit_run) we have spawned this session.  Reaped best-effort at interpreter
+# exit so an error path that bypassed unit_stop can never leak a unitd tree.
+_pgids = set()
 _fds_info = {
     'main': {'fds': 0, 'skip': False},
     'router': {'name': 'unit: router', 'pid': -1, 'fds': 0, 'skip': False},
@@ -271,6 +276,135 @@ def run(request):
     Log.check_alerts(log=log)
 
 
+def _write_pgid(temp_dir, pgid):
+    # The pgid file on disk is the contract external sweepers (the D4 wrapper)
+    # consume to reap a unitd tree orphaned by a hard-killed runner.  Written
+    # eagerly at spawn, before we risk a startup timeout.
+    try:
+        Path(f'{temp_dir}/unitd.pgid').write_text(f'{pgid}\n', encoding='utf-8')
+    except OSError:
+        pass
+
+
+def _register_pgid(pgid):
+    if pgid and pgid > 1:
+        _pgids.add(pgid)
+
+
+def _signal_group(pgid, sig):
+    # Guard hard: never signal group 0 (our OWN process group) or a
+    # negative/empty/reserved id.  With start_new_session the leader pid equals
+    # the group id, so this is always a group we created — never the pytest
+    # runner's group and never an unrelated unitd on the box.
+    if not pgid or pgid <= 1:
+        return
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _group_alive(p, pgid):
+    # True only if a NON-zombie process still remains in the group.  Our group
+    # leader is a direct child (Popen), so once signalled it lingers as a zombie
+    # until reaped; reap it via poll() first, and skip any 'Z' state below, so a
+    # zombie never keeps the group looking alive forever.
+    if p is not None:
+        p.poll()
+
+    if not pgid or pgid <= 1:
+        return False
+
+    try:
+        pids = (
+            subprocess.check_output(
+                ['pgrep', '-g', str(pgid)], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .split()
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # exit 1 == no process in the group; no pgrep == treat as gone
+        return False
+
+    for pid in pids:
+        try:
+            state = (
+                subprocess.check_output(
+                    ['ps', '-o', 'state=', '-p', pid],
+                    stderr=subprocess.DEVNULL,
+                )
+                .decode()
+                .strip()
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+
+        if state and not state.startswith('Z'):
+            return True
+
+    return False
+
+
+def _reap_group(p, pgid, timeout):
+    # Escalation ladder scoped to a process group WE created (pgid == leader
+    # pid): SIGTERM the group, poll up to `timeout` s, then SIGKILL the group.
+    # Keyed on the GROUP, not the main pid, so it reaps the router/controller/
+    # app workers even when main is already dead but its children survive.
+    if not pgid or pgid <= 1:
+        return
+
+    if not _group_alive(p, pgid):
+        return
+
+    _signal_group(pgid, signal.SIGTERM)
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _group_alive(p, pgid):
+            return
+        time.sleep(0.2)
+
+    _signal_group(pgid, signal.SIGKILL)
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if not _group_alive(p, pgid):
+            return
+        time.sleep(0.2)
+
+
+@atexit.register
+def _reap_all_pgids():
+    # Best-effort safety net for any group we spawned that is somehow still
+    # alive at interpreter exit (an exception path that bypassed unit_stop).
+    # NOTE: a SIGBUS/SIGKILL of the runner itself defeats every in-process
+    # handler — external containment is the D4 wrapper's job — but the
+    # <temp_dir>/unitd.pgid file left on disk is the contract those external
+    # sweepers consume.
+    for pgid in list(_pgids):
+        try:
+            _reap_group(None, pgid, timeout=3)
+        except Exception:
+            pass
+
+
+def _sigterm_reap(signum, frame):
+    # SIGTERM does not run atexit handlers, so drive the same best-effort reap
+    # here, then restore the default disposition and re-raise so the runner
+    # still dies from the signal.  SIGINT is already covered by pytest's
+    # KeyboardInterrupt path (see unit_stop).
+    _reap_all_pgids()
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+# Install once at import, and only if nothing else already owns SIGTERM, so we
+# never stomp a host harness's handler.
+if signal.getsignal(signal.SIGTERM) in (signal.SIG_DFL, None):
+    signal.signal(signal.SIGTERM, _sigterm_reap)
+
+
 def unit_run(state_dir=None):
     global unit_instance
 
@@ -319,9 +453,27 @@ def unit_run(state_dir=None):
         unitd_args.extend(['--user', option.user])
 
     with open(f'{temporary_dir}/unit.log', 'w', encoding='utf-8') as log:
-        unit_instance['process'] = subprocess.Popen(unitd_args, stderr=log)
+        # start_new_session=True makes the child a session/process-group leader,
+        # so its pgid == pid and the whole unitd family (main, controller,
+        # router, app workers) shares one group we can signal as a unit — and
+        # which can never be confused with the pytest runner's own group or an
+        # unrelated unitd already running on the box.
+        p = subprocess.Popen(unitd_args, stderr=log, start_new_session=True)
+        unit_instance['process'] = p
 
-    if not waitforfiles(control_sock):
+    # Record the group id (== leader pid) immediately, on disk and in-memory,
+    # before we risk a startup timeout below.
+    unit_instance['pgid'] = p.pid
+    _register_pgid(p.pid)
+    _write_pgid(temporary_dir, p.pid)
+
+    # Start budget is env-tunable for slow/32-bit builders; the default of 5 s
+    # (waitforfiles counts in 0.1 s steps) preserves the previous behavior.
+    start_timeout = int(os.environ.get('UNIT_TEST_START_TIMEOUT', 5))
+    if not waitforfiles(control_sock, timeout=start_timeout * 10):
+        # Reap the group we just spawned before bailing: a unitd that never
+        # opened its control socket would otherwise leak its whole tree.
+        _reap_group(p, p.pid, timeout=5)
         Log.print_log()
         sys.exit('Could not start unit')
 
@@ -358,35 +510,58 @@ def unit_stop():
 
         return
 
-    # check zombies
+    # Startup may have failed before the process/pid were recorded; nothing to
+    # stop then, and reads of unit_instance['pid'] must not KeyError.
+    p = unit_instance.get('process')
+    if p is None:
+        return
 
-    out = subprocess.check_output(
-        ['ps', 'ax', '-o', 'state', '-o', 'ppid']
-    ).decode()
-    z_ppids = re.findall(r'Z\s*(\d+)', out)
-    assert unit_instance['pid'] not in z_ppids, 'no zombies'
+    pgid = unit_instance.get('pgid')
+    main_pid = unit_instance.get('pid')
+
+    # check zombies (only once startup got far enough to record the main pid)
+
+    if main_pid is not None:
+        out = subprocess.check_output(
+            ['ps', 'ax', '-o', 'state', '-o', 'ppid']
+        ).decode()
+        z_ppids = re.findall(r'Z\s*(\d+)', out)
+        assert main_pid not in z_ppids, 'no zombies'
 
     # terminate unit
 
-    p = unit_instance['process']
-
     if p.poll() is not None:
+        # Main already exited — make sure no group member (router, controller,
+        # app worker) lingers behind it.
+        _reap_group(p, pgid, timeout=5)
         return
+
+    # Graceful shutdown first: SIGQUIT asks main to quit cleanly and reap its
+    # own children.  STOP_TIMEOUT is env-tunable because a slow or 32-bit CI
+    # box can take far longer than the 15 s default to drain — set
+    # UNIT_TEST_STOP_TIMEOUT=60 (or more) there.
+    stop_timeout = int(os.environ.get('UNIT_TEST_STOP_TIMEOUT', 15))
 
     p.send_signal(signal.SIGQUIT)
 
     try:
-        retcode = p.wait(15)
+        retcode = p.wait(stop_timeout)
         if retcode:
             return f'Child process terminated with code {retcode}'
 
     except KeyboardInterrupt:
-        p.kill()
+        # Ctrl-C mid-shutdown: reap the whole group before re-raising so we
+        # never leak the unitd tree.
+        _reap_group(p, pgid, timeout=5)
         raise
 
-    except:
-        p.kill()
-        return 'Could not terminate unit'
+    except subprocess.TimeoutExpired:
+        # Graceful quit overran STOP_TIMEOUT: escalate to the process GROUP
+        # (SIGTERM, then SIGKILL) so the router/controller/app workers die even
+        # when main itself is wedged.
+        _reap_group(p, pgid, timeout=5)
+        if _group_alive(p, pgid):
+            return 'Could not terminate unit'
 
 
 @print_log_on_assert

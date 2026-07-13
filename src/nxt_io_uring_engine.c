@@ -52,12 +52,17 @@
 
 
 /*
- * user_data layout returned verbatim in every CQE:
+ * user_data layout returned verbatim in every CQE (64 bits, fully allocated):
  *
- *   bit  0      DIR   0 = read poll, 1 = write poll
- *   bit  1      KIND  0 = fd poll (slot-indexed), 1 = internal sentinel
- *   bits 2..15  GEN   14-bit per-direction generation (stale-CQE rejection)
- *   bits 16..   IDX   slot index == fd number
+ *   bit  0        DIR   0 = read poll, 1 = write poll
+ *   bit  1        KIND  0 = fd poll (slot-indexed), 1 = internal sentinel
+ *   bits 2..33    GEN   32-bit per-direction generation (stale-CQE rejection)
+ *   bits 34..63   IDX   30-bit slot index == fd number (up to ~1.07e9 fds)
+ *
+ * GEN is the full 32-bit width of the slot's generation counter, so a stale
+ * CQE can only alias a live arming after 2^32 disable/enable cycles on the
+ * same fd number -- unreachable for any realistic churn.  IDX at 30 bits
+ * covers any attainable RLIMIT_NOFILE.
  */
 
 #define NXT_IOU_DIR_READ     0
@@ -66,18 +71,26 @@
 #define NXT_IOU_KIND_FD      0
 #define NXT_IOU_KIND_INT     1
 
-#define NXT_IOU_GEN_MASK     0x3FFF
+#define NXT_IOU_GEN_MASK     0xFFFFFFFF
+
+/*
+ * The generation field is the same width (32 bits) as the uint32_t slot
+ * counters, so the mask is an identity on the slot side and the user_data
+ * side stays in lockstep with the counter across its full period; the macro
+ * is kept for documentation and to keep the packing self-describing.
+ */
+#define nxt_iou_gen(g)        ((uint32_t) ((g) & NXT_IOU_GEN_MASK))
 
 #define nxt_iou_ud(idx, gen, dir)                                             \
-    ( ((uint64_t) (idx) << 16)                                                \
+    ( ((uint64_t) (idx) << 34)                                                \
       | (((uint64_t) ((gen) & NXT_IOU_GEN_MASK)) << 2)                        \
       | ((uint64_t) (NXT_IOU_KIND_FD) << 1)                                   \
       | (uint64_t) (dir) )
 
 #define nxt_iou_ud_dir(ud)    ((uint32_t) ((ud) & 0x1))
 #define nxt_iou_ud_kind(ud)   ((uint32_t) (((ud) >> 1) & 0x1))
-#define nxt_iou_ud_gen(ud)    ((uint16_t) (((ud) >> 2) & NXT_IOU_GEN_MASK))
-#define nxt_iou_ud_idx(ud)    ((uint32_t) ((ud) >> 16))
+#define nxt_iou_ud_gen(ud)    ((uint32_t) (((ud) >> 2) & NXT_IOU_GEN_MASK))
+#define nxt_iou_ud_idx(ud)    ((uint32_t) ((ud) >> 34))
 
 /* Internal sentinel user_data values (KIND == INTERNAL). */
 #define NXT_IOU_UD_POST      ((uint64_t) 0x2)   /* eventfd post channel     */
@@ -121,8 +134,13 @@ static void nxt_io_uring_arm_failed(nxt_event_engine_t *engine,
 static void nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
     nxt_uint_t dir);
 static nxt_bool_t nxt_io_uring_submit_remove(nxt_event_engine_t *engine,
-    nxt_fd_t fd, uint16_t gen, nxt_uint_t dir);
+    nxt_fd_t fd, uint32_t gen, nxt_uint_t dir);
 static void nxt_io_uring_retry_pending_removes(nxt_event_engine_t *engine);
+static void nxt_io_uring_arm_pend(nxt_event_engine_t *engine,
+    nxt_io_uring_slot_t *slot, nxt_uint_t dir);
+static void nxt_io_uring_retry_pending_arms(nxt_event_engine_t *engine);
+static void nxt_io_uring_slot_reconcile(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev);
 
 static void nxt_io_uring_enable(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static void nxt_io_uring_disable(nxt_event_engine_t *engine,
@@ -248,15 +266,23 @@ const nxt_event_interface_t  nxt_io_uring_engine = {
 nxt_inline uint32_t
 nxt_io_uring_pow2(uint32_t n)
 {
-    uint32_t  p;
-
-    p = 1;
-
-    while (p < n) {
-        p <<= 1;
+    if (nxt_slow_path(n <= 1)) {
+        return 1;
     }
 
-    return p;
+    if (nxt_slow_path(n > 0x80000000)) {
+        /* Saturate: no caller's size gets here, but never overflow to 0. */
+        return 0x80000000;
+    }
+
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+
+    return n + 1;
 }
 
 
@@ -361,6 +387,8 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
                 "io_uring_queue_init_params() failed %E", -ret);
         return NXT_ERROR;
     }
+
+    iou->ring_inited = 1;
 
     nxt_debug(&engine->task, "io_uring_queue_init(): sq:%uD cq:%uD features:%uxD",
               iou->sq_entries, params.cq_entries, params.features);
@@ -603,6 +631,7 @@ static void
 nxt_io_uring_signalfd_handler(nxt_task_t *task, void *obj, void *data)
 {
     int                      n;
+    nxt_err_t                err;
     nxt_fd_event_t           *ev;
     nxt_work_handler_t       handler;
     struct signalfd_siginfo  sfd;
@@ -612,18 +641,32 @@ nxt_io_uring_signalfd_handler(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "io_uring signalfd handler");
 
-    n = read(ev->fd, &sfd, sizeof(struct signalfd_siginfo));
+    /*
+     * Drain the signalfd to EAGAIN: multishot poll delivery is edge-like
+     * (one CQE per wakeup) and the CQ drain dedupes to one handler call, so
+     * a single read() would strand any additional queued siginfo records
+     * (e.g. a SIGTERM arriving while a SIGCHLD is already pending) until
+     * some later, unrelated wakeup.
+     */
+    for ( ;; ) {
+        n = read(ev->fd, &sfd, sizeof(struct signalfd_siginfo));
+        err = (n == -1) ? nxt_errno : 0;
 
-    nxt_debug(task, "read signalfd(%d): %d", ev->fd, n);
+        nxt_debug(task, "read signalfd(%d): %d", ev->fd, n);
 
-    if (n != sizeof(struct signalfd_siginfo)) {
-        nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, nxt_errno);
-        return;
+        if (n != sizeof(struct signalfd_siginfo)) {
+            if (n == -1 && err == NXT_EAGAIN) {
+                return;
+            }
+
+            nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, err);
+            return;
+        }
+
+        nxt_debug(task, "signalfd(%d) signo:%d", ev->fd, sfd.ssi_signo);
+
+        handler(task, (void *) (uintptr_t) sfd.ssi_signo, NULL);
     }
-
-    nxt_debug(task, "signalfd(%d) signo:%d", ev->fd, sfd.ssi_signo);
-
-    handler(task, (void *) (uintptr_t) sfd.ssi_signo, NULL);
 }
 
 #endif
@@ -655,7 +698,7 @@ nxt_io_uring_free(nxt_event_engine_t *engine)
         nxt_alert(&engine->task, "eventfd close(%d) failed %E", fd, nxt_errno);
     }
 
-    if (iou->tier != NXT_IOU_TIER_NONE) {
+    if (iou->ring_inited) {
         io_uring_queue_exit(&iou->ring);
     }
 
@@ -673,6 +716,15 @@ nxt_io_uring_slot(nxt_event_engine_t *engine, nxt_fd_t fd)
     nxt_io_uring_engine_t  *iou;
 
     iou = &engine->u.io_uring;
+
+    /*
+     * A negative fd (closed/reset socket) must not reach the table: cast to
+     * uint32_t it would pass the grow check and then shrink the table to one
+     * slot and index it out of bounds.  Callers all tolerate NULL.
+     */
+    if (nxt_slow_path(fd < 0)) {
+        return NULL;
+    }
 
     if (nxt_slow_path((uint32_t) fd >= iou->nslots)) {
 
@@ -781,7 +833,7 @@ static nxt_bool_t
 nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t dir,
     nxt_bool_t multishot)
 {
-    uint16_t             gen;
+    uint32_t             gen;
     uint32_t             mask;
     struct io_uring_sqe  *sqe;
     nxt_io_uring_slot_t  *slot;
@@ -870,7 +922,7 @@ static void
 nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
     nxt_uint_t dir)
 {
-    uint16_t             gen;
+    uint32_t             gen;
     nxt_io_uring_slot_t  *slot;
 
     slot = nxt_io_uring_slot(engine, ev->fd);
@@ -888,7 +940,18 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
      * retried from nxt_io_uring_poll() under the pre-bump generation, so the
      * leaked kernel poll's file reference is dropped even after a close/reuse.
      */
+    /*
+     * Any disable/delete/close/oneshot on a direction invalidates a re-arm
+     * owed for it (nxt_io_uring_arm_pend): the direction is no longer wanted,
+     * so drop the pending record before it is retried.  Cleared up front so
+     * the !armed early-return below cannot skip it.
+     */
     if (dir == NXT_IOU_DIR_READ) {
+        if (slot->read_arm_pending) {
+            slot->read_arm_pending = 0;
+            engine->u.io_uring.npending_arms--;
+        }
+
         if (!slot->read_armed) {
             slot->read_generation++;
             return;
@@ -898,6 +961,11 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
         slot->read_generation++;
 
     } else {
+        if (slot->write_arm_pending) {
+            slot->write_arm_pending = 0;
+            engine->u.io_uring.npending_arms--;
+        }
+
         if (!slot->write_armed) {
             slot->write_generation++;
             return;
@@ -951,7 +1019,7 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
  */
 
 static nxt_bool_t
-nxt_io_uring_submit_remove(nxt_event_engine_t *engine, nxt_fd_t fd, uint16_t gen,
+nxt_io_uring_submit_remove(nxt_event_engine_t *engine, nxt_fd_t fd, uint32_t gen,
     nxt_uint_t dir)
 {
     struct io_uring_sqe  *sqe;
@@ -1011,10 +1079,152 @@ nxt_io_uring_retry_pending_removes(nxt_event_engine_t *engine)
 }
 
 
+/*
+ * Record a re-arm (POLL_ADD) that could not get an SQE so nxt_io_uring_poll()
+ * can retry it.  Used only for a still-wanted direction whose re-arm failed on
+ * SQ exhaustion (a transient condition): escalating such a failure through
+ * nxt_io_uring_error() would be swallowed by its per-drain dedupe (the fd
+ * already dispatched a handler this drain) and strand the direction ACTIVE with
+ * no poller -- silent listener death, or a stalled connection.  The flag guard
+ * keeps npending_arms from double-counting.
+ */
+
+static void
+nxt_io_uring_arm_pend(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
+    nxt_uint_t dir)
+{
+    if (dir == NXT_IOU_DIR_READ) {
+        if (!slot->read_arm_pending) {
+            slot->read_arm_pending = 1;
+            engine->u.io_uring.npending_arms++;
+        }
+
+    } else {
+        if (!slot->write_arm_pending) {
+            slot->write_arm_pending = 1;
+            engine->u.io_uring.npending_arms++;
+        }
+    }
+}
+
+
+/*
+ * Retry, at the top of nxt_io_uring_poll(), the re-arms that could not get an
+ * SQE (nxt_io_uring_arm_pend).  Gated by npending_arms so the scan never runs in
+ * steady state.  The retry arms under the *current* generation exactly like a
+ * fresh arm, which is correct: a disable/delete/close/oneshot in the meantime
+ * would have cleared the record (nxt_io_uring_remove), so a surviving record
+ * still refers to the same wanted arming.  The re-check (ev still present and
+ * the direction still wanted and not already armed) is belt-and-braces against
+ * a record that outlived its direction.  The previous iteration's
+ * submit_and_wait flushed the SQ, so in practice an SQE is available here and
+ * the arm rides this iteration's submit; a still-exhausted SQ leaves the record
+ * for the next iteration (mirrors the pending-removes recovery).
+ */
+
+static void
+nxt_io_uring_retry_pending_arms(nxt_event_engine_t *engine)
+{
+    uint32_t               fd;
+    nxt_fd_event_t         *ev;
+    nxt_io_uring_slot_t    *slot;
+    nxt_io_uring_engine_t  *iou;
+
+    iou = &engine->u.io_uring;
+
+    for (fd = 0; fd < iou->nslots && iou->npending_arms != 0; fd++) {
+        slot = &iou->slots[fd];
+
+        if (slot->read_arm_pending) {
+            ev = slot->ev;
+
+            if (ev == NULL
+                || ev->read == NXT_EVENT_INACTIVE
+                || ev->read == NXT_EVENT_DISABLED
+                || slot->read_armed
+                || nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ,
+                                    slot->read_multishot))
+            {
+                slot->read_arm_pending = 0;
+                iou->npending_arms--;
+            }
+        }
+
+        if (slot->write_arm_pending) {
+            ev = slot->ev;
+
+            if (ev == NULL
+                || ev->write == NXT_EVENT_INACTIVE
+                || ev->write == NXT_EVENT_DISABLED
+                || slot->write_armed
+                || nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_WRITE, 1))
+            {
+                slot->write_arm_pending = 0;
+                iou->npending_arms--;
+            }
+        }
+    }
+}
+
+
+/*
+ * Self-heal a slot whose fd number was closed and reused without the engine
+ * being told to cancel the previous owner's poll.  Connection fds are torn
+ * down through nxt_fd_event_close() (nxt_conn_close), which reaches this
+ * engine's close/delete and POLL_REMOVEs the poll; port fds, however, are
+ * closed raw (nxt_port_close/nxt_port_read_close call nxt_socket_close/
+ * nxt_fd_close directly), which is harmless for epoll -- the kernel drops a
+ * closed fd from the epoll set -- but leaves an io_uring multishot poll armed
+ * with slot->ev pointing at the freed event and the generation un-bumped.
+ * When the fd number is then reused for a new event, enable_* would see the
+ * stale armed flag and skip arming, stranding the new event's readiness.
+ *
+ * Detect the reuse (slot->ev set to a *different* event on the same fd) and
+ * condemn both directions of the stale arming: nxt_io_uring_remove bumps the
+ * generation -- so any CQE still produced by the old poll is rejected -- and
+ * POLL_REMOVEs the leaked kernel poll on the old file.  arm() then installs a
+ * fresh poll under the new generation and repoints slot->ev.
+ *
+ * Residual (documented, not closed here): a CQE that lands on the raw-closed
+ * fd *before* the reuse can still write to / dispatch through the stale
+ * slot->ev.  Fully closing that window requires the port teardown to
+ * deregister from the engine, which cannot be done safely from
+ * nxt_port_close() because a port may be closed from a thread other than the
+ * one that owns its engine's ring (the router already posts cross-thread port
+ * work via nxt_event_engine_post for exactly this reason); it is left as a
+ * follow-up (a thread-safe port deregistration posted to port->engine).
+ */
+
+static void
+nxt_io_uring_slot_reconcile(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
+{
+    nxt_io_uring_slot_t  *slot;
+
+    slot = nxt_io_uring_slot(engine, ev->fd);
+
+    if (slot == NULL || slot->ev == NULL || slot->ev == ev) {
+        return;
+    }
+
+    if (slot->read_armed || slot->write_armed
+        || slot->read_arm_pending || slot->write_arm_pending)
+    {
+        nxt_debug(ev->task, "io_uring stale slot reuse fd:%d", ev->fd);
+
+        nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_READ);
+        nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_WRITE);
+    }
+
+    slot->ev = NULL;
+}
+
+
 static void
 nxt_io_uring_enable(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_io_uring_slot_t  *slot;
+
+    nxt_io_uring_slot_reconcile(engine, ev);
 
     ev->read = NXT_EVENT_ACTIVE;
     ev->write = NXT_EVENT_ACTIVE;
@@ -1107,6 +1317,8 @@ nxt_io_uring_enable_read(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_io_uring_slot_t  *slot;
 
+    nxt_io_uring_slot_reconcile(engine, ev);
+
     slot = nxt_io_uring_slot(engine, ev->fd);
     if (nxt_slow_path(slot == NULL)) {
         nxt_io_uring_arm_failed(engine, ev);
@@ -1133,6 +1345,8 @@ static void
 nxt_io_uring_enable_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_io_uring_slot_t  *slot;
+
+    nxt_io_uring_slot_reconcile(engine, ev);
 
     slot = nxt_io_uring_slot(engine, ev->fd);
     if (nxt_slow_path(slot == NULL)) {
@@ -1262,6 +1476,8 @@ nxt_io_uring_enable_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_io_uring_slot_t  *slot;
 
+    nxt_io_uring_slot_reconcile(engine, ev);
+
     ev->read = NXT_EVENT_ACTIVE;
 
     slot = nxt_io_uring_slot(engine, ev->fd);
@@ -1365,6 +1581,10 @@ nxt_io_uring_poll(nxt_event_engine_t *engine, nxt_msec_t timeout)
         nxt_io_uring_retry_pending_removes(engine);
     }
 
+    if (nxt_slow_path(iou->npending_arms != 0)) {
+        nxt_io_uring_retry_pending_arms(engine);
+    }
+
     if (nxt_slow_path(iou->post_rearm_pending)) {
         struct io_uring_sqe  *sqe;
 
@@ -1423,7 +1643,21 @@ nxt_io_uring_poll(nxt_event_engine_t *engine, nxt_msec_t timeout)
 
     nxt_thread_time_update(engine->task.thread);
 
-    if (ret < 0 && ret != -ETIME && ret != -EINTR && ret != -EAGAIN) {
+    /*
+     * -ETIME (deadline), -EINTR (signal) and -EAGAIN (transient) all just mean
+     * "no wait satisfied"; there may still be completions to drain, so fall
+     * through.  -EBUSY is load-bearing: with IORING_FEAT_NODROP the kernel
+     * returns it when the CQ ring is full and refuses to submit more (which
+     * could generate yet more completions) until it is drained -- returning
+     * here without draining would livelock (the CQ never empties, every
+     * subsequent submit_and_wait re-hits -EBUSY).  So drain the visible CQEs
+     * (which frees CQ space) and let the next iteration re-submit the batch
+     * liburing still holds queued.  Only a genuinely unexpected negative return
+     * is fatal.
+     */
+    if (ret < 0
+        && ret != -ETIME && ret != -EINTR && ret != -EAGAIN && ret != -EBUSY)
+    {
         nxt_alert(&engine->task, "io_uring_submit_and_wait_timeout() failed %E",
                   -ret);
         return;
@@ -1439,6 +1673,8 @@ nxt_io_uring_poll(nxt_event_engine_t *engine, nxt_msec_t timeout)
     iou->drain_seq++;
 
     io_uring_for_each_cqe(&iou->ring, head, cqe) {
+        nxt_debug(&engine->task, "io_uring cqe ud:%uxL res:%d flags:%uxD",
+                  (uint64_t) cqe->user_data, cqe->res, cqe->flags);
         nxt_io_uring_handle_cqe(engine, cqe);
         count++;
     }
@@ -1455,7 +1691,7 @@ static void
 nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
 {
     int                    res;
-    uint16_t               gen;
+    uint32_t               gen;
     uint32_t               idx, mask;
     uint64_t               ud;
     nxt_uint_t             dir;
@@ -1482,12 +1718,12 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
 
     /* Reject completions for a stale (disabled/closed) arming. */
     if (dir == NXT_IOU_DIR_READ) {
-        if (gen != slot->read_generation) {
+        if (gen != nxt_iou_gen(slot->read_generation)) {
             return;
         }
 
     } else {
-        if (gen != slot->write_generation) {
+        if (gen != nxt_iou_gen(slot->write_generation)) {
             return;
         }
     }
@@ -1516,15 +1752,42 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
     }
 
     if (res < 0) {
-        /* -ECANCELED/-EBADF/-ENOENT after a remove or close: fd is gone. */
-        if (res == -ECANCELED || res == -EBADF || res == -ENOENT) {
+
+#if (NXT_HAVE_SIGNALFD)
+        /*
+         * The signalfd is armed as an ordinary fd poll but has no
+         * error_handler (nxt_io_uring_error would tear it down to INACTIVE and
+         * never re-arm, blocking signal delivery for the process's lifetime).
+         * A poll error is almost always transient, so self-heal: re-arm the
+         * multishot read poll (the !more branch above already cleared
+         * read_armed), deferring to the pending-arm retry if no SQE is free,
+         * and alert so a persistent failure is visible.
+         */
+        if (ev == &engine->u.io_uring.signalfd) {
+            nxt_alert(&engine->task, "io_uring signalfd(%d) poll failed %E, "
+                      "re-arming", ev->fd, -res);
+
+            if (!slot->read_armed
+                && nxt_slow_path(!nxt_io_uring_arm(engine, ev,
+                                                   NXT_IOU_DIR_READ, 1)))
+            {
+                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ);
+            }
+
             return;
         }
+#endif
 
         /*
-         * The poll operation itself failed (not a socket-readiness error):
-         * treat the fd as dead and hand it to its error_handler exactly once,
-         * deduped across both direction pollers (see nxt_io_uring_error).
+         * A current-generation res<0 is a genuine poll failure, never a
+         * self-inflicted cancel: every POLL_REMOVE this engine issues -- the
+         * immediate one in nxt_io_uring_remove and the deferred retry from
+         * nxt_io_uring_poll -- targets the *pre-bump* generation, so a
+         * -ECANCELED/-EBADF/-ENOENT produced by one of our own cancels carries
+         * the stale generation and was already dropped by the generation gate
+         * above.  What reaches here is a real error on a live arming: treat the
+         * fd as dead and hand it to its error_handler exactly once, deduped
+         * across both direction pollers (see nxt_io_uring_error).
          */
         ev->error = -res;
 
@@ -1588,6 +1851,13 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
          * nxt_io_uring_error(), which dedupes the two pollers' error CQEs so a
          * socket error never runs both direction handlers -- the second on
          * state the first handler may already have freed.
+         *
+         * The dispatch gate also skips this fd if an error_handler was already
+         * queued for it this drain (error_seq): the error CQE and this readiness
+         * CQE arrive on independent pollers in arbitrary order, and epoll's
+         * single per-fd event never runs a readiness handler *after* the error
+         * handler queued for the same fd -- doing so here would dispatch onto a
+         * connection the error_handler may free first.
          */
         if (mask & POLLIN) {
             ev->read_ready = 1;
@@ -1603,7 +1873,8 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
             }
 
             if (ev->read != NXT_EVENT_INACTIVE
-                && slot->read_seq != engine->u.io_uring.drain_seq)
+                && slot->read_seq != engine->u.io_uring.drain_seq
+                && slot->error_seq != engine->u.io_uring.drain_seq)
             {
                 slot->read_seq = engine->u.io_uring.drain_seq;
 
@@ -1629,9 +1900,15 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
          * whose handler never calls enable_read.  The slot's recorded mode
          * keeps listen sockets non-multishot.  A oneshot (now DISABLED) or
          * a disabled direction is left alone.  If the re-arm cannot get an
-         * SQE, escalate to the error_handler so the direction is not stranded
-         * ACTIVE with no poller (nxt_io_uring_error self-dedupes, so an fd that
-         * already dispatched a handler this drain is left to that handler).
+         * SQE (transient SQ exhaustion), record it for retry from the poll
+         * loop rather than escalating: escalation goes through
+         * nxt_io_uring_error(), which self-dedupes and would swallow this call
+         * whenever the fd already dispatched a read handler this drain (the
+         * common case for a listen POLL_ADD whose CQE we just dispatched),
+         * leaving the listener ACTIVE with no poller -- it silently stops
+         * accepting.  The pending-arm retry re-issues the POLL_ADD next
+         * iteration instead of killing a healthy listener for a transient
+         * exhaustion.
          */
         if (!more
             && ev->read != NXT_EVENT_INACTIVE
@@ -1640,7 +1917,7 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
             if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ,
                                                 slot->read_multishot)))
             {
-                nxt_io_uring_error(engine, slot, ev);
+                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ);
             }
         }
 
@@ -1664,7 +1941,8 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
             }
 
             if (ev->write != NXT_EVENT_INACTIVE
-                && slot->write_seq != engine->u.io_uring.drain_seq)
+                && slot->write_seq != engine->u.io_uring.drain_seq
+                && slot->error_seq != engine->u.io_uring.drain_seq)
             {
                 slot->write_seq = engine->u.io_uring.drain_seq;
 
@@ -1690,7 +1968,7 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
             if (nxt_slow_path(!nxt_io_uring_arm(engine, ev,
                                                 NXT_IOU_DIR_WRITE, 1)))
             {
-                nxt_io_uring_error(engine, slot, ev);
+                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_WRITE);
             }
         }
     }

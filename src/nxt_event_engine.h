@@ -239,10 +239,32 @@ extern const nxt_event_interface_t  nxt_epoll_level_engine;
 typedef struct {
     /* The event owning this fd's pollers; recovered in the CQE handler. */
     nxt_fd_event_t                *ev;
-    uint16_t                      read_generation;
-    uint16_t                      write_generation;
+
+    /*
+     * Per-direction stale-CQE generation.  32 bits wide (the full width of the
+     * generation field packed into user_data, see nxt_iou_ud) so a wrap needs
+     * 2^32 disable/enable cycles on one long-lived fd number -- unreachable for
+     * any realistic churn, closing the theoretical stale-CQE aliasing window a
+     * 14-bit counter left open.
+     */
+    uint32_t                      read_generation;
+    uint32_t                      write_generation;
     uint8_t                       read_armed;      /* R poll live in kernel   */
     uint8_t                       write_armed;     /* W poll live in kernel   */
+
+    /*
+     * A re-arm (POLL_ADD) could not get an SQE (SQ ring exhausted).  Unlike a
+     * failed initial arm -- which escalates to the error_handler -- a failed
+     * *re-arm* of a still-wanted direction (e.g. the per-batch listen POLL_ADD,
+     * or a kernel-dropped multishot) must retry rather than tear down: escalating
+     * it silently dies inside nxt_io_uring_error()'s per-drain dedupe (the fd
+     * already dispatched a handler this drain), leaving the direction ACTIVE with
+     * no poller.  Recorded here and retried from nxt_io_uring_poll() under the
+     * *current* generation (a deferred re-arm is identical to arming fresh);
+     * cleared by any disable/delete/close/oneshot on the direction.
+     */
+    uint8_t                       read_arm_pending;
+    uint8_t                       write_arm_pending;
 
     /*
      * A POLL_REMOVE for a still-live kernel poll could not get an SQE (SQ ring
@@ -256,8 +278,8 @@ typedef struct {
      */
     uint8_t                       read_remove_pending;
     uint8_t                       write_remove_pending;
-    uint16_t                      read_remove_gen;
-    uint16_t                      write_remove_gen;
+    uint32_t                      read_remove_gen;
+    uint32_t                      write_remove_gen;
 
     /*
      * Arming mode of the live R poll: 1 = multishot (conn fds), 0 = single
@@ -303,6 +325,14 @@ typedef struct {
      */
     uint8_t                       post_rearm_pending;
 
+    /*
+     * The ring was io_uring_queue_init()ed and must be io_uring_queue_exit()ed
+     * on free.  Tracked separately from the tier: setup() can fail between a
+     * successful queue_init and the tier assignment (feature gates), and free()
+     * keyed on the tier would leak the ring fd and its mmaps.
+     */
+    uint8_t                       ring_inited;
+
     /* Side table of pollers, indexed by fd; grown on demand. */
     nxt_io_uring_slot_t           *slots;
     uint32_t                      nslots;
@@ -316,6 +346,13 @@ typedef struct {
      * in nxt_io_uring_poll() so it stays off the hot path: zero in steady state.
      */
     uint32_t                      npending_removes;
+
+    /*
+     * Count of slot directions with a re-arm owed but not yet submitted (see
+     * nxt_io_uring_slot_t.read_arm_pending).  Gates the retry scan in
+     * nxt_io_uring_poll() so it stays off the hot path: zero in steady state.
+     */
+    uint32_t                      npending_arms;
 
     /* Current CQ-drain sequence; see nxt_io_uring_slot_t.read_seq. */
     uint64_t                      drain_seq;

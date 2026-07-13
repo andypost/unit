@@ -61,6 +61,39 @@
 #
 # NOTE: functional harness only. Real measurement runs are done serialized by the
 # coordinator; the numbers from a shared/loaded box are not measurement-grade.
+#
+# LIFECYCLE (process-tree ownership)
+#   Each unitd is spawned via `setsid` into its OWN session/process group, so the
+#   whole family (main + controller + router + app workers) can be signalled as a
+#   unit and can never be confused with the harness's own group or with unrelated
+#   unitd daemons on a shared box. The real main pid is read back from the pidfile
+#   (--pid <run>/unit.pid), NOT from $!, and the group id is written to
+#   <run>/unitd.pgid.
+#   Teardown is an escalation ladder keyed on the PGID, not the main pid: TERM the
+#   group, poll ~10s for it to empty, then KILL the group (loudly). This reaps the
+#   router/controller even when the main pid is already dead but children survive.
+#   Concurrency: each round holds an exclusive flock on "<run>.lock" for its
+#   whole lifetime. Two invocations sharing RUNBASE+labels compute the SAME
+#   deterministic run dir, so the pre-run sweep must never mistake a live
+#   sibling for a crash: it only runs once we hold the lock, and if a live
+#   invocation already holds it we skip the round instead of sweeping/deleting
+#   its tree. The kernel drops the lock when a process dies, so a CRASHED run
+#   leaves the file with a FREE lock — still reapable by the next invocation or
+#   an external sweeper.
+#   Sweeps are FINGERPRINTED to run dirs: a pre-run sweep reaps a prior crashed
+#   instance only if its pgid file lives in THIS run dir or a process cmdline
+#   references THIS run dir — never a bare `unitd` pattern — and every kill
+#   target must additionally have a unitd process image (/proc/<pid>/exe), so a
+#   mere observer of the run files can never be signalled. Ports held by anything
+#   else are still caught by the port_busy abort. A post-run leak assert scans
+#   the <run>/unitd.pgid files of THIS invocation's run dirs only (a concurrent
+#   invocation sharing RUNBASE owns its own groups), kills any survivor still
+#   FINGERPRINTED to its run dir via the ladder — including orphaned children
+#   whose argv unit rewrote to 'unit: <name>', recognized by unitd image +
+#   session id == recorded pgid WITH a vacant/zombie session-leader slot (a live
+#   pid==pgid means the id was recycled, so it is rejected) — and fails the run.
+#   pgid/lock files are intentionally left on disk after teardown so an external
+#   sweeper can reap orphans from a hard-killed harness.
 
 set -u
 
@@ -223,9 +256,23 @@ fi
 # Don't silently halve the matrix: a missing ab must abort unless the caller
 # explicitly opted out via --skip-ab/SKIP_AB=1.
 [ "$SKIP_AB" = 1 ] || [ "$HAVE_AB" = 1 ] || { echo "ab not found (use --skip-ab)" >&2; exit 2; }
+# pgrep/ps power every group-liveness and ownership check. Without pgrep,
+# group_alive() reports every live group as empty, so the kill ladder never
+# signals, the leak scan sees no survivors, and the whole unitd tree can be
+# left running with a green exit. Require them up front.
+for t in pgrep ps flock; do
+    command -v "$t" >/dev/null 2>&1 \
+        || { echo "$t not found (procps + util-linux are required for process-group" \
+                  "cleanup and per-run locking)" >&2; exit 2; }
+done
 
 # ---- state ------------------------------------------------------------------
-UNITD_PID=""
+UNITD_PID=""        # unitd main pid (read back from the pidfile, for pgrep -P)
+PGID=""             # process-group id of the current unitd session (kill target)
+RUN_CUR=""          # run dir of the currently-starting instance (orphan recovery)
+LOAD_PID=""         # active load-generator pid (oha/ab run backgrounded + wait)
+RUN_DIRS=()         # run dirs THIS invocation created (scopes the leak scan)
+RUN_LOCK_FD=""      # fd holding this round's per-run flock (live-vs-crashed marker)
 ROUTER=""
 declare -A ENGINE   # engine name per label
 
@@ -252,20 +299,251 @@ wait_port() {  # host-port timeout_s -> 0 when listening
     return 1
 }
 
-cleanup() {
-    if [ -n "$UNITD_PID" ] && kill -0 "$UNITD_PID" 2>/dev/null; then
-        kill "$UNITD_PID" 2>/dev/null
-        wait "$UNITD_PID" 2>/dev/null
+proc_state() {  # pid -> /proc state letter (R/S/D/T/Z/...) or empty if gone
+    # comm (field 2) can contain spaces and ')' — strip through the last ')'
+    # first, then the state is the next field.
+    sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $1}'
+}
+
+reap_child() {  # non-blocking reap of our own group leader if it became a zombie
+    # The setsid'd unitd is still our direct child, so after we kill it it lingers
+    # as a zombie until reaped — and a zombie keeps pgrep -g reporting the group as
+    # non-empty. Reap it ONLY when it is gone or Z, never wait on a live/stopped
+    # process (that would block the ladder, defeating the timeout budget).
+    [ -n "$UNITD_PID" ] || return 0
+    local st; st=$(proc_state "$UNITD_PID")
+    if [ -z "$st" ] || [ "$st" = Z ]; then
+        wait "$UNITD_PID" 2>/dev/null || true
     fi
+    return 0
+}
+
+group_alive() {  # pgid -> 0 if any NON-zombie process remains in the group
+    local pgid=$1 p st
+    for p in $(pgrep -g "$pgid" 2>/dev/null); do
+        st=$(proc_state "$p")
+        [ "$st" = Z ] && continue   # a zombie is already dead; it holds nothing
+        [ -z "$st" ] && continue    # vanished between pgrep and the read
+        return 0
+    done
+    return 1
+}
+
+proc_is_unitd() {  # pid -> 0 if the process image is a unitd binary
+    # Sweeps and ownership tests must only ever treat REAL unitd processes as
+    # evidence/targets: a cmdline match alone also hits innocent observers —
+    # e.g. `tail -f <run>/unitd.pgid` contains both "unitd" and the run path.
+    # /proc/<pid>/exe names the true image regardless of unit's argv rewriting;
+    # tolerate the "(deleted)" suffix from a rebuilt build dir.
+    local exe
+    exe=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1
+    case "$exe" in
+        */unitd|*/unitd\ \(deleted\)) return 0 ;;
+    esac
+    return 1
+}
+
+group_owns_run() {  # pgid run -> 0 if the group is provably OUR unitd tree
+    # A numeric pgid read from a *.pgid file can name a group whose id was recycled
+    # by an UNRELATED process after our clean teardown (pgid files are left on disk
+    # on purpose, so a later run still finds them). Signalling on group_alive()
+    # alone would then kill a stranger's group and report a false leak. Ownership
+    # therefore needs BOTH a unitd process image and a tie to THIS run:
+    #  - the main process keeps the run dir visible: unit rewrites its title to
+    #    'unit: main vX [<full original argv>]' (src/nxt_main_process.c), so
+    #    --pid <run>/unit.pid etc. stay in /proc cmdline;
+    #  - an ORPHANED child (main died first) does not: unit rewrites child argv
+    #    to 'unit: <router|controller|app>' (src/nxt_process.c) with no run-dir
+    #    reference. But the child kept the session created by our setsid spawn,
+    #    so SID == PGID == main pid. Accepting that alone is unsafe: the numeric
+    #    pgid can be reused as the pid of an UNRELATED setsid'd unitd (also
+    #    SID==PGID). Distinguish by the group/session-LEADER slot (pid == pgid):
+    #    the kernel keeps a pgid reserved while the group is non-empty, so the
+    #    number cannot become a new pid until our last member exits. A LIVE
+    #    process at pid==pgid therefore means the id was recycled (reject); a
+    #    vacant or zombie leader with surviving members is our crashed tree.
+    local pgid=$1 run=$2 p sid lst
+    [ -n "$run" ] || return 1
+    for p in $(pgrep -g "$pgid" 2>/dev/null); do
+        proc_is_unitd "$p" || continue
+        grep -qaF -- "$run" "/proc/$p/cmdline" 2>/dev/null && return 0
+        sid=$(ps -o sid= -p "$p" 2>/dev/null | tr -d ' ')
+        if [ "$sid" = "$pgid" ]; then
+            lst=$(proc_state "$pgid")            # state of the session-leader pid
+            { [ -z "$lst" ] || [ "$lst" = Z ]; } && return 0
+        fi
+    done
+    return 1
+}
+
+kill_pgid() {  # pgid -> TERM/poll/KILL escalation ladder, scoped to that group
+    local pgid=$1
+    # Guard hard: never `kill -- -` with an empty/invalid group, and never a
+    # low/reserved id. The setsid session id equals the leader pid, so this can
+    # never be the harness's own group.
+    case "$pgid" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$pgid" -gt 1 ] || return 0
+    reap_child
+    group_alive "$pgid" || return 0
+    kill -TERM -- "-$pgid" 2>/dev/null
+    local i=0
+    while [ "$i" -lt 50 ]; do                 # ~10s at 0.2s steps
+        reap_child
+        group_alive "$pgid" || return 0
+        i=$((i+1)); sleep 0.2
+    done
+    echo "cleanup: process group $pgid survived TERM after ~10s; sending KILL" >&2
+    kill -KILL -- "-$pgid" 2>/dev/null
+    local j=0
+    while [ "$j" -lt 25 ]; do                 # ~5s for the KILL to settle
+        reap_child
+        group_alive "$pgid" || return 0
+        j=$((j+1)); sleep 0.2
+    done
+    group_alive "$pgid" \
+        && echo "cleanup: process group $pgid STILL has survivors after KILL" >&2
+    return 0
+}
+
+resolve_pgid_from_run() {  # run -> sets UNITD_PID/PGID from pidfile, writes pgid
+    local run=$1 main pgid
+    [ -n "$run" ] || return 1
+    [ -s "$run/unit.pid" ] || return 1
+    main=$(tr -d ' \t\r\n' < "$run/unit.pid" 2>/dev/null)
+    case "$main" in ''|*[!0-9]*) return 1 ;; esac
+    pgid=$(ps -o pgid= -p "$main" 2>/dev/null | tr -d ' ')
+    case "$pgid" in ''|*[!0-9]*) return 1 ;; esac
+    UNITD_PID=$main
+    PGID=$pgid
+    echo "$pgid" > "$run/unitd.pgid" 2>/dev/null || true
+    return 0
+}
+
+cleanup() {
+    # First stop any load generator we may be mid-`wait` on: bash defers
+    # INT/TERM traps while a FOREGROUND child runs, so oha/ab are backgrounded
+    # and wait'ed (wait is interruptible). Without this kill, a signalled
+    # harness would tear the server down while the generator keeps hammering
+    # the dead ports for up to a full measurement of timeout waves.
+    if [ -n "$LOAD_PID" ] && kill -0 "$LOAD_PID" 2>/dev/null; then
+        kill "$LOAD_PID" 2>/dev/null
+        wait "$LOAD_PID" 2>/dev/null
+    fi
+    LOAD_PID=""
+    # Recover a pgid from the current run's pidfile if start_unitd failed before
+    # recording one, so a half-started (orphaned) tree is still reaped. A stale
+    # pidfile (KILL-escalated or crashed unitd never unlinks it) can name a
+    # RECYCLED pid though, so never signal a group resolved this way without
+    # proof it still owns the run dir.
+    if [ -z "$PGID" ] && [ -n "$RUN_CUR" ]; then
+        resolve_pgid_from_run "$RUN_CUR" 2>/dev/null || true
+        if [ -n "$PGID" ] && ! group_owns_run "$PGID" "$RUN_CUR"; then
+            UNITD_PID=""
+            PGID=""
+        fi
+    fi
+    if [ -n "$PGID" ]; then
+        kill_pgid "$PGID"
+    elif [ -n "$UNITD_PID" ] && kill -0 "$UNITD_PID" 2>/dev/null; then
+        kill "$UNITD_PID" 2>/dev/null
+    fi
+    reap_child
     UNITD_PID=""
+    PGID=""
+    # This run is dealt with: a LATER cleanup invocation (the EXIT trap fires
+    # after INT/TERM, or after the last round) must not re-resolve the same
+    # pidfile into a possibly-recycled pid and signal a stranger's group.
+    RUN_CUR=""
+    # Release this round's run-dir lock (closing the fd drops the flock) so a
+    # later invocation can reuse the dir and its own sweep sees the lock free.
+    if [ -n "$RUN_LOCK_FD" ]; then
+        exec {RUN_LOCK_FD}>&- 2>/dev/null
+        RUN_LOCK_FD=""
+    fi
 }
 # INT/TERM must EXIT, not just clean up: after the handler returns bash would
 # otherwise resume the script into later measurements with unitd already killed.
-# cleanup is idempotent (clears UNITD_PID), so the subsequent EXIT trap is a
+# cleanup is idempotent (clears UNITD_PID/PGID), so the subsequent EXIT trap is a
 # harmless no-op.
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
+
+acquire_run_lock() {  # run -> 0 if we now hold the exclusive lock; 1 if a LIVE invocation holds it
+    # Per-run exclusive flock, SIBLING to the run dir (claim_run_dir rm -rf's the
+    # dir itself, which would drop an in-dir lock and defeat the mutex). A live
+    # invocation holds this fd for the whole round; the kernel frees the lock
+    # when that process dies, so a CRASHED run leaves the file with a FREE lock
+    # (still reapable). This gates sweep_stale_run: we only ever sweep/claim a
+    # dir we could lock, so we can never TERM a concurrent invocation's live
+    # tree or rm -rf its live run dir (two invocations sharing RUNBASE + labels
+    # otherwise compute the same deterministic run dir).
+    local run=$1
+    local lock="$run.lock"   # split decl: `local a=$1 b=$a` trips set -u
+    mkdir -p "$(dirname "$lock")" 2>/dev/null || true
+    exec {RUN_LOCK_FD}>"$lock" 2>/dev/null || { RUN_LOCK_FD=""; return 1; }
+    if ! flock -n "$RUN_LOCK_FD"; then
+        exec {RUN_LOCK_FD}>&- 2>/dev/null
+        RUN_LOCK_FD=""
+        return 1
+    fi
+    return 0
+}
+
+sweep_stale_run() {  # run -> reap a prior crashed instance tied to THIS run dir
+    local run=$1
+    # Defensive: an empty run would turn the pattern kill into a bare `unitd`
+    # match against every daemon on the box.
+    [ -n "$run" ] || return 0
+    local swept=0
+
+    # 1) pgid file left behind by a previous (crashed/hard-killed) run
+    if [ -f "$run/unitd.pgid" ]; then
+        local oldpgid
+        oldpgid=$(tr -d ' \t\r\n' < "$run/unitd.pgid" 2>/dev/null)
+        case "$oldpgid" in
+            ''|*[!0-9]*) ;;
+            *)
+                if group_alive "$oldpgid" && group_owns_run "$oldpgid" "$run"; then
+                    echo "sweep: reaping stale process group $oldpgid from prior run $run" >&2
+                    kill_pgid "$oldpgid"
+                    swept=1
+                fi
+                ;;
+        esac
+    fi
+
+    # 2) processes whose cmdline still references THIS run dir (pgid file lost).
+    #    Enumerate unitd candidates with a FIXED-string cmdline confirm, never a
+    #    regex on $run: labels permit '.' and RUNBASE is caller-supplied, so
+    #    feeding the run path to `pgrep -f` as a pattern could match an unrelated
+    #    run (e.g. 'A.B-r1' matches 'AxB-r1') and this branch would kill a
+    #    stranger's group WITHOUT the group_owns_run check — or a stray metachar
+    #    in RUNBASE could break the pattern and miss a real leak. Confirm each
+    #    candidate literally, exactly the way group_owns_run does, AND require a
+    #    unitd process image: the cmdline of an innocent observer can contain
+    #    both "unitd" and the run path (e.g. `tail -f <run>/unitd.pgid`), and
+    #    signalling its group would kill an unrelated process tree.
+    local pids="" p g
+    for p in $(pgrep -f unitd 2>/dev/null); do
+        proc_is_unitd "$p" || continue
+        grep -qaF -- "$run" "/proc/$p/cmdline" 2>/dev/null && pids="$pids $p"
+    done
+    pids=${pids# }
+    if [ -n "$pids" ]; then
+        echo "sweep: reaping stale unitd process(es) [$pids] matching run dir $run" >&2
+        for p in $pids; do
+            g=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')
+            case "$g" in
+                ''|*[!0-9]*) kill -TERM "$p" 2>/dev/null ;;
+                *)           kill_pgid "$g" ;;
+            esac
+        done
+        swept=1
+    fi
+    [ "$swept" = 0 ] || echo "sweep: run dir $run cleared" >&2
+    return 0
+}
 
 router_cpu_ticks() {  # utime+stime of the router process; comm has a space
     # Default to 0 if the process vanished between checks: an empty value
@@ -394,32 +672,86 @@ detect_engine() {  # rundir -> engine name (or "unknown")
 }
 
 # ---- lifecycle --------------------------------------------------------------
+claim_run_dir() {  # run -> (re)create run dir; refuse to delete a foreign one
+    # RUNBASE is caller-supplied, so "$RUNBASE/<label>-r<n>" can collide with a
+    # pre-existing unrelated path; blindly rm -rf'ing it would destroy data the
+    # harness does not own. Only delete a directory that a bench-engines run
+    # created earlier, proven by its marker file (or an empty/absent path).
+    local run=$1
+    if [ -e "$run" ] && [ ! -f "$run/.bench-engines-run" ]; then
+        echo "run dir $run exists but has no bench-engines marker;" \
+             "refusing to delete it (point RUNBASE at a dedicated dir)" >&2
+        return 1
+    fi
+    rm -rf "$run"
+    mkdir -p "$run" || return 1
+    : > "$run/.bench-engines-run" || return 1
+    return 0
+}
+
 start_unitd() {  # label build run -> sets UNITD_PID, ROUTER, ENGINE[label]
     local label=$1 build=$2 run=$3 mods=$4
-    rm -rf "$run"; mkdir -p "$run" "$run/state" "$run/modules"
+    claim_run_dir "$run" || return 1
+    mkdir -p "$run/state" "$run/modules"
+    UNITD_PID=""; PGID=""; RUN_CUR="$run"
+    RUN_DIRS+=("$run")
     # AF_UNIX sun_path is ~108 bytes; unitd binds "<run>/control.sock.tmp" (+17).
     if [ "$(( ${#run} + 17 ))" -ge 108 ]; then
         echo "run path too long for AF_UNIX socket ($run); set a shorter RUNBASE" >&2
         return 1
     fi
-    # Pin the whole server tree at spawn (children inherit affinity); the
-    # later router re-pin is then just a no-op safety net.
-    # stderr must be captured: the main process logs the engine line before
-    # the log file is opened, so it only ever appears on stderr.
-    taskset -c "$SERVER_CORES" "$build/sbin/unitd" --no-daemon \
+    # setsid: give unitd its OWN session/process group so cleanup can signal the
+    # whole tree (main+controller+router+workers) as a unit, isolated from the
+    # harness's group and from unrelated daemons.
+    # Pin the whole server tree at spawn (children inherit affinity); the later
+    # router re-pin is then just a no-op safety net.
+    # stderr must be captured: the main process logs the engine line before the
+    # log file is opened, so it only ever appears on stderr.
+    setsid taskset -c "$SERVER_CORES" "$build/sbin/unitd" --no-daemon \
         --control "unix:$run/control.sock" \
         --pid "$run/unit.pid" --log "$run/unit.log" \
         --statedir "$run/state" --tmpdir "$run" \
         --modulesdir "$mods" \
         >/dev/null 2>"$run/stderr.log" &
-    UNITD_PID=$!
+    # $! may be the setsid wrapper (which forks-or-execs depending on group-leader
+    # status), so it is only trusted as a start-failure hint until the pidfile
+    # appears; the real main pid is read from the pidfile below.
+    local spawn_pid=$! main=""
+    # Fallback cleanup target BEFORE the pidfile exists. setsid runs the child in
+    # its OWN session with PID==PGID==SID (this is a non-job-control shell, so the
+    # child is not a group leader, setsid() succeeds and execs in place), so
+    # spawn_pid names the new group. Record it as the kill target NOW: if unitd
+    # hangs and never writes unit.pid or opens the control socket, PGID/UNITD_PID
+    # would otherwise both stay empty and neither cleanup nor the post-run leak
+    # scan (both key off <run>/unitd.pgid) could reap the leaked group. This can
+    # never be the harness's own group (spawn_pid is a child pid, != the shell's
+    # pid, and no group has id==spawn_pid until setsid creates it); a query before
+    # setsid runs simply finds no such group. resolve_pgid_from_run overwrites
+    # this with the authoritative pidfile-derived pgid once unitd is up.
+    PGID=$spawn_pid
+    echo "$spawn_pid" > "$run/unitd.pgid" 2>/dev/null || true
     # wait for the control socket instead of a bare sleep
     local i=0
     while [ ! -S "$run/control.sock" ] && [ "$i" -lt 100 ]; do
-        kill -0 "$UNITD_PID" 2>/dev/null || { echo "unitd died on start ($label)"; return 1; }
+        # Prefer the real pid the moment unitd writes its pidfile.
+        if [ -z "$main" ] && [ -s "$run/unit.pid" ]; then
+            main=$(tr -d ' \t\r\n' < "$run/unit.pid" 2>/dev/null)
+            case "$main" in *[!0-9]*) main="" ;; esac
+        fi
+        if [ -n "$main" ]; then
+            kill -0 "$main" 2>/dev/null || { echo "unitd died on start ($label)"; return 1; }
+        elif ! kill -0 "$spawn_pid" 2>/dev/null && [ ! -s "$run/unit.pid" ]; then
+            # spawn gone before any pidfile: a real early death (exec case). In the
+            # fork case the wrapper exits normally, so only trust this pre-pidfile.
+            echo "unitd died on start ($label)"; return 1
+        fi
         i=$((i+1)); sleep 0.1
     done
     [ -S "$run/control.sock" ] || { echo "no control socket ($label)"; return 1; }
+    # Resolve the authoritative main pid + process group from the pidfile and
+    # record the pgid for the cleanup ladder / external sweepers.
+    resolve_pgid_from_run "$run" \
+        || { echo "no valid main pid/pgid in pidfile ($label)"; return 1; }
     ENGINE[$label]=$(detect_engine "$run")
     return 0
 }
@@ -440,10 +772,17 @@ oha_one() {
     local ohaka=()
     [ "$ka" = 1 ] && ohaka=(-c "$c") || ohaka=(-c "$c" --disable-keepalive)
     if [ "$mode" = tree ]; then t0=$(tree_cpu_ticks); else t0=$(router_cpu_ticks); fi
+    # Backgrounded + wait, NOT foreground: bash defers INT/TERM traps while a
+    # foreground child runs, so a signalled harness would otherwise let the
+    # generator run out its full measurement before cleanup can start. wait is
+    # interruptible and cleanup kills $LOAD_PID.
     taskset -c "$LOAD_CORES" "$OHA" --no-tui --output-format json -t "$OHA_TIMEOUT" \
         -n "$n" "${ohaka[@]}" "$url" \
-        > "$js" 2>"$run/oha-$scen.err"
+        > "$js" 2>"$run/oha-$scen.err" &
+    LOAD_PID=$!
+    wait "$LOAD_PID"
     rc=$?
+    LOAD_PID=""
     if [ "$mode" = tree ]; then t1=$(tree_cpu_ticks); else t1=$(router_cpu_ticks); fi
     # Router mode: a crash/restart mid-measurement makes router_cpu_ticks default
     # to 0, yielding a bogus 0/negative CPU sample that would still pass. Fail if
@@ -487,9 +826,13 @@ ab_one() {
     local t0 t1 rc out="$run/ab-$scen.txt" extra=""
     [ "$ka" = 1 ] && extra="-k"
     if [ "$mode" = tree ]; then t0=$(tree_cpu_ticks); else t0=$(router_cpu_ticks); fi
+    # Backgrounded + wait for signal responsiveness; see oha_one.
     # shellcheck disable=SC2086
-    taskset -c "$LOAD_CORES" ab $extra -n "$n" -c "$c" -q "$url" > "$out" 2>&1
+    taskset -c "$LOAD_CORES" ab $extra -n "$n" -c "$c" -q "$url" > "$out" 2>&1 &
+    LOAD_PID=$!
+    wait "$LOAD_PID"
     rc=$?
+    LOAD_PID=""
     if [ "$mode" = tree ]; then t1=$(tree_cpu_ticks); else t1=$(router_cpu_ticks); fi
     # Router mode: a crash/restart mid-measurement makes router_cpu_ticks default
     # to 0, yielding a bogus 0/negative CPU sample that would still pass. Fail if
@@ -537,9 +880,13 @@ ab_one() {
 warmup_one() {  # run label tag url nreq conc
     local run=$1 label=$2 tag=$3 url=$4 n=$5 c=$6
     local rc rps p50 p99 failed js="$run/warmup-$tag.json"
+    # Backgrounded + wait for signal responsiveness; see oha_one.
     taskset -c "$LOAD_CORES" "$OHA" --no-tui --output-format json -t "$OHA_TIMEOUT" \
-        -n "$n" -c "$c" "$url" > "$js" 2>"$run/warmup-$tag.err"
+        -n "$n" -c "$c" "$url" > "$js" 2>"$run/warmup-$tag.err" &
+    LOAD_PID=$!
+    wait "$LOAD_PID"
     rc=$?
+    LOAD_PID=""
     IFS=$'\t' read -r rps p50 p99 failed < <(parse_oha "$js")
     if [ "$rc" -ne 0 ] || [ -z "$rps" ]; then
         echo "warmup failed: $label $tag (rc=$rc, see $run/warmup-$tag.err)" >&2
@@ -565,10 +912,21 @@ run_build_round() {
     mods="$build/lib/unit/modules"
     [ -d "$mods" ] || mods="$run/modules"
 
+    # Serialize against a CONCURRENT invocation using the same RUNBASE+labels
+    # (=> the same deterministic run dir): hold the exclusive per-run lock so the
+    # sweep below can only ever reap a CRASHED prior run, never a live sibling.
+    acquire_run_lock "$run" \
+        || { echo "run dir $run is locked by another live invocation; skipping round" >&2; return 1; }
+
+    # Reap any instance left in THIS run dir by a previously crashed/hard-killed
+    # harness before we probe the ports (an orphan holding them would otherwise
+    # trip the port_busy abort below on a run we can legitimately recover).
+    sweep_stale_run "$run"
+
     # refuse if ports busy (php port too: a bound $pphp would otherwise
     # degrade to the php SKIP path instead of aborting the round)
     for p in "$port" "$pport" "$pphp"; do
-        if port_busy "$p"; then echo "port $p busy, aborting" >&2; return 1; fi
+        if port_busy "$p"; then echo "port $p busy, aborting" >&2; cleanup; return 1; fi
     done
 
     echo "== round $rnd  build=$label ($build) engine-slot=$slot =="
@@ -577,6 +935,17 @@ run_build_round() {
     # trap only knows the LAST spawned pid.
     start_unitd "$label" "$build" "$run" "$mods" || { cleanup; return 1; }
 
+    # Engine revalidation: the preflight same-engine assertion ran ONCE, but
+    # ENGINE[$label] is re-detected on every start. A build that transiently
+    # falls back to another engine (or a build dir swapped mid-run) must fail
+    # the round instead of pooling foreign-engine samples under this label.
+    if [ -n "${EXPECT_ENGINE[$label]:-}" ] \
+       && [ "${ENGINE[$label]}" != "${EXPECT_ENGINE[$label]}" ]; then
+        echo "engine changed for $label: preflight='${EXPECT_ENGINE[$label]}'" \
+             "this round='${ENGINE[$label]}'" >&2
+        cleanup; return 1
+    fi
+
     # --- HTTP scenarios ---
     put_config_http "$run/control.sock" "$port" "$pport" "$run/conf-http.json" \
         || { echo "CONF FAILED $label"; cat "$run/conf-http.json"; cleanup; return 1; }
@@ -584,9 +953,12 @@ run_build_round() {
         || { echo "listener $port never came up"; cleanup; return 1; }
     pin_router "$run" || { cleanup; return 1; }
 
-    # warmup (validated: a cold/erroring warmup fails the round instead of
-    # silently preceding the first measurement)
-    warmup_one "$run" "$label" http "http://127.0.0.1:$port/" 2000 16 || meas_failed=1
+    # warmup (validated): a failed warmup means the warmed-state precondition
+    # for EVERY sample of this round does not hold — abort the round now
+    # instead of recording a full matrix of cold/erroring samples that sit in
+    # RESULTS looking like valid measurements.
+    warmup_one "$run" "$label" http "http://127.0.0.1:$port/" 2000 16 \
+        || { echo "warmup failed; aborting round for $label" >&2; cleanup; return 1; }
 
     # Collect measurement failures instead of aborting mid-round: the round
     # must still tear down cleanly, then report failure via FAILED_ROUNDS.
@@ -608,9 +980,15 @@ run_build_round() {
         root=$(ensure_phpapp) || root=""
         if [ -n "$root" ]; then
             if cleanup_http_reconfig "$run" "$pphp" "$root"; then
-                warmup_one "$run" "$label" php "http://127.0.0.1:$pphp/" 5000 8 || meas_failed=1
-                oha_one "$run" "$label" php_ka "http://127.0.0.1:$pphp/" "$N_PHP" 8 1 tree || meas_failed=1
-                ab_one  "$run" "$label" php_ka "http://127.0.0.1:$pphp/" "$N_PHP" 8 1 tree || meas_failed=1
+                # An unwarmed php scenario must not be measured either: skip
+                # its samples and fail the round (http samples above stand).
+                if warmup_one "$run" "$label" php "http://127.0.0.1:$pphp/" 5000 8; then
+                    oha_one "$run" "$label" php_ka "http://127.0.0.1:$pphp/" "$N_PHP" 8 1 tree || meas_failed=1
+                    ab_one  "$run" "$label" php_ka "http://127.0.0.1:$pphp/" "$N_PHP" 8 1 tree || meas_failed=1
+                else
+                    echo "php warmup failed for $label; skipping php measurements" >&2
+                    meas_failed=1
+                fi
             else
                 # module + app dir are BOTH present, so a config/listener
                 # failure is a real regression in this build, not a missing
@@ -661,6 +1039,9 @@ preflight_engine() {  # label build -> detects ENGINE[label], then kills
     local run="$RUNBASE/$label-preflight"
     local mods="$build/lib/unit/modules"
     [ -d "$mods" ] || mods="$run/modules"
+    acquire_run_lock "$run" \
+        || { echo "preflight: run dir $run is locked by another live invocation" >&2; return 1; }
+    sweep_stale_run "$run"
     start_unitd "$label" "$build" "$run" "$mods" || {
         echo "preflight: $label failed to start" >&2; cleanup; return 1; }
     cleanup
@@ -686,6 +1067,11 @@ elif [ "$EA" = "$EB" ]; then
         exit 1
     fi
 fi
+# Pin each label to its preflight-asserted engine: run_build_round compares the
+# per-start re-detection against this and fails the round on any mismatch.
+declare -A EXPECT_ENGINE
+EXPECT_ENGINE[$LABEL_A]=$EA
+EXPECT_ENGINE[$LABEL_B]=$EB
 
 # ---- main loop --------------------------------------------------------------
 FAILED_ROUNDS=0
@@ -706,11 +1092,38 @@ for r in $(seq 1 "$ROUNDS"); do
     fi
 done
 
+# ---- post-run leak assert ---------------------------------------------------
+# Every round tears its instance down via the pgid ladder, but assert it: scan
+# the pgid files left on disk and treat any surviving group as a run failure even
+# if all measurements succeeded. Kill survivors (again, via the ladder) so we do
+# not leave orphans behind, and force a non-zero exit below.
+# Scan ONLY the run dirs THIS invocation created: a concurrent invocation
+# sharing RUNBASE (different labels) has live, legitimately-owned unitd groups
+# under other dirs, and a glob over all of RUNBASE would report the first one
+# found as our leak and kill it mid-measurement.
+LEAKED=0
+UNITD_PID=""   # leak survivors are not our children; keep reap_child a no-op
+for rd in ${RUN_DIRS[@]+"${RUN_DIRS[@]}"}; do
+    pf="$rd/unitd.pgid"
+    [ -f "$pf" ] || continue
+    pg=$(tr -d ' \t\r\n' < "$pf" 2>/dev/null)
+    case "$pg" in ''|*[!0-9]*) continue ;; esac
+    if group_alive "$pg" && group_owns_run "$pg" "${pf%/unitd.pgid}"; then
+        echo "LEAK: process group $pg from ${pf%/unitd.pgid} still has survivors:" >&2
+        ps -o pid,pgid,cmd -g "$pg" >&2 2>/dev/null || true
+        kill_pgid "$pg"
+        LEAKED=1
+    fi
+done
+
 # ---- summary ----------------------------------------------------------------
 echo
 SUMMARIZER="$(dirname "$0")/bench-engines-report.py"
+# A summarizer failure must fail the run (below): automation would otherwise
+# read a clean exit off a benchmark whose reporting stage broke.
+SUMMARY_FAILED=0
 if [ "$HAVE_PY" = 1 ] && [ -f "$SUMMARIZER" ]; then
-    python3 "$SUMMARIZER" "$RESULTS" "$LABEL_A" "$LABEL_B"
+    python3 "$SUMMARIZER" "$RESULTS" "$LABEL_A" "$LABEL_B" || SUMMARY_FAILED=1
 else
     # inline awk fallback summary (mean only)
     echo "### summary (mean RPS, oha)"
@@ -719,6 +1132,11 @@ else
         key=$1" "$2; sum[key]+=rps; cnt[key]++
     } END{ for(k in sum) printf "  %s  mean_rps=%.0f (n=%d)\n", k, sum[k]/cnt[k], cnt[k] }' \
         "$RESULTS" | sort
+    # Snapshot the WHOLE pipeline status BEFORE any other command: the first
+    # test would otherwise reset PIPESTATUS, so the second element would read
+    # the test's status and flag a spurious failure on a clean awk|sort run.
+    sumstat=("${PIPESTATUS[@]}")
+    [ "${sumstat[0]}" = 0 ] && [ "${sumstat[1]}" = 0 ] || SUMMARY_FAILED=1
 fi
 
 # A failed round means incomplete/contaminated results: still print the
@@ -726,6 +1144,19 @@ fi
 # never mistakes this for a good A/B run.
 if [ "$FAILED_ROUNDS" -gt 0 ]; then
     echo "ERROR: $FAILED_ROUNDS build-round(s) failed; results are incomplete" >&2
+    exit 1
+fi
+
+# A leaked process group is a run failure even if every measurement passed.
+if [ "$LEAKED" -ne 0 ]; then
+    echo "ERROR: leaked unitd process group(s) survived teardown (see LEAK lines above)" >&2
+    exit 1
+fi
+
+# Nobody validated/printed the aggregate: the raw rows exist, but the run must
+# not look green when its summary stage failed.
+if [ "$SUMMARY_FAILED" -ne 0 ]; then
+    echo "ERROR: summary generation failed (raw rows remain in $RESULTS)" >&2
     exit 1
 fi
 

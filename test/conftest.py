@@ -291,6 +291,15 @@ def _register_pgid(pgid):
         _pgids.add(pgid)
 
 
+def _forget_pgid(p, pgid):
+    # Drop a pgid from the atexit/SIGTERM sweep set once its tree is confirmed
+    # gone: the kernel reuses pid/pgid numbers, and sweeping a stale entry at
+    # interpreter exit could TERM/KILL an unrelated process group that
+    # inherited the number (long --restart sessions make this reachable).
+    if pgid and not _group_alive(p, pgid):
+        _pgids.discard(pgid)
+
+
 def _signal_group(pgid, sig):
     # Guard hard: never signal group 0 (our OWN process group) or a
     # negative/empty/reserved id.  With start_new_session the leader pid equals
@@ -315,33 +324,30 @@ def _group_alive(p, pgid):
     if not pgid or pgid <= 1:
         return False
 
+    # Enumerate the group from /proc rather than pgrep: no subprocess per
+    # 0.2 s poll tick (this loop exists for slow builders), and no ambiguity
+    # between "pgrep found nothing" and "pgrep failed/absent" — a failure
+    # mistaken for an empty group would skip the TERM/KILL escalation and
+    # leak the tree.
     try:
-        pids = (
-            subprocess.check_output(
-                ['pgrep', '-g', str(pgid)], stderr=subprocess.DEVNULL
-            )
-            .decode()
-            .split()
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        # exit 1 == no process in the group; no pgrep == treat as gone
-        return False
-
-    for pid in pids:
-        # Read the state straight from /proc: this runs per pid per 0.2 s poll
-        # tick, and spawning a ps for each adds real load on exactly the slow
-        # builders the ladder timeouts exist for.  comm (field 2) may contain
-        # spaces and ')', so parse from the LAST ')'.
-        try:
-            stat = Path(f'/proc/{pid}/stat').read_text(
-                encoding='utf-8', errors='ignore'
-            )
-            state = stat[stat.rfind(')') + 1 :].split()[0]
-        except (OSError, IndexError):
-            continue
-
-        if not state.startswith('Z'):
-            return True
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit():
+                continue
+            try:
+                stat = Path(f'/proc/{entry}/stat').read_text(
+                    encoding='utf-8', errors='ignore'
+                )
+                # comm (field 2) may contain spaces and ')'; parse from the
+                # LAST ')'.  After it: state, ppid, pgrp, ...
+                fields = stat[stat.rfind(')') + 1 :].split()
+                if int(fields[2]) == pgid and not fields[0].startswith('Z'):
+                    return True
+            except (OSError, IndexError, ValueError):
+                continue
+    except OSError:
+        # /proc unavailable: assume alive so the ladder still signals the
+        # group (killpg needs no /proc); worst case is a full timeout wait.
+        return True
 
     return False
 
@@ -374,6 +380,15 @@ def _reap_group(p, pgid, timeout):
         time.sleep(0.2)
 
 
+# The reap handlers below must run ONLY in the pytest runner itself: with the
+# fork start method (the multiprocessing default on Linux through 3.13) the
+# helper children spawned by run_process inherit both the SIGTERM disposition
+# and _pgids, and stop_processes terminates those helpers with SIGTERM — a
+# helper running the sweep would TERM/KILL the still-active Unit tree
+# mid-session.
+_main_pid = os.getpid()
+
+
 @atexit.register
 def _reap_all_pgids():
     # Best-effort safety net for any group we spawned that is somehow still
@@ -382,19 +397,24 @@ def _reap_all_pgids():
     # handler — external containment is the D4 wrapper's job — but the
     # <temp_dir>/unitd.pgid file left on disk is the contract those external
     # sweepers consume.
+    if os.getpid() != _main_pid:
+        return
     for pgid in list(_pgids):
         try:
             _reap_group(None, pgid, timeout=3)
         except Exception:
             pass
+        _pgids.discard(pgid)
 
 
 def _sigterm_reap(signum, frame):
     # SIGTERM does not run atexit handlers, so drive the same best-effort reap
     # here, then restore the default disposition and re-raise so the runner
     # still dies from the signal.  SIGINT is already covered by pytest's
-    # KeyboardInterrupt path (see unit_stop).
-    _reap_all_pgids()
+    # KeyboardInterrupt path (see unit_stop).  Forked children re-raise
+    # without reaping (see _main_pid above).
+    if os.getpid() == _main_pid:
+        _reap_all_pgids()
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     os.kill(os.getpid(), signal.SIGTERM)
 
@@ -534,6 +554,7 @@ def unit_stop():
         # Main already exited — make sure no group member (router, controller,
         # app worker) lingers behind it.
         _reap_group(p, pgid, timeout=5)
+        _forget_pgid(p, pgid)
         return
 
     # Graceful shutdown first: SIGQUIT asks main to quit cleanly and reap its
@@ -547,12 +568,17 @@ def unit_stop():
     try:
         retcode = p.wait(stop_timeout)
         if retcode:
+            # Abnormal graceful shutdown can leave router/controller/app
+            # workers behind in the group; reap them before reporting.
+            _reap_group(p, pgid, timeout=5)
+            _forget_pgid(p, pgid)
             return f'Child process terminated with code {retcode}'
 
     except KeyboardInterrupt:
         # Ctrl-C mid-shutdown: reap the whole group before re-raising so we
         # never leak the unitd tree.
         _reap_group(p, pgid, timeout=5)
+        _forget_pgid(p, pgid)
         raise
 
     except subprocess.TimeoutExpired:
@@ -562,6 +588,10 @@ def unit_stop():
         _reap_group(p, pgid, timeout=5)
         if _group_alive(p, pgid):
             return 'Could not terminate unit'
+        _forget_pgid(p, pgid)
+        return
+
+    _forget_pgid(p, pgid)
 
 
 @print_log_on_assert
@@ -623,6 +653,9 @@ def _clear_temp_dir():
             'state',
             'unit.pid',
             'unit.log',
+            # the on-disk pgid contract for external sweepers; deleting it
+            # would leave a hard-killed runner's orphan tree unidentifiable
+            'unitd.pgid',
         ]:
 
             public_dir(item)

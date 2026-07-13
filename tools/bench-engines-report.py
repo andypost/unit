@@ -43,27 +43,28 @@ def parse(path):
     rows = defaultdict(lambda: defaultdict(list))
     skips = []
     engines = {}
-    for line in open(path):
-        f = line.split()
-        if len(f) >= 4 and f[2] == "SKIP":
-            skips.append((f[0], " ".join(f[3:])))
-            continue
-        if len(f) < 4 or "=" not in f[3]:
-            continue
-        label, scenario, tool = f[0], f[1], f[2]
-        kv = {}
-        for tok in f[3:]:
-            if "=" in tok:
-                k, v = tok.split("=", 1)
-                kv[k] = v
-        for m in ("rps", "p50ms", "p99ms", "failed", "cpu_us_per_req"):
-            v = kv.get(m)
-            try:
-                rows[(tool, scenario, label)][m].append(float(v))
-            except (TypeError, ValueError):
-                rows[(tool, scenario, label)][m].append(None)
-        if kv.get("engine"):
-            engines[label] = kv["engine"]
+    with open(path) as fp:
+        for line in fp:
+            f = line.split()
+            if len(f) >= 4 and f[2] == "SKIP":
+                skips.append((f[0], " ".join(f[3:])))
+                continue
+            if len(f) < 4 or "=" not in f[3]:
+                continue
+            label, scenario, tool = f[0], f[1], f[2]
+            kv = {}
+            for tok in f[3:]:
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    kv[k] = v
+            for m in ("rps", "p50ms", "p99ms", "failed", "cpu_us_per_req"):
+                v = kv.get(m)
+                try:
+                    rows[(tool, scenario, label)][m].append(float(v))
+                except (TypeError, ValueError):
+                    rows[(tool, scenario, label)][m].append(None)
+            if kv.get("engine"):
+                engines[label] = kv["engine"]
     return rows, skips, engines
 
 

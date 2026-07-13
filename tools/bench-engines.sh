@@ -12,8 +12,11 @@
 #
 # USAGE
 #   bench-engines.sh <labelA> <builddirA> <labelB> <builddirB> [rounds]
-#     rounds default 5. Builds are interleaved A/B/A/B across rounds to cancel
-#     thermal/cache drift.
+#     rounds default 4. Builds are interleaved within every round, and the
+#     order alternates per round (A/B, B/A, A/B, ...) so monotonic warmup or
+#     thermal drift cannot stay correlated with one build label. Keep rounds
+#     EVEN: with an odd count one build starts first more often than the
+#     other, so a repeatable position effect would not cancel out of the means.
 #
 #   ENV OVERRIDES
 #     RUNBASE=/path      base dir for per-run scratch (default under scratch/tmp)
@@ -26,6 +29,8 @@
 #     N_HIGH, N_LOW, N_CLOSE, N_PROXY, N_PHP   request counts (reproducibility knob)
 #     OHA_TIMEOUT=dur    per-request oha timeout (default 30s; e.g. 5s, 500ms)
 #     CURL_MAXTIME=secs  control-socket PUT transfer timeout (default 30)
+#     SERVER_CORES=list  taskset CPU list for the server tree (default 0-3)
+#     LOAD_CORES=list    taskset CPU list for the load generators (default 4-7)
 #
 #   FLAGS
 #     --allow-same       same as ALLOW_SAME=1
@@ -126,8 +131,46 @@ N_CLOSE=${N_CLOSE:-20000}
 N_PROXY=${N_PROXY:-50000}
 N_PHP=${N_PHP:-50000}
 
-SERVER_CORES=0-3
-LOAD_CORES=4-7
+# CPU partition: server tree vs load generators.  The defaults encode the
+# reference-box methodology (8 cores, 0-3/4-7); override via env on other
+# hosts.  Validate up front: on a smaller box or a cpuset-limited runner an
+# invalid list would otherwise fail every taskset invocation mid-run (or
+# silently record empty measurements).
+SERVER_CORES=${SERVER_CORES:-0-3}
+LOAD_CORES=${LOAD_CORES:-4-7}
+for cores in "$SERVER_CORES" "$LOAD_CORES"; do
+    if ! taskset -c "$cores" true 2>/dev/null; then
+        echo "cannot set CPU affinity '$cores' on this host" \
+             "(set SERVER_CORES/LOAD_CORES to available CPUs)" >&2
+        exit 2
+    fi
+done
+# The two masks must also be DISJOINT: any shared CPU makes the load generators
+# contend directly with the measured server tree, silently invalidating both
+# the RPS and the CPU-per-request comparison the partition exists to protect.
+expand_cores() {  # taskset CPU list -> one cpu id per line
+    # Handles every taskset list form: single "N", range "N-M", and strided
+    # range "N-M:S" (taskset(1): 0-31:2 = every 2nd cpu). Missing the stride
+    # form made a strided mask expand to NOTHING, so the disjoint check silently
+    # passed two overlapping strided masks.
+    local part range stride lo hi
+    echo "$1" | tr ',' '\n' | while IFS= read -r part; do
+        [ -n "$part" ] || continue
+        stride=1; range=$part
+        case "$part" in *:*) stride=${part##*:}; range=${part%:*} ;; esac
+        lo=${range%%-*}; hi=${range##*-}
+        case "$lo$hi$stride" in ''|*[!0-9]*) continue ;; esac
+        [ "$stride" -ge 1 ] || continue
+        seq "$lo" "$stride" "$hi"
+    done
+}
+CORE_OVERLAP=$(comm -12 <(expand_cores "$SERVER_CORES" | sort -u) \
+                        <(expand_cores "$LOAD_CORES" | sort -u) | tr '\n' ' ')
+if [ -n "${CORE_OVERLAP% }" ]; then
+    echo "SERVER_CORES ($SERVER_CORES) and LOAD_CORES ($LOAD_CORES) overlap" \
+         "on CPU(s) ${CORE_OVERLAP% }; the masks must be disjoint" >&2
+    exit 2
+fi
 
 mkdir -p "$RUNBASE"
 : > "$RESULTS"
@@ -153,7 +196,8 @@ port_busy() {  # port -> 0 if in use
     if command -v ss >/dev/null 2>&1; then
         ss -ltn "sport = :$1" 2>/dev/null | grep -q LISTEN
     else
-        (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3>&- 3<&-; return 0; }
+        # fd 3 lives only inside the subshell; nothing to close here
+        (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && return 0
         return 1
     fi
 }
@@ -164,7 +208,7 @@ wait_port() {  # host-port timeout_s -> 0 when listening
         if command -v ss >/dev/null 2>&1; then
             ss -ltn "sport = :$p" 2>/dev/null | grep -q LISTEN && return 0
         else
-            (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null && { exec 3>&- 3<&-; return 0; }
+            (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null && return 0
         fi
         i=$((i+1)); sleep 0.1
     done
@@ -181,15 +225,26 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 router_cpu_ticks() {  # utime+stime of the router process; comm has a space
-    sed 's/.*) //' "/proc/$ROUTER/stat" | awk '{print $12+$13}'
+    # Default to 0 if the process vanished between checks: an empty value
+    # would blow up the callers' $((...)) arithmetic.
+    local ticks
+    ticks=$(sed 's/.*) //' "/proc/$ROUTER/stat" 2>/dev/null | awk '{print $12+$13}')
+    echo "${ticks:-0}"
 }
 
 tree_cpu_ticks() {  # unitd main + all descendants (router + app workers)
-    local total=0 pid
+    # utime+stime of each live member PLUS its cutime+cstime: an app worker
+    # that exits mid-measurement is reaped by its parent, which folds the dead
+    # child's ticks into the parent's cutime/cstime. Without those fields a
+    # worker exit (or churn/replacement) removes its CPU from the t1 snapshot
+    # and the interval delta understates — or even goes negative. Live children
+    # are never in a parent's cutime, so nothing is double-counted.
+    local total=0 pid ticks
     for pid in $UNITD_PID $(pgrep -P "$UNITD_PID" 2>/dev/null) \
                $(pgrep -P "$UNITD_PID" 2>/dev/null | xargs -rn1 pgrep -P 2>/dev/null); do
         [ -r "/proc/$pid/stat" ] || continue
-        total=$((total + $(sed 's/.*) //' "/proc/$pid/stat" | awk '{print $12+$13}')))
+        ticks=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $12+$13+$14+$15}')
+        total=$((total + ${ticks:-0}))
     done
     echo "$total"
 }
@@ -350,10 +405,14 @@ ab_one() {
     # shellcheck disable=SC2086
     taskset -c "$LOAD_CORES" ab $extra -n "$n" -c "$c" -q "$url" > "$out" 2>&1
     if [ "$mode" = tree ]; then t1=$(tree_cpu_ticks); else t1=$(router_cpu_ticks); fi
-    local rps p99 failed us
+    local rps p99 failed non2xx us
     rps=$(awk '/Requests per second/{print $4}' "$out")
     p99=$(awk '/ 99%/{print $2}' "$out")
+    # ab reports HTTP-status failures on a separate "Non-2xx responses" line,
+    # NOT in "Failed requests"; count both or 5xx regressions record failed=0.
     failed=$(awk '/Failed requests/{print $3}' "$out")
+    non2xx=$(awk '/Non-2xx responses/{print $3}' "$out")
+    failed=$(( ${failed:-0} + ${non2xx:-0} ))
     us=$(LC_ALL=C awk -v a="$t0" -v b="$t1" -v clk="$CLK" -v n="$n" \
         'BEGIN{printf "%.2f", (b-a)*1000000/clk/n}')
     printf '%s %s ab rps=%s p50ms=NA p99ms=%s failed=%s cpu_us_per_req=%s engine=%s\n' \
@@ -380,13 +439,17 @@ run_build_round() {
     done
 
     echo "== round $rnd  build=$label ($build) engine-slot=$slot =="
-    start_unitd "$label" "$build" "$run" "$mods" || return 1
+    # Every early-failure return must run cleanup first, or the half-started
+    # unitd leaks: it holds the ports (aborting later rounds) and the EXIT
+    # trap only knows the LAST spawned pid.
+    start_unitd "$label" "$build" "$run" "$mods" || { cleanup; return 1; }
 
     # --- HTTP scenarios ---
     put_config_http "$run/control.sock" "$port" "$pport" "$run/conf-http.json" \
-        || { echo "CONF FAILED $label"; cat "$run/conf-http.json"; return 1; }
-    wait_port "$port" 10   || { echo "listener $port never came up"; return 1; }
-    pin_router "$run" || return 1
+        || { echo "CONF FAILED $label"; cat "$run/conf-http.json"; cleanup; return 1; }
+    wait_port "$port" 10 \
+        || { echo "listener $port never came up"; cleanup; return 1; }
+    pin_router "$run" || { cleanup; return 1; }
 
     # warmup
     taskset -c "$LOAD_CORES" "$OHA" --no-tui --output-format json -t "$OHA_TIMEOUT" -n 2000 -c 16 \
@@ -462,7 +525,7 @@ preflight_engine() {  # label build -> detects ENGINE[label], then kills
     local mods="$build/lib/unit/modules"
     [ -d "$mods" ] || mods="$run/modules"
     start_unitd "$label" "$build" "$run" "$mods" || {
-        echo "preflight: $label failed to start" >&2; return 1; }
+        echo "preflight: $label failed to start" >&2; cleanup; return 1; }
     cleanup
 }
 
@@ -488,10 +551,22 @@ elif [ "$EA" = "$EB" ]; then
 fi
 
 # ---- main loop --------------------------------------------------------------
+FAILED_ROUNDS=0
 for r in $(seq 1 "$ROUNDS"); do
-    # interleave A then B each round to cancel drift
-    run_build_round "$LABEL_A" "$BUILD_A" A "$r" || { echo "round $r A failed" >&2; }
-    run_build_round "$LABEL_B" "$BUILD_B" B "$r" || { echo "round $r B failed" >&2; }
+    # Interleave within the round AND alternate the order per round: with a
+    # fixed A-then-B order any monotonic warmup/thermal drift stays correlated
+    # with the build label; alternating puts each build in both positions.
+    if [ $((r % 2)) = 1 ]; then
+        run_build_round "$LABEL_A" "$BUILD_A" A "$r" \
+            || { echo "round $r A failed" >&2; FAILED_ROUNDS=$((FAILED_ROUNDS+1)); }
+        run_build_round "$LABEL_B" "$BUILD_B" B "$r" \
+            || { echo "round $r B failed" >&2; FAILED_ROUNDS=$((FAILED_ROUNDS+1)); }
+    else
+        run_build_round "$LABEL_B" "$BUILD_B" B "$r" \
+            || { echo "round $r B failed" >&2; FAILED_ROUNDS=$((FAILED_ROUNDS+1)); }
+        run_build_round "$LABEL_A" "$BUILD_A" A "$r" \
+            || { echo "round $r A failed" >&2; FAILED_ROUNDS=$((FAILED_ROUNDS+1)); }
+    fi
 done
 
 # ---- summary ----------------------------------------------------------------
@@ -507,6 +582,14 @@ else
         key=$1" "$2; sum[key]+=rps; cnt[key]++
     } END{ for(k in sum) printf "  %s  mean_rps=%.0f (n=%d)\n", k, sum[k]/cnt[k], cnt[k] }' \
         "$RESULTS" | sort
+fi
+
+# A failed round means incomplete/contaminated results: still print the
+# summary above for whatever data exists, but exit non-zero so automation
+# never mistakes this for a good A/B run.
+if [ "$FAILED_ROUNDS" -gt 0 ]; then
+    echo "ERROR: $FAILED_ROUNDS build-round(s) failed; results are incomplete" >&2
+    exit 1
 fi
 
 exit 0

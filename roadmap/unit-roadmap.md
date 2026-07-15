@@ -84,23 +84,32 @@ not here. The only actions left, all security-track owned:
 
 _Working state / resume notes live in `plan-finish-vectors.md` (maintainer-private, not committed)._
 
-### After 1.35.6 — where the next work goes (non-security)
+### After 1.36.0 — where the next work goes (non-security)
 
 With the security wave closed, the next cycle is **feature / platform work**.
-Pick from here (in rough priority), not from the security list above:
+Priority order (decided for the post-1.36 cycle):
 
-1. **Graceful shutdown / reload — finish the series.** #107/#108/#111 shipped the
-   signal split, listener drain, and the `active_connections` engine primitive.
-   Next are the server-initiated connection drain and `POST /reload` endpoint —
-   phases 5–7 of [plan-graceful-shutdown.md](plan-graceful-shutdown.md). Highest-
-   leverage because it unblocks PHP P6 / Python P7 / Ruby P7 reload.
-2. **"Design once" cross-cutting primitives** — status API, preload/warmup,
-   graceful reload, per-target env/venv (the table below) in the router /
-   controller / libunit layer so SAPIs stay thin.
-3. **Per-language modules** — PHP (ZTS pool, persistent worker), Python
-   (free-threaded 3.13t, subinterpreters), Ruby (Fiber scheduler, YJIT); see the
-   per-language docs.
-4. **Scheduler / `/run` endpoint** — [plan-run.md](plan-run.md).
+1. **★ FLAGSHIP — Graceful shutdown / reload: finish the series.** #107/#108/#111
+   shipped the signal split, listener drain, and the `active_connections` engine
+   primitive. Next are the server-initiated connection drain and `POST /reload`
+   endpoint — phases 5–7 of [plan-graceful-shutdown.md](plan-graceful-shutdown.md).
+   Highest-leverage because it unblocks PHP P6 / Python P7 / Ruby P7 reload. This
+   is the committed big rock for the cycle.
+2. **"Design once" cross-cutting primitives** (cheap, parallel) — X1 preload/warmup
+   and X2 status API first (~1 wk each, each unblocks three SAPIs), then X6
+   per-target env/venv. These fill around the flagship.
+3. **io_uring event engine (D0)** — land Stage 1 disabled-by-default (epoll
+   fallback keeps it zero-risk), then Stage 2 tiers; independent of the reload
+   track, so it can proceed in parallel as review bandwidth allows. Merge via
+   `andypost/unit` → upstream.
+4. **Quick-win debt** — #130 (Dockerfile template), `SUPPORT.md` prose (finishes
+   G1). Days, not weeks; clear early.
+5. **Per-language modules** — PHP (ZTS pool, persistent worker), Python
+   (free-threaded 3.13t, subinterpreters), Ruby (Fiber scheduler, YJIT); gated on
+   their X* parents above. See the per-language docs.
+6. **Bigger-ticket, schedule deliberately** — D2 HTTP/2 (~3 mo, biggest single
+   impact) and D1 armv7 CI fix (active failure; promote if all-arch green CI is a
+   near-term goal). Scheduler / `/run` ([plan-run.md](plan-run.md)) follows.
 
 The 12-month timeline at the bottom sequences these across the Core / PHP /
 Python / Ruby / Governance streams.

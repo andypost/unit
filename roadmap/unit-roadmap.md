@@ -45,6 +45,10 @@ _Security track_ below). It ships:
 - **#113** — reject duplicate upstream `Content-Length` (response-smuggling desync).
 - **#114** — reject empty / embedded-NUL config strings consumed as C strings (app options + pathname unix sockets).
 - **#115** — mount rootfs destinations onto the openat2-validated fd (`/proc/self/fd`), completing #14's mount-destination vector.
+- **#117 / #125** — close out **#116**: the same NUL/empty C-string guard extended to `access_log` path, TLS certificate names, and njs module paths (PR-A, #117), then to the templated `share`/`chroot` paths at request-resolution time (PR-B, #125); `index` intentionally excluded (static config value, no request-controlled component).
+- **#123** — per-language negative test coverage for the #114/#117 C-string guards (java, njs, perl, php, tls, wasm-component), one case per module CI leg.
+- **#129** — libunit Go-module port-fd **double-close race**: the Go SAPI dup'd the port fd then closed the original while libunit still owned it, and `nxt_unit_add_port()` ran its callback outside `lib->mutex` — a concurrent `port_release()` could close an already-closed (or reused) fd. Root-caused and fixed (Go keeps its own dup; an extra `port_use`/`port_release` brackets the callback). This closes the intermittent go-isolation `close(N): Bad file descriptor` CI flake ("Wave 2a").
+- **#128** — permanent libunit close()-provenance diagnostic (names the failing call site and the fd's prior closer via a lock-published, wraparound-safe ticket table) so any future double-close self-locates.
 
 Perf validated (A/B/C bench, `f2cd42e2` → wave → +#111): the whole wave costs
 ≈ +3 % router CPU/request only on the synthetic `return 200` hot path and
@@ -65,13 +69,18 @@ not here. The only actions left, all security-track owned:
   (control-socket peer-auth + cgroup TOCTOU, High) and `GHSA-g6v8-r577-76jm`
   (WebSocket OOB / cross-frame disclosure, High) — then backport #14/#18 to
   **1.34.x LTS**. This advances **G2 (security disclosure process)** below.
+- **[#116](https://github.com/freeunitorg/freeunit/issues/116) — done this cycle:**
+  the config C-string NUL/empty guards from #114 were extended to `access_log`
+  path, TLS certificate names, and njs module paths (PR-A, #117) and to the
+  templated `share`/`chroot` paths at request-resolution time (PR-B, #125).
+  `index` was intentionally left as a plain static config value. The issue can
+  be closed once PR-B lands in a tagged release.
 - Deferred, non-blocking: `andypost/unit#26` (Trivy + cgroup NUL); **wasmtime → 44**
   for the last `rustls-webpki` CVE, blocked until wasmtime moves off rustls 0.22
   (first release on webpki 0.103 is 44.0.0; see [unit-wasm.md](unit-wasm.md) W1);
-  **[#116](https://github.com/freeunitorg/freeunit/issues/116)** — extend the item-12b
-  config C-string NUL/empty guards (shipped in #114) to `access_log` path, TLS
-  certificate names, and njs module paths (PR-A), plus the templated
-  `share`/`chroot`/`index` at resolution time (PR-B).
+  **[#130](https://github.com/freeunitorg/freeunit/issues/130)** — `pkg/docker`
+  `template.Dockerfile` `dpkg-query`/`set -e` pipeline can silently truncate
+  `/requirements.apt` (template-wide, packaging hygiene; see G5).
 
 _Working state / resume notes live in `plan-finish-vectors.md` (maintainer-private, not committed)._
 
@@ -267,11 +276,18 @@ Not code, but define the fork. These determine whether FreeUnit is a drive-by pa
 
 ### G1. Supported-versions matrix
 
-Published policy document (`SUPPORT.md`) stating:
-- Which Unit versions receive security fixes and for how long.
-- Which PHP/Python/Ruby/Node/Perl/Go/Java minors are supported (and their EOL dates).
-- OS support (Alpine, Debian, RHEL, Ubuntu — versions).
-- **Effort:** 1 day of writing.
+**Mostly delivered as machine-enforced data (#124), not just a doc.**
+- **`pkg/eol.json`** is now the single source of truth for supported runtime
+  (PHP/Python/Ruby/Node/Perl/Go/Java) and OS (Alpine/Debian/RHEL/Ubuntu/…)
+  versions with their EOL dates; the Docker matrix, `build-test.yml` legs, and
+  `EOL.md` all derive from it.
+- **`EOL.md`** is the generated human-readable matrix.
+- **`unit-eol-check`** (`pkg/eol/`, Rust) validates `eol.json` against the
+  endoflife.date API and **CI hard-fails** any PR that ships a runtime/OS past
+  EOL + grace (the expiry gate); a weekly job reports upcoming EOLs.
+- Java 25 (LTS) + 26 runtimes added on this basis (#126 / #127).
+- **Remaining:** the human-facing `SUPPORT.md` policy prose (security-fix
+  windows, LTS support length) — ~1 day; the enforcement mechanism now exists.
 
 ### G2. Security disclosure process
 
@@ -290,19 +306,28 @@ Published policy document (`SUPPORT.md`) stating:
 
 ### G4. Public CI matrix
 
-- Today: one GitHub Actions workflow. Expand to:
-  - All supported PHP × Python × Ruby × Node × OS × arch combinations as a matrix.
+- **In progress:** the runtime build/test matrix (Go/Java/Node/PHP/Python/Ruby)
+  is now **data-driven from `pkg/eol.json`** (G1) — e.g. the Java legs cover
+  17/21/25/26, and `build-test.yml` re-runs when `eol.json` changes (#127).
+  Per-language config-validation negatives run in every matching leg (#123).
+- Still to do:
+  - Full PHP × Python × Ruby × Node × OS × arch expansion.
   - armv7 as a first-class CI target (once D1 lands).
   - Nightly builds against upstream PHP/Python/Ruby HEAD so regressions surface fast.
 - **Effort:** ~2 weeks initial + ongoing maintenance.
 
 ### G5. Package distribution
 
-- Today: Docker images in GHCR. Expand:
+- Today: Docker images in GHCR, generated from `pkg/docker/template.Dockerfile`
+  with the version list read from `pkg/eol.json` (G1). Expand:
   - APK packages for Alpine (community repo inclusion).
   - DEB packages for Debian/Ubuntu (PPA or apt repo on `apt.freeunit.org`).
   - RPM packages for RHEL/Fedora/Rocky/Alma.
   - Homebrew tap for macOS (dev use).
+- Known packaging bug: **[#130](https://github.com/freeunitorg/freeunit/issues/130)**
+  — the template's `dpkg-query -S … | uniq` runtime-dep discovery can silently
+  truncate `/requirements.apt` under `set -e` (fix in the template + regenerate
+  all Dockerfiles).
 - **Effort:** ~4 weeks initial; packaging automation in `pkg/`.
 
 ### G6. Documentation site

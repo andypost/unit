@@ -204,6 +204,37 @@ These items live in the **core daemon** (`src/nxt_router.c`, `src/nxt_controller
 
 Independent of language modules. Most of these are overdue or acknowledged bugs.
 
+### D0. io_uring event engine  *(in flight — most-developed core work)*
+
+A new `io_uring`-based event engine alongside epoll, developed on
+`andypost/unit` and destined for upstream. Unlike the mostly-aspirational D1–D10
+below, this is real in-flight code under review, staged for low risk:
+
+- **Stage 1 — poll-mode readiness bridge** (`src/nxt_io_uring_engine.c`, ~1.4k LOC):
+  io_uring drives readiness with an epoll-compatible delivery contract, so the
+  rest of the daemon is unchanged. Registration is gated on a **runtime probe
+  with automatic epoll fallback** (also on runtime engine-creation failure);
+  `--io-uring` / `--io-uring-default` configure options; signals via signalfd;
+  multishot-poll re-arm hardened to honor epoll's edge-like delivery.
+- **Stage 2 — completion-mode + feature tiers**: resolves capability **tiers**
+  (`ACCEPT` multishot for listeners, `RECV` tier, completion-mode conn recv
+  deferred behind a probe), `NXT_IO_URING_FORCE_TIER` override, epoll-degrade
+  path shared and double-failure hardened, **seccomp kill-switch**, dead
+  machinery dropped. Engine-contract + design-notes doc included.
+- **A/B bench harness** (`tools/bench-engines.sh` + report): build-agnostic
+  epoll↔io_uring comparison; detects the active engine from stderr, owns the
+  unitd process tree (setsid/pgid kill ladder) for clean sweeps. _Run serially
+  in a quiet environment for trustworthy numbers._
+- **Why:** removes per-event syscall overhead and epoll's readiness→syscall
+  round-trips; the payoff scales with connection count and is the natural next
+  step after the symmetric idle/active connection accounting (#111) and the
+  engine-teardown fixes (#98).
+- **Status / path:** on branches (`feat/io-uring-stage1`, `feat/io-uring-stage2`,
+  `bench/io-engine-harness`), multi-angle reviewed; **land via `andypost/unit`
+  → upstream**. Fallback-to-epoll keeps it zero-risk to ship disabled-by-default.
+- **Effort:** Stage 1 review+merge ~1 week; Stage 2 ~2–3 weeks; completion-mode
+  recv path is the deepest remaining piece.
+
 ### D1. 32-bit ARM alignment fixes (armv7/armhf)
 
 See [unit-arm32.md](unit-arm32.md). Active CI failure today. Three-stage fix:

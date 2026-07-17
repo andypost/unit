@@ -10,22 +10,26 @@ The hardest piece — per-context request draining — is **already implemented*
 
 This plan threads existing primitives into a delivered feature across **7 phases (~7–8 weeks)**. It does not invent new abstractions.
 
-## Delivery status (2026-07)
+## Delivery status (updated 2026-07-17 — 1.36.0 shipped)
+
+The 1.35.6 cycle shipped as **1.36.0** (merged `pre-1.35.6` → `master` via #139
+on 2026-07-17). P1–P4 are now all landed; **P5 is the resume point.**
 
 | Phase | State | Landed as |
 |---|---|---|
-| **P1** — signal split / `quit_mode` plumbing | ✅ shipped in 1.35.6 | #107 |
-| **P2** — two-phase listener close | ✅ shipped in 1.35.6 | #108 |
-| **P4.5** — `active_connections` engine primitive (pre-P5) | ✅ shipped in 1.35.6 | #111 |
-| **P3, P4** — write-path D′, engine teardown | open | — |
+| **P1** — signal split / `quit_mode` plumbing | ✅ shipped in 1.36.0 | #107 |
+| **P2** — two-phase listener close | ✅ shipped in 1.36.0 | #108 |
+| **P4.5** — `active_connections` engine primitive (pre-P5) | ✅ shipped in 1.36.0 | #111 |
+| **P3** — write-path error contract (D′), non-TLS | ✅ shipped in 1.36.0 | #97 (`c8a75942`) + #96 (`3d0e8177`, port-socket/router OOM) |
+| **P4** — engine teardown TODOs | ✅ shipped in 1.36.0 | `8f5c8886` (free `timers.changes`, `online`-gate the sendmsg log); `nxt_lib_stop` stop-engines closed as a documented decision (`d3d945c3`) — dead code with no caller, revisit only when P5 gives it one |
 | **P5** — server-initiated connection drain | **next** — its prerequisite (an enumerable in-flight list) is #111's `active_connections` | — |
 | **P6** — `POST /reload` endpoint | open (depends on P5) | — |
 | **P7** — per-language drain hooks (Python, Ruby) | open | — |
 
 **Resume point for feature work: P5.** Build `nxt_runtime_drain_active_connections()`
 on top of `engine->active_connections` / `active_conns_cnt` (read only on the
-owning engine's thread). This is non-security work — the 1.35.6 hardening wave is
-closed (see `unit-roadmap.md` → _Security track_).
+owning engine's thread). This is non-security work — the 1.36.0 hardening wave
+shipped (see `unit-roadmap.md` → _Security track_).
 
 ## What "done" looks like
 

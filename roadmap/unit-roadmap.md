@@ -11,10 +11,11 @@ Per-language detail lives in:
 
 ---
 
-## Release status — 1.35.6 (2026-07, content-complete on `pre-1.35.6`)
+## Release status — 1.36.0 (SHIPPED 2026-07-17, merged to `master`)
 
-_Dated note; revisit each release._ The **1.35.6** cycle is **content-complete
-and fully merged to `pre-1.35.6`**. Only the release mechanics remain (see
+_Dated note; revisit each release._ The 1.35.6 cycle **shipped as 1.36.0** on
+2026-07-17 — `pre-1.35.6` was merged to `master` via **#139** (merge commit, not
+fast-forward). Only the **post-tag** security-disclosure steps remain (see
 _Security track_ below). It ships:
 
 - **Security hardening** — the 14-vector audit remediation across the HTTP/
@@ -63,12 +64,18 @@ audit + hardening as **complete** and must **not re-audit, re-open, or block on
 these items** — the live working state is private (`plan-finish-vectors.md`),
 not here. The only actions left, all security-track owned:
 
-- Cut the release: `pre-1.35.6` → `master` (merge, **not** fast-forward — master
-  carries CI-only commits), tag **1.35.6**.
-- Publish the two draft GHSAs + request CVEs **at the tag** — `GHSA-768w-qrh2-jjvh`
+- ✅ **Done (2026-07-17)** — `pre-1.35.6` merged to `master` via **#139** (merge
+  commit, not fast-forward), shipped as **1.36.0**.
+- **Remaining (post-tag):** publish the two draft GHSAs + request CVEs — `GHSA-768w-qrh2-jjvh`
   (control-socket peer-auth + cgroup TOCTOU, High) and `GHSA-g6v8-r577-76jm`
   (WebSocket OOB / cross-frame disclosure, High) — then backport #14/#18 to
   **1.34.x LTS**. This advances **G2 (security disclosure process)** below.
+- **Only deferred audit vector: V5 sender-type ACL** on port dispatch
+  (`src/nxt_port.c:173`, `TODO(audit-V5-medium)`). Every other PR-A..PR-I vector
+  is fixed; V5 needs `SO_PASSCRED` + process-registration ordering rework so the
+  sender PID is consistently available (APP-COMP escalation primitive, 2/5 from a
+  worker foothold — not remote). Tracked in `audit.md`; schedule alongside a P5-era
+  port-protocol pass.
 - **[#116](https://github.com/freeunitorg/freeunit/issues/116) — done this cycle:**
   the config C-string NUL/empty guards from #114 were extended to `access_log`
   path, TLS certificate names, and njs module paths (PR-A, #117) and to the

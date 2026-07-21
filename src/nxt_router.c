@@ -4343,7 +4343,7 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
                 continue;
             }
 
-            field = nxt_list_add(r->resp.fields);
+            field = nxt_http_resp_field_add(&r->resp, r->mem_pool);
 
             if (nxt_slow_path(field == NULL)) {
                 goto fail;
@@ -4369,7 +4369,13 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
                       (size_t) field->value_length, field->value);
 
             if (field->skip) {
-                r->resp.fields->last->nelts--;
+                if (r->resp.num_inline_fields > 0
+                    && field == &r->resp.inline_fields[r->resp.num_inline_fields - 1])
+                {
+                    r->resp.num_inline_fields--;
+                } else if (r->resp.fields != NULL && r->resp.fields->last != NULL) {
+                    r->resp.fields->last->nelts--;
+                }
             }
         }
 

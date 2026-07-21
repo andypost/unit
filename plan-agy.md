@@ -95,10 +95,10 @@ This plan outlines the architecture, parallel task breakdown, future subsystem e
 - [x] **Agent 4**: Run allocation profiling test to verify 0 heap allocations per request on keep-alive.
 
 ### Phase 2: Subsystem Optimization Expansion
-- [ ] **Track E**: Embed `nxt_http_static_ctx_t` in `r` and implement file buffer descriptor freelist.
-- [ ] **Track F**: Implement inline 8-element scratchpad in `nxt_var_cache_t`.
-- [ ] **Track G**: Build per-thread `nxt_conn_t` freelist recycler on event engine.
-- [ ] **Track H**: Apply `inline_fields[16]` array to `r->resp.fields` in proxy response pipeline.
+- [x] **Track E**: Embed `nxt_http_static_ctx_t` in `r` and implement file buffer descriptor freelist.
+- [x] **Track F**: Implement inline 8-element scratchpad in `nxt_var_cache_t`.
+- [x] **Track G**: Build per-thread `nxt_conn_t` freelist recycler on event engine.
+- [x] **Track H**: Apply `inline_fields[16]` array to `r->resp.fields` in proxy response pipeline.
 
 ---
 

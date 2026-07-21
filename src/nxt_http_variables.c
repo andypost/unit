@@ -758,7 +758,9 @@ nxt_http_var_response_header(nxt_task_t *task, nxt_str_t *str, void *ctx,
     r = ctx;
     name = data;
 
-    nxt_list_each(f, r->resp.fields) {
+    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
 
         if (f->skip) {
             continue;
@@ -771,7 +773,7 @@ nxt_http_var_response_header(nxt_task_t *task, nxt_str_t *str, void *ctx,
             return NXT_OK;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     nxt_str_null(str);
 

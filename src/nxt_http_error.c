@@ -41,12 +41,7 @@ nxt_http_request_error(nxt_task_t *task, nxt_http_request_t *r,
 
     r->status = status;
 
-    r->resp.fields = nxt_list_create(r->mem_pool, 8, sizeof(nxt_http_field_t));
-    if (nxt_slow_path(r->resp.fields == NULL)) {
-        goto fail;
-    }
-
-    content_type = nxt_list_zero_add(r->resp.fields);
+    content_type = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
     if (nxt_slow_path(content_type == NULL)) {
         goto fail;
     }

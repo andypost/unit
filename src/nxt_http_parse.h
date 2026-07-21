@@ -173,7 +173,8 @@ nxt_http_fields_next(nxt_http_fields_iter_t *iter)
 #define nxt_http_fields_each(field, inline_fields, num_inline_fields, fields) \
     do {                                                                      \
         nxt_http_fields_iter_t  _iter;                                        \
-        for (field = nxt_http_fields_first(&_iter, inline_fields,              \
+        for (field = nxt_http_fields_first(&_iter,                            \
+                                            (nxt_http_field_t *) (inline_fields),\
                                             num_inline_fields, fields);       \
              field != NULL;                                                   \
              field = nxt_http_fields_next(&_iter))                            \

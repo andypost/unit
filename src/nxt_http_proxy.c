@@ -266,7 +266,7 @@ nxt_http_proxy_header_read(nxt_task_t *task, void *obj, void *data)
                   (size_t) field->value_length, field->value);
 
         if (!field->skip) {
-            f = nxt_list_add(r->resp.fields);
+            f = nxt_http_resp_field_add(&r->resp, r->mem_pool);
             if (nxt_slow_path(f == NULL)) {
                 nxt_http_proxy_error(task, r, peer);
                 return;

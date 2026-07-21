@@ -24,7 +24,6 @@ static void nxt_http_request_proto_info(nxt_task_t *task,
     nxt_http_request_t *r);
 static void nxt_http_request_mem_buf_completion(nxt_task_t *task, void *obj,
     void *data);
-static void nxt_http_request_done(nxt_task_t *task, void *obj, void *data);
 
 static u_char *nxt_http_date_cache_handler(u_char *buf, nxt_realtime_t *now,
     struct tm *tm, size_t size, const char *format);
@@ -242,37 +241,19 @@ nxt_http_request_content_length(void *ctx, nxt_http_field_t *field,
 
 
 nxt_http_request_t *
-nxt_http_request_create(nxt_task_t *task)
+nxt_http_request_create_from_mp(nxt_task_t *task, nxt_mp_t *mp)
 {
-    nxt_mp_t            *mp;
-    nxt_buf_t           *last;
     nxt_http_request_t  *r;
-
-    mp = nxt_mp_create(4096, 128, 512, 32);
-    if (nxt_slow_path(mp == NULL)) {
-        return NULL;
-    }
 
     r = nxt_mp_zget(mp, sizeof(nxt_http_request_t));
     if (nxt_slow_path(r == NULL)) {
-        goto fail;
+        return NULL;
     }
 
-    r->resp.fields = nxt_list_create(mp, 8, sizeof(nxt_http_field_t));
+    r->resp.fields = nxt_list_create(mp, 16, sizeof(nxt_http_field_t));
     if (nxt_slow_path(r->resp.fields == NULL)) {
-        goto fail;
+        return NULL;
     }
-
-    last = nxt_mp_zget(mp, NXT_BUF_SYNC_SIZE);
-    if (nxt_slow_path(last == NULL)) {
-        goto fail;
-    }
-
-    nxt_buf_set_sync(last);
-    nxt_buf_set_last(last);
-    last->completion_handler = nxt_http_request_done;
-    last->parent = r;
-    r->last = last;
 
     r->mem_pool = mp;
     r->content_length_n = -1;
@@ -289,19 +270,34 @@ nxt_http_request_create(nxt_task_t *task)
     if (nxt_otel_rs_is_init()) {
         r->otel = nxt_mp_zget(r->mem_pool, sizeof(nxt_otel_state_t));
         if (nxt_slow_path(r->otel == NULL)) {
-            goto fail;
+            return NULL;
         }
         r->otel->status = NXT_OTEL_INIT_STATE;
     }
 #endif
 
     return r;
+}
 
-fail:
 
-    nxt_mp_release(mp);
+nxt_http_request_t *
+nxt_http_request_create(nxt_task_t *task)
+{
+    nxt_mp_t            *mp;
+    nxt_http_request_t  *r;
 
-    return NULL;
+    mp = nxt_mp_create(4096, 128, 512, 32);
+    if (nxt_slow_path(mp == NULL)) {
+        return NULL;
+    }
+
+    r = nxt_http_request_create_from_mp(task, mp);
+    if (nxt_slow_path(r == NULL)) {
+        nxt_mp_release(mp);
+        return NULL;
+    }
+
+    return r;
 }
 
 
@@ -381,7 +377,7 @@ nxt_http_request_forward(nxt_task_t *task, nxt_http_request_t *r,
 
     protocol_field = NULL;
 
-    nxt_list_each(f, r->fields) {
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
         if (client_ip_fields != NULL
             && f->hash == client_ip->header_hash
             && f->value_length > 0
@@ -407,7 +403,7 @@ nxt_http_request_forward(nxt_task_t *task, nxt_http_request_t *r,
         {
             protocol_field = f;
         }
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     if (client_ip_fields != NULL) {
         nxt_http_request_forward_client_ip(r, forward, client_ip_fields);
@@ -833,13 +829,26 @@ nxt_http_buf_last(nxt_http_request_t *r)
     nxt_buf_t  *last;
 
     last = r->last;
+
+    if (last == NULL) {
+        last = nxt_mp_zget(r->mem_pool, NXT_BUF_SYNC_SIZE);
+        if (nxt_slow_path(last == NULL)) {
+            return NULL;
+        }
+
+        nxt_buf_set_sync(last);
+        nxt_buf_set_last(last);
+        last->completion_handler = nxt_http_request_done;
+        last->parent = r;
+    }
+
     r->last = NULL;
 
     return last;
 }
 
 
-static void
+void
 nxt_http_request_done(nxt_task_t *task, void *obj, void *data)
 {
     nxt_http_request_t  *r;
@@ -1092,7 +1101,7 @@ nxt_http_cookies_parse(nxt_http_request_t *r)
         return NULL;
     }
 
-    nxt_list_each(f, r->fields) {
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
 
         if (f->hash != NXT_HTTP_COOKIE_HASH
             || f->name_length != 6
@@ -1107,7 +1116,7 @@ nxt_http_cookies_parse(nxt_http_request_t *r)
             return NULL;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     r->cookies = cookies;
 

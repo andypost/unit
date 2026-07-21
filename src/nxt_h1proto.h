@@ -49,6 +49,7 @@ struct nxt_h1proto_s {
      * be zeroed in a keep-alive connection.
      */
     nxt_conn_t                *conn;
+    nxt_mp_t                  *mem_pool;
 };
 
 #define nxt_h1p_is_http11(h1p)                                              \

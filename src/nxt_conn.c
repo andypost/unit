@@ -45,9 +45,22 @@ nxt_conn_create(nxt_mp_t *mp, nxt_task_t *task)
     nxt_conn_t    *c;
     nxt_thread_t  *thr;
 
-    c = nxt_mp_zget(mp, sizeof(nxt_conn_t));
-    if (nxt_slow_path(c == NULL)) {
-        return NULL;
+    thr = nxt_thread();
+
+    if (thr->engine->free_connections != NULL) {
+        c = thr->engine->free_connections;
+        thr->engine->free_connections = c->next;
+        nxt_memzero(c, sizeof(nxt_conn_t));
+
+    } else {
+        nxt_mp_t  *alloc_mp;
+
+        alloc_mp = thr->engine->mem_pool != NULL ? thr->engine->mem_pool : mp;
+
+        c = nxt_mp_zget(alloc_mp, sizeof(nxt_conn_t));
+        if (nxt_slow_path(c == NULL)) {
+            return NULL;
+        }
     }
 
     c->mem_pool = mp;
@@ -63,7 +76,6 @@ nxt_conn_create(nxt_mp_t *mp, nxt_task_t *task)
         c->log.ident = nxt_task_next_ident();
     }
 
-    thr = nxt_thread();
     thr->engine->connections++;
 
     c->task.thread = thr;
@@ -92,12 +104,19 @@ nxt_conn_create(nxt_mp_t *mp, nxt_task_t *task)
 void
 nxt_conn_free(nxt_task_t *task, nxt_conn_t *c)
 {
-    nxt_mp_t  *mp;
+    nxt_mp_t            *mp;
+    nxt_event_engine_t  *engine;
 
-    task->thread->engine->connections--;
+    engine = task->thread->engine;
+    engine->connections--;
+
+    c->next = engine->free_connections;
+    engine->free_connections = c;
 
     mp = c->mem_pool;
-    nxt_mp_release(mp);
+    if (mp != NULL) {
+        nxt_mp_release(mp);
+    }
 }
 
 

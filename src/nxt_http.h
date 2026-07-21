@@ -122,6 +122,8 @@ typedef struct {
     nxt_http_proto_t                proto;
     nxt_http_request_t              *request;
     nxt_upstream_server_t           *server;
+    nxt_http_field_t                inline_fields[16];
+    uint8_t                         num_inline_fields;
     nxt_list_t                      *fields;
     nxt_buf_t                       *body;
 
@@ -157,6 +159,8 @@ struct nxt_http_request_s {
     nxt_str_t                       args_decoded;
     nxt_array_t                     *arguments;  /* of nxt_http_name_value_t */
     nxt_array_t                     *cookies;    /* of nxt_http_name_value_t */
+    nxt_http_field_t                inline_fields[16];
+    uint8_t                         num_inline_fields;
     nxt_list_t                      *fields;
     nxt_http_field_t                *content_type;
     nxt_http_field_t                *content_length;
@@ -336,6 +340,8 @@ nxt_int_t nxt_http_response_hash_init(nxt_task_t *task);
 
 void nxt_http_conn_init(nxt_task_t *task, void *obj, void *data);
 nxt_http_request_t *nxt_http_request_create(nxt_task_t *task);
+nxt_http_request_t *nxt_http_request_create_from_mp(nxt_task_t *task,
+    nxt_mp_t *mp);
 void nxt_http_request_error(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_status_t status);
 void nxt_http_request_read_body(nxt_task_t *task, nxt_http_request_t *r);
@@ -348,6 +354,7 @@ void nxt_http_request_send(nxt_task_t *task, nxt_http_request_t *r,
 nxt_buf_t *nxt_http_buf_mem(nxt_task_t *task, nxt_http_request_t *r,
     size_t size);
 nxt_buf_t *nxt_http_buf_last(nxt_http_request_t *r);
+void nxt_http_request_done(nxt_task_t *task, void *obj, void *data);
 void nxt_http_request_error_handler(nxt_task_t *task, void *obj, void *data);
 void nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data);
 

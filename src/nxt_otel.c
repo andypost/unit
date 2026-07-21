@@ -376,7 +376,7 @@ nxt_otel_drop_tracestate(nxt_http_request_t *r)
 
     nxt_str_null(&r->otel->trace_state);
 
-    nxt_list_each(f, r->fields) {
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
 
         if (f->name_length == nxt_length("tracestate")
             && nxt_memcasecmp(f->name, "tracestate",
@@ -385,7 +385,7 @@ nxt_otel_drop_tracestate(nxt_http_request_t *r)
             f->skip = 1;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     /* the echo copies nxt_otel_parse_tracestate() already appended */
 

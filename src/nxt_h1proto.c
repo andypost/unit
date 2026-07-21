@@ -490,7 +490,17 @@ nxt_h1p_conn_request_init(nxt_task_t *task, void *obj, void *data)
 
     nxt_conn_active(task->thread->engine, c);
 
-    r = nxt_http_request_create(task);
+    if (h1p->mem_pool == NULL) {
+        h1p->mem_pool = nxt_mp_create(4096, 128, 512, 32);
+        if (nxt_slow_path(h1p->mem_pool == NULL)) {
+            nxt_h1p_closing(task, c);
+            return;
+        }
+    }
+
+    nxt_mp_retain(h1p->mem_pool);
+
+    r = nxt_http_request_create_from_mp(task, h1p->mem_pool);
 
     if (nxt_fast_path(r != NULL)) {
         h1p->request = r;
@@ -678,9 +688,15 @@ nxt_h1p_header_process(nxt_task_t *task, nxt_h1proto_t *h1p,
     r->path = &h1p->parser.path;
     r->args = &h1p->parser.args;
 
+    r->num_inline_fields = h1p->parser.num_inline_fields;
+    if (r->num_inline_fields > 0) {
+        nxt_memcpy(r->inline_fields, h1p->parser.inline_fields,
+                   sizeof(nxt_http_field_t) * r->num_inline_fields);
+    }
     r->fields = h1p->parser.fields;
 
-    ret = nxt_http_fields_process(r->fields, &nxt_h1p_fields_hash, r);
+    ret = nxt_http_fields_process(r->inline_fields, r->num_inline_fields,
+                                  r->fields, &nxt_h1p_fields_hash, r);
     if (nxt_slow_path(ret != NXT_OK)) {
         return ret;
     }
@@ -1366,6 +1382,19 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     h1p = r->proto.h1;
     n = r->status;
 
+    if (r->last == NULL) {
+        r->last = nxt_mp_zget(r->mem_pool, NXT_BUF_SYNC_SIZE);
+        if (nxt_slow_path(r->last == NULL)) {
+            nxt_h1p_request_error(task, h1p, r);
+            return;
+        }
+
+        nxt_buf_set_sync(r->last);
+        nxt_buf_set_last(r->last);
+        r->last->completion_handler = nxt_http_request_done;
+        r->last->parent = r;
+    }
+
     if (n >= NXT_HTTP_CONTINUE && n <= NXT_HTTP_LAST_INFORMATIONAL) {
         status = &nxt_http_informational[n - NXT_HTTP_CONTINUE];
 
@@ -1753,7 +1782,7 @@ nxt_h1p_conn_request_error(nxt_task_t *task, void *obj, void *data)
         return;
     }
 
-    if (r->fields == NULL) {
+    if (r->method == NULL) {
         (void) nxt_h1p_header_process(task, h1p, r);
     }
 
@@ -1789,7 +1818,7 @@ nxt_h1p_conn_request_timeout(nxt_task_t *task, void *obj, void *data)
     h1p->keepalive = 0;
     r = h1p->request;
 
-    if (r->fields == NULL) {
+    if (r->method == NULL) {
         (void) nxt_h1p_header_process(task, h1p, r);
     }
 
@@ -1954,6 +1983,10 @@ nxt_h1p_keepalive(nxt_task_t *task, nxt_h1proto_t *h1p, nxt_conn_t *c)
     in = c->read;
 
     nxt_memzero(h1p, offsetof(nxt_h1proto_t, conn));
+
+    if (h1p->mem_pool != NULL) {
+        nxt_mp_reset(h1p->mem_pool);
+    }
 
     c->sent = 0;
 
@@ -2204,7 +2237,16 @@ nxt_h1p_conn_ws_shutdown(nxt_task_t *task, void *obj, void *data)
 static void
 nxt_h1p_closing(nxt_task_t *task, nxt_conn_t *c)
 {
+    nxt_h1proto_t  *h1p;
+
     nxt_debug(task, "h1p closing");
+
+    h1p = c->socket.data;
+
+    if (h1p != NULL && h1p->mem_pool != NULL) {
+        nxt_mp_release(h1p->mem_pool);
+        h1p->mem_pool = NULL;
+    }
 
     c->socket.data = NULL;
 
@@ -2454,14 +2496,16 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
         size += nxt_length("Content-Length: ") + NXT_OFF_T_LEN + nxt_length("\r\n");
     }
 
-    nxt_list_each(field, r->fields) {
+    nxt_http_fields_each(field, r->inline_fields, r->num_inline_fields,
+                         r->fields)
+    {
 
         if (!field->hopbyhop && !field->skip) {
             size += field->name_length + field->value_length;
             size += nxt_length(": \r\n");
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     header = nxt_http_buf_mem(task, r, size);
     if (nxt_slow_path(header == NULL)) {
@@ -2476,7 +2520,9 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
     p = nxt_cpymem(p, " HTTP/1.1\r\n", 11);
     p = nxt_cpymem(p, "Connection: close\r\n", 19);
 
-    nxt_list_each(field, r->fields) {
+    nxt_http_fields_each(field, r->inline_fields, r->num_inline_fields,
+                         r->fields)
+    {
 
         if (!field->hopbyhop && !field->skip) {
             p = nxt_cpymem(p, field->name, field->name_length);
@@ -2485,7 +2531,7 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
             *p++ = '\r'; *p++ = '\n';
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     if (content_length >= 0) {
         p = nxt_cpymem(p, "Content-Length: ", nxt_length("Content-Length: "));
@@ -2766,9 +2812,16 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
     switch (ret) {
 
     case NXT_DONE:
+        peer->num_inline_fields = peer->proto.h1->parser.num_inline_fields;
+        if (peer->num_inline_fields > 0) {
+            nxt_memcpy(peer->inline_fields,
+                       peer->proto.h1->parser.inline_fields,
+                       sizeof(nxt_http_field_t) * peer->num_inline_fields);
+        }
         peer->fields = peer->proto.h1->parser.fields;
 
-        ret = nxt_http_fields_process(peer->fields,
+        ret = nxt_http_fields_process(peer->inline_fields,
+                                      peer->num_inline_fields, peer->fields,
                                       &nxt_h1p_peer_fields_hash, r);
         if (nxt_slow_path(ret != NXT_OK)) {
             peer->status = NXT_HTTP_INTERNAL_SERVER_ERROR;

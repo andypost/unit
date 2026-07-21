@@ -5546,56 +5546,7 @@ nxt_router_app_prepare_request(nxt_task_t *task,
 }
 
 
-struct nxt_fields_iter_s {
-    nxt_list_part_t   *part;
-    nxt_http_field_t  *field;
-};
 
-typedef struct nxt_fields_iter_s  nxt_fields_iter_t;
-
-
-static nxt_http_field_t *
-nxt_fields_part_first(nxt_list_part_t *part, nxt_fields_iter_t *i)
-{
-    if (part == NULL) {
-        return NULL;
-    }
-
-    while (part->nelts == 0) {
-        part = part->next;
-        if (part == NULL) {
-            return NULL;
-        }
-    }
-
-    i->part = part;
-    i->field = nxt_list_data(i->part);
-
-    return i->field;
-}
-
-
-static nxt_http_field_t *
-nxt_fields_first(nxt_list_t *fields, nxt_fields_iter_t *i)
-{
-    return nxt_fields_part_first(nxt_list_part(fields), i);
-}
-
-
-static nxt_http_field_t *
-nxt_fields_next(nxt_fields_iter_t *i)
-{
-    nxt_http_field_t  *end = nxt_list_data(i->part);
-
-    end += i->part->nelts;
-    i->field++;
-
-    if (i->field < end) {
-        return i->field;
-    }
-
-    return nxt_fields_part_first(i->part->next, i);
-}
 
 
 static nxt_buf_t *
@@ -5607,11 +5558,11 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     size_t              fields_count, req_size, size, free_size;
     size_t              copy_size;
     nxt_off_t           content_length;
-    nxt_buf_t           *b, *buf, *out, **tail;
-    nxt_http_field_t    *field, *dup;
-    nxt_unit_field_t    *dst_field;
-    nxt_fields_iter_t   iter, dup_iter;
-    nxt_unit_request_t  *req;
+    nxt_buf_t               *b, *buf, *out, **tail;
+    nxt_http_field_t        *field, *dup;
+    nxt_unit_field_t        *dst_field;
+    nxt_http_fields_iter_t  iter, dup_iter;
+    nxt_unit_request_t      *req;
 
     req_size = sizeof(nxt_unit_request_t)
                + r->method->length + 1
@@ -5626,12 +5577,14 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     content_length = r->content_length_n < 0 ? 0 : r->content_length_n;
     fields_count = 0;
 
-    nxt_list_each(field, r->fields) {
+    nxt_http_fields_each(field, r->inline_fields, r->num_inline_fields,
+                         r->fields)
+    {
         fields_count++;
 
         req_size += field->name_length + prefix->length + 1
                     + field->value_length + 1;
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     req_size += fields_count * sizeof(nxt_unit_field_t);
 
@@ -5728,9 +5681,10 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 
     dst_field = req->fields;
 
-    for (field = nxt_fields_first(r->fields, &iter);
+    for (field = nxt_http_fields_first(&iter, r->inline_fields,
+                                       r->num_inline_fields, r->fields);
          field != NULL;
-         field = nxt_fields_next(&iter))
+         field = nxt_http_fields_next(&iter))
     {
         if (field->skip) {
             continue;
@@ -5793,9 +5747,9 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
         if (prefix->length != 0) {
             dup_iter = iter;
 
-            for (dup = nxt_fields_next(&dup_iter);
+            for (dup = nxt_http_fields_next(&dup_iter);
                  dup != NULL;
-                 dup = nxt_fields_next(&dup_iter))
+                 dup = nxt_http_fields_next(&dup_iter))
             {
                 if (dup->name_length != field->name_length
                     || dup->skip

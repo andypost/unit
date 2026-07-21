@@ -257,7 +257,9 @@ nxt_http_proxy_header_read(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "http proxy status: %d", peer->status);
 
-    nxt_list_each(field, peer->fields) {
+    nxt_http_fields_each(field, peer->inline_fields, peer->num_inline_fields,
+                         peer->fields)
+    {
 
         nxt_debug(task, "http proxy header: \"%*s: %*s\"",
                   (size_t) field->name_length, field->name,
@@ -273,7 +275,7 @@ nxt_http_proxy_header_read(nxt_task_t *task, void *obj, void *data)
             *f = *field;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     r->state = &nxt_http_proxy_read_state;
 

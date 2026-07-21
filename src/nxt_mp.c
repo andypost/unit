@@ -357,6 +357,64 @@ nxt_mp_destroy(nxt_mp_t *mp)
 }
 
 
+void
+nxt_mp_reset(nxt_mp_t *mp)
+{
+    void               *p;
+    uint32_t           pages;
+    nxt_work_t         *work, *next_work;
+    nxt_queue_t        *chunk_pages;
+    nxt_mp_block_t     *block;
+    nxt_rbtree_node_t  *node, *next;
+
+    nxt_debug_alloc("mp %p reset", mp);
+
+    nxt_mp_thread_assert(mp);
+
+    while (mp->cleanup != NULL) {
+        work = mp->cleanup;
+        next_work = work->next;
+
+        work->handler(work->task, work->obj, work->data);
+
+        mp->cleanup = next_work;
+    }
+
+    next = nxt_rbtree_root(&mp->blocks);
+
+    while (next != nxt_rbtree_sentinel(&mp->blocks)) {
+
+        node = nxt_rbtree_destroy_next(&mp->blocks, &next);
+        block = (nxt_mp_block_t *) node;
+
+        p = block->start;
+
+        if (block->type != NXT_MP_EMBEDDED_BLOCK) {
+            nxt_free(block);
+        }
+
+        nxt_free(p);
+    }
+
+    pages = mp->page_size_shift - mp->chunk_size_shift;
+    chunk_pages = mp->chunk_pages;
+
+    while (pages != 0) {
+        nxt_queue_init(chunk_pages);
+        chunk_pages++;
+        pages--;
+    }
+
+    nxt_queue_init(&mp->free_pages);
+    nxt_queue_init(&mp->nget_pages);
+    nxt_queue_init(&mp->get_pages);
+
+    nxt_rbtree_init(&mp->blocks, nxt_mp_rbtree_compare);
+
+    mp->retain = 2;
+}
+
+
 nxt_bool_t
 nxt_mp_test_sizes(size_t cluster_size, size_t page_alignment, size_t page_size,
     size_t min_chunk_size)

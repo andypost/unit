@@ -52,6 +52,11 @@ NXT_EXPORT void nxt_mp_retain(nxt_mp_t *mp);
  */
 NXT_EXPORT void nxt_mp_release(nxt_mp_t *mp);
 
+/*
+ * nxt_mp_reset() frees all allocations in memory pool and resets pool.
+ */
+NXT_EXPORT void nxt_mp_reset(nxt_mp_t *mp);
+
 #if (NXT_TESTS)
 /*
  * Returns the current retention count.  Used by

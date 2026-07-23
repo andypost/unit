@@ -140,10 +140,10 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
         nxt_otel_rs_copy_traceparent(traceval, r->otel->trace);
 
         /*
-         * nxt_list_add() hands out non-zeroed memory: garbage skip/hopbyhop
+         * The unzeroed add hands out non-zeroed memory: garbage skip/hopbyhop
          * bits make the peer/app serializers randomly drop the field.
          */
-        f = nxt_list_zero_add(r->fields);
+        f = nxt_http_req_field_zero_add(r);
         if (nxt_slow_path(f == NULL)) {
             return;
         }

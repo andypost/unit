@@ -270,6 +270,38 @@ struct nxt_http_request_s {
 };
 
 
+nxt_inline nxt_http_field_t *
+nxt_http_req_field_add(nxt_http_request_t *r)
+{
+    if (r->num_inline_fields < 16) {
+        return &r->inline_fields[r->num_inline_fields++];
+    }
+
+    if (r->fields == NULL) {
+        r->fields = nxt_list_create(r->mem_pool, 8, sizeof(nxt_http_field_t));
+        if (nxt_slow_path(r->fields == NULL)) {
+            return NULL;
+        }
+    }
+
+    return nxt_list_add(r->fields);
+}
+
+
+nxt_inline nxt_http_field_t *
+nxt_http_req_field_zero_add(nxt_http_request_t *r)
+{
+    nxt_http_field_t  *field;
+
+    field = nxt_http_req_field_add(r);
+    if (nxt_fast_path(field != NULL)) {
+        nxt_memzero(field, sizeof(nxt_http_field_t));
+    }
+
+    return field;
+}
+
+
 typedef struct {
     uint16_t                        hash;
     uint16_t                        name_length;

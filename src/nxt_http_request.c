@@ -555,7 +555,7 @@ nxt_http_request_chunked_transform(nxt_http_request_t *r)
 
     size = r->body->file_end;
 
-    f = nxt_list_zero_add(r->fields);
+    f = nxt_http_req_field_zero_add(r);
     if (nxt_slow_path(f == NULL)) {
         return NXT_ERROR;
     }

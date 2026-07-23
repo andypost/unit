@@ -1028,13 +1028,21 @@ nxt_http_parse_test_headers(nxt_http_request_parse_t *rp,
     nxt_http_parse_test_data_t *data, nxt_str_t *request, nxt_log_t *log)
 {
     nxt_uint_t                      i, nelts;
-    nxt_http_field_t                *field, *elt_field;
-    nxt_list_next_t                 next;
+    nxt_http_field_t                *field;
     nxt_http_parse_test_headers_t  *expected;
 
     expected = &data->headers;
 
-    nelts = nxt_list_nelts(rp->fields);
+    /*
+     * Headers are stored inline (first 16) with any overflow spilling into
+     * the rp->fields list, so the total count is the sum of both and the
+     * only valid traversal is nxt_http_fields_each().
+     */
+    nelts = rp->num_inline_fields;
+    if (rp->fields != NULL) {
+        nelts += nxt_list_nelts(rp->fields);
+    }
+
     if (nelts != expected->count) {
         nxt_log_alert(log, "http parse headers test failed (count mismatch):\n"
                            " - request:\n\"%V\"\n"
@@ -1043,12 +1051,13 @@ nxt_http_parse_test_headers(nxt_http_request_parse_t *rp,
         return NXT_ERROR;
     }
 
-    /* 1. Verify via nxt_list_each iteration */
     i = 0;
-    nxt_list_each(field, rp->fields) {
+    nxt_http_fields_each(field, rp->inline_fields, rp->num_inline_fields,
+                         rp->fields)
+    {
         if (i >= expected->count) {
             nxt_log_alert(log, "http parse headers test failed:\n"
-                               " - nxt_list_each iterated beyond count %ui",
+                               " - iterated beyond count %ui",
                                expected->count);
             return NXT_ERROR;
         }
@@ -1059,8 +1068,8 @@ nxt_http_parse_test_headers(nxt_http_request_parse_t *rp,
         {
             nxt_log_alert(log, "http parse header name mismatch at [%ui]:\n"
                                " - request:\n\"%V\"\n"
-                               " - got: \"%.*s\" (expected: \"%V\")",
-                               i, request, (int) field->name_length,
+                               " - got: \"%*s\" (expected: \"%V\")",
+                               i, request, (size_t) field->name_length,
                                field->name, &expected->fields[i].name);
             return NXT_ERROR;
         }
@@ -1071,8 +1080,8 @@ nxt_http_parse_test_headers(nxt_http_request_parse_t *rp,
         {
             nxt_log_alert(log, "http parse header value mismatch at [%ui]:\n"
                                " - request:\n\"%V\"\n"
-                               " - got: \"%.*s\" (expected: \"%V\")",
-                               i, request, (int) field->value_length,
+                               " - got: \"%*s\" (expected: \"%V\")",
+                               i, request, (size_t) field->value_length,
                                field->value, &expected->fields[i].value);
             return NXT_ERROR;
         }
@@ -1083,64 +1092,11 @@ nxt_http_parse_test_headers(nxt_http_request_parse_t *rp,
         }
 
         i++;
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     if (i != expected->count) {
         nxt_log_alert(log, "http parse headers test failed:\n"
-                           " - nxt_list_each iteration count: %ui (expected: %ui)",
-                           i, expected->count);
-        return NXT_ERROR;
-    }
-
-    /* 2. Verify via nxt_list_elt index lookup */
-    for (i = 0; i < expected->count; i++) {
-        elt_field = nxt_list_elt(rp->fields, i);
-        if (elt_field == NULL) {
-            nxt_log_alert(log, "http parse headers test failed:\n"
-                               " - nxt_list_elt(%ui) returned NULL", i);
-            return NXT_ERROR;
-        }
-
-        if (elt_field->name_length != expected->fields[i].name.length
-            || memcmp(elt_field->name, expected->fields[i].name.start,
-                      elt_field->name_length) != 0)
-        {
-            nxt_log_alert(log, "http parse header nxt_list_elt name mismatch at [%ui]", i);
-            return NXT_ERROR;
-        }
-    }
-
-    if (nxt_list_elt(rp->fields, expected->count) != NULL) {
-        nxt_log_alert(log, "http parse headers test failed:\n"
-                           " - nxt_list_elt(%ui) out of bounds returned non-NULL",
-                           expected->count);
-        return NXT_ERROR;
-    }
-
-    /* 3. Verify via nxt_list_next iterator */
-    nxt_memzero(&next, sizeof(nxt_list_next_t));
-    i = 0;
-    while ((field = nxt_list_next(rp->fields, &next)) != NULL) {
-        if (i >= expected->count) {
-            nxt_log_alert(log, "http parse headers test failed:\n"
-                               " - nxt_list_next iterated beyond count %ui",
-                               expected->count);
-            return NXT_ERROR;
-        }
-
-        if (field->name_length != expected->fields[i].name.length
-            || memcmp(field->name, expected->fields[i].name.start,
-                      field->name_length) != 0)
-        {
-            nxt_log_alert(log, "http parse header nxt_list_next name mismatch at [%ui]", i);
-            return NXT_ERROR;
-        }
-        i++;
-    }
-
-    if (i != expected->count) {
-        nxt_log_alert(log, "http parse headers test failed:\n"
-                           " - nxt_list_next iteration count: %ui (expected: %ui)",
+                           " - iteration count: %ui (expected: %ui)",
                            i, expected->count);
         return NXT_ERROR;
     }

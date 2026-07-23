@@ -490,17 +490,7 @@ nxt_h1p_conn_request_init(nxt_task_t *task, void *obj, void *data)
 
     nxt_conn_active(task->thread->engine, c);
 
-    if (h1p->mem_pool == NULL) {
-        h1p->mem_pool = nxt_mp_create(4096, 128, 512, 32);
-        if (nxt_slow_path(h1p->mem_pool == NULL)) {
-            nxt_h1p_closing(task, c);
-            return;
-        }
-    }
-
-    nxt_mp_retain(h1p->mem_pool);
-
-    r = nxt_http_request_create_from_mp(task, h1p->mem_pool);
+    r = nxt_http_request_create(task);
 
     if (nxt_fast_path(r != NULL)) {
         h1p->request = r;
@@ -1988,10 +1978,6 @@ nxt_h1p_keepalive(nxt_task_t *task, nxt_h1proto_t *h1p, nxt_conn_t *c)
 
     nxt_memzero(h1p, offsetof(nxt_h1proto_t, conn));
 
-    if (h1p->mem_pool != NULL) {
-        nxt_mp_reset(h1p->mem_pool);
-    }
-
     c->sent = 0;
 
     engine = task->thread->engine;
@@ -2241,16 +2227,7 @@ nxt_h1p_conn_ws_shutdown(nxt_task_t *task, void *obj, void *data)
 static void
 nxt_h1p_closing(nxt_task_t *task, nxt_conn_t *c)
 {
-    nxt_h1proto_t  *h1p;
-
     nxt_debug(task, "h1p closing");
-
-    h1p = c->socket.data;
-
-    if (h1p != NULL && h1p->mem_pool != NULL) {
-        nxt_mp_release(h1p->mem_pool);
-        h1p->mem_pool = NULL;
-    }
 
     c->socket.data = NULL;
 

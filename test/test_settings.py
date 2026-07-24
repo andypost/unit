@@ -309,6 +309,60 @@ Connection: close
     assert len(data) > data_len, 'send timeout data 2'
 
 
+def test_settings_send_timeout_recovery(temp_dir):
+    # Regression test: aborting a request on send timeout while the
+    # response body is still queued used to double-complete the request's
+    # last buffer and crash the router with a use-after-free.  Abort
+    # several requests in a row, then check that the router still serves.
+    client.load('body_generate')
+
+    def req(addr, data_len):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(addr)
+
+        req = f"""GET / HTTP/1.1
+Host: localhost
+X-Length: {data_len}
+Connection: close
+
+"""
+
+        sock.sendall(req.encode())
+
+        data = sock.recv(16).decode()
+
+        time.sleep(3)
+
+        data += client.recvall(sock).decode()
+
+        sock.close()
+
+        return data
+
+    sysctl_out = sysctl()
+    values = re.findall(r'net.core.[rw]mem_(?:max|default).*?(\d+)', sysctl_out)
+    values = [int(v) for v in values]
+
+    data_len = 1048576 if len(values) == 0 else 10 * max(values)
+
+    addr = f'{temp_dir}/sock'
+
+    assert 'success' in client.conf(
+        {f'unix:{addr}': {'application': 'body_generate'}}, 'listeners'
+    )
+
+    assert 'success' in client.conf({'http': {'send_timeout': 1}}, 'settings')
+
+    for i in range(3):
+        data = req(addr, data_len)
+        assert re.search(r'200 OK', data), f'aborted status {i}'
+        assert len(data) < data_len, f'aborted data {i}'
+
+    data = req(addr, 10)
+    assert re.search(r'200 OK', data), 'recovery status'
+    assert re.search(r'XXXXXXXXXX$', data), 'recovery data'
+
+
 def test_settings_idle_timeout():
     client.load('empty')
 

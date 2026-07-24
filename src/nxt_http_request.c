@@ -828,6 +828,17 @@ nxt_http_buf_last(nxt_http_request_t *r)
     last = r->last;
 
     if (last == NULL) {
+        if (r->header_sent) {
+            /*
+             * The last buffer was created lazily at header send and has
+             * already been consumed by the send path.  Do not mint a second
+             * one: its completion is nxt_http_request_done, and a duplicate
+             * completion would free the request pool twice (use-after-free
+             * on an abort after the response was queued).
+             */
+            return NULL;
+        }
+
         last = nxt_mp_zget(r->mem_pool, NXT_BUF_SYNC_SIZE);
         if (nxt_slow_path(last == NULL)) {
             return NULL;

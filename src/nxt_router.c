@@ -5408,6 +5408,24 @@ nxt_router_process_http_request(nxt_task_t *task, nxt_http_request_t *r,
     req_rpc_data->request = r;
     r->req_rpc_data = req_rpc_data;
 
+    /*
+     * The response sync-last buffer is now created lazily at header send, so
+     * it does not yet exist here.  App requests must complete through
+     * nxt_router_http_request_done() (which unlinks req_rpc_data before the
+     * close), so create the buffer eagerly and install that handler; without
+     * it an app request would fall back to plain nxt_http_request_done() and
+     * skip the rpc-data unlink.
+     */
+    if (r->last == NULL) {
+        r->last = nxt_mp_zget(r->mem_pool, NXT_BUF_SYNC_SIZE);
+
+        if (nxt_fast_path(r->last != NULL)) {
+            nxt_buf_set_sync(r->last);
+            nxt_buf_set_last(r->last);
+            r->last->parent = r;
+        }
+    }
+
     if (r->last != NULL) {
         r->last->completion_handler = nxt_router_http_request_done;
     }

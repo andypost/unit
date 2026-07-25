@@ -38,6 +38,43 @@ static nxt_work_handler_t nxt_event_engine_queue_pop(nxt_event_engine_t *engine,
     nxt_task_t **task, void **obj, void **data);
 
 
+/*
+ * Degrade a failed engine create() to epoll instead of failing the process:
+ * io_uring resources (ring memory, fds) can run out at any process fork or
+ * router worker start long after the startup probe passed.  The failed
+ * create() has already released its own resources (create contract) but may
+ * leave residue in the engine union; it is zeroed before the fallback engine
+ * claims the union arm.  Returns the interface that now backs the engine, or
+ * NULL when there is no fallback (the failing engine was not io_uring, or the
+ * fallback create failed too).
+ */
+
+static const nxt_event_interface_t *
+nxt_event_engine_fallback(nxt_event_engine_t *engine,
+    const nxt_event_interface_t *interface, nxt_uint_t events)
+{
+#if (NXT_HAVE_IO_URING && NXT_HAVE_EPOLL_EDGE)
+
+    if (interface != &nxt_io_uring_engine) {
+        return NULL;
+    }
+
+    nxt_memzero(&engine->u, sizeof(engine->u));
+
+    if (nxt_epoll_edge_engine.create(engine, 4 * events, events) != NXT_OK) {
+        return NULL;
+    }
+
+    return &nxt_epoll_edge_engine;
+
+#else
+
+    return NULL;
+
+#endif
+}
+
+
 nxt_event_engine_t *
 nxt_event_engine_create(nxt_task_t *task,
     const nxt_event_interface_t *interface, const nxt_sig_event_t *signals,
@@ -116,24 +153,11 @@ nxt_event_engine_create(nxt_task_t *task,
     events = (batch != 0) ? batch : 32;
 
     if (interface->create(engine, 4 * events, events) != NXT_OK) {
+        interface = nxt_event_engine_fallback(engine, interface, events);
 
-#if (NXT_HAVE_IO_URING && NXT_HAVE_EPOLL_EDGE)
-        /*
-         * io_uring resources (ring memory, fds) can run out at any process
-         * fork or router worker start long after the startup probe passed,
-         * so degrade this engine to epoll instead of failing the process.
-         */
-        if (interface != &nxt_io_uring_engine
-            || nxt_epoll_edge_engine.create(engine, 4 * events, events)
-               != NXT_OK)
-        {
+        if (interface == NULL) {
             goto event_set_fail;
         }
-
-        interface = &nxt_epoll_edge_engine;
-#else
-        goto event_set_fail;
-#endif
     }
 
     engine->event = *interface;
@@ -438,20 +462,22 @@ nxt_event_engine_change(nxt_event_engine_t *engine,
     events = (batch != 0) ? batch : 32;
 
     if (interface->create(engine, 4 * events, events) != NXT_OK) {
+        interface = nxt_event_engine_fallback(engine, interface, events);
 
-#if (NXT_HAVE_IO_URING && NXT_HAVE_EPOLL_EDGE)
-        /* As in nxt_event_engine_create(): degrade to epoll, do not die. */
-        if (interface != &nxt_io_uring_engine
-            || nxt_epoll_edge_engine.create(engine, 4 * events, events)
-               != NXT_OK)
-        {
+        if (interface == NULL) {
+            /*
+             * Both the requested facility and the fallback failed while the
+             * old facility's state is already freed: engine->event still
+             * holds the OLD vtable over a dead union.  Clear both so a
+             * subsequent nxt_event_engine_free()/poll cannot dispatch
+             * through stale function pointers into freed state; free() is
+             * NULL-guarded for exactly this path.
+             */
+            nxt_memzero(&engine->event, sizeof(nxt_event_interface_t));
+            nxt_memzero(&engine->u, sizeof(engine->u));
+
             return NXT_ERROR;
         }
-
-        interface = &nxt_epoll_edge_engine;
-#else
-        return NXT_ERROR;
-#endif
     }
 
     engine->event = *interface;
@@ -490,7 +516,10 @@ nxt_event_engine_free(nxt_event_engine_t *engine)
 
     nxt_work_queue_cache_destroy(&engine->work_queue_cache);
 
-    engine->event.free(engine);
+    /* NULL after a double create failure in nxt_event_engine_change(). */
+    if (engine->event.free != NULL) {
+        engine->event.free(engine);
+    }
 
     /*
      * Release the timer subsystem's heap-owned state.

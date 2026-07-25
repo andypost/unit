@@ -31,11 +31,14 @@
  * touched.
  *
  * Runtime control:
- *   NXT_IO_URING=0                  operational kill switch: forces epoll for
+ *   NXT_IO_URING=0 (or =off)        operational kill switch: forces epoll for
  *                                   the whole process tree with no rebuild
  *                                   (insurance against a kernel/seccomp
- *                                   io_uring regression).  Honored by both the
- *                                   registration probe and create().
+ *                                   io_uring regression).  Checked BEFORE any
+ *                                   io_uring syscall by both the registration
+ *                                   probe and create(), so the runtime uses
+ *                                   epoll without ever entering
+ *                                   io_uring_setup(2).
  *
  * Debug-only overrides:
  *   NXT_IO_URING_FORCE_TIER=none    fails both the registration probe and
@@ -43,26 +46,115 @@
  *   NXT_IO_URING_FORCE_TIER=create  passes the probe but fails create(),
  *                                   exercising the in-create epoll fallback
  *                                   (nxt_event_engine_create/_change).
+ *   NXT_IO_URING_FORCE_TIER=poll    caps at the Stage-1 poll-mode bridge:
+ *                                   accept and recv stay on poll+syscall.
+ *   NXT_IO_URING_FORCE_TIER=accept  caps at completion-mode accept (oneshot
+ *                                   IORING_OP_ACCEPT); recv stays on the
+ *                                   poll+recv path.
+ *   NXT_IO_URING_FORCE_TIER=recv    accepted for compatibility; resolves to
+ *                                   the full implemented tier (ACCEPT until
+ *                                   the buf-ring recv path lands).
+ *   NXT_IO_URING_FORCE_TIER=opt     (== recv == unset) the full feature tier.
+ *
+ * The cap never raises the tier above what the kernel actually supports; it
+ * only lowers it, so a modern kernel can drive every degraded path.
+ *
+ * SECCOMP CAVEAT: the registration probe calls io_uring_setup(2) once at
+ * startup in every --io-uring build.  A seccomp policy that answers io_uring
+ * syscalls with SCMP_ACT_ERRNO is handled (the probe fails, epoll is used),
+ * but a SCMP_ACT_KILL / SCMP_ACT_KILL_PROCESS policy delivers an uncatchable
+ * SIGSYS and kills the process at startup.  On such systems either build
+ * without --io-uring or set NXT_IO_URING=0 in the environment, which skips
+ * the probe entirely.
  */
 
 
-/* Resolved feature tiers.  Stage 1 only needs multishot POLL_ADD. */
+/*
+ * Resolved feature tiers.  Each is cumulative and degrades independently to the
+ * poll-mode Stage-1 path: RECV implies ACCEPT implies POLL.  The kernel
+ * capability is probed once (never by uname) and then capped by the debug
+ * NXT_IO_URING_FORCE_TIER override so every degraded path is exercisable on a
+ * modern kernel.
+ *
+ *   NONE    io_uring unusable                       -> epoll fallback
+ *   POLL    multishot POLL_ADD (5.13)               -> Stage-1 readiness bridge
+ *   ACCEPT  + IORING_OP_ACCEPT (5.5, probed)        -> completion-mode accept
+ *   RECV    buf-ring multishot recv: reserved, not implemented (see the
+ *           deferral note below); "recv" is still accepted by FORCE_TIER and
+ *           resolves to the full implemented tier.
+ *   OPT     reserved; SINGLE_ISSUER/DEFER_TASKRUN turned out unusable with
+ *           Unit's off-thread engine creation (see nxt_io_uring_setup), so
+ *           "opt" equals the full implemented tier as well.
+ */
 #define NXT_IOU_TIER_NONE    0
 #define NXT_IOU_TIER_POLL    1
+#define NXT_IOU_TIER_ACCEPT  2
+#define NXT_IOU_TIER_RECV    3
+#define NXT_IOU_TIER_OPT     4
 
 
 /*
- * user_data layout returned verbatim in every CQE (64 bits, fully allocated):
+ * RECV (buf-ring multishot recv) is a reserved tier: the completion-mode recv
+ * conn path is not implemented, so the resolved tier tops out at ACCEPT.
+ * The deferral is deliberate, not an oversight -- three constraints must be
+ * resolved together before it is safe, and none is a small change:
  *
- *   bit  0        DIR   0 = read poll, 1 = write poll
- *   bit  1        KIND  0 = fd poll (slot-indexed), 1 = internal sentinel
- *   bits 2..33    GEN   32-bit per-direction generation (stale-CQE rejection)
- *   bits 34..63   IDX   30-bit slot index == fd number (up to ~1.07e9 fds)
+ *   1. Scope (design §2.4).  Multishot recv must cover ONLY data connections,
+ *      never the UDS port sockets, whose messages carry SCM_RIGHTS fd-passing
+ *      and credential cmsgs that a provided-buffer IORING_OP_RECV cannot carry
+ *      (it has no ancillary-data channel).  But data conns and port sockets
+ *      arm read through the SAME engine enable_read (nxt_port_socket.c calls
+ *      nxt_fd_event_enable_read directly), and nxt_fd_event_t carries no type
+ *      tag to tell them apart -- and design §1.7 forbids adding one (ABI churn
+ *      across every engine).  So recv cannot be armed from enable_read; it must
+ *      be driven from a completion-mode nxt_conn_io_t whose read handler forks
+ *      the readiness-based nxt_conn_io_read state machine.
  *
- * GEN is the full 32-bit width of the slot's generation counter, so a stale
- * CQE can only alias a live arming after 2^32 disable/enable cycles on the
- * same fd number -- unreachable for any realistic churn.  IDX at 30 bits
- * covers any attainable RLIMIT_NOFILE.
+ *   2. Buffer lifetime (design OQ2).  The zero-copy win requires handing a ring
+ *      buffer to the request pipeline as c->read; but the router may hold
+ *      c->read across a round-trip to the application process, pinning a ring
+ *      buffer far longer than the ring can afford and starving it.  The safe
+ *      answer is copy-out at the HTTP-parse boundary for data that outlives the
+ *      completion -- which reintroduces a copy for bodies -- while a pure
+ *      copy-out-immediately model adds a userspace copy on top of the kernel's,
+ *      making it likely net-negative versus poll+recv (one kernel->c->read
+ *      copy, zero syscalls saved beyond recv).  Getting the pin/return/close
+ *      lifecycle wrong is a use-after-free or a leaked buffer -- i.e. a soak
+ *      signal-11, exactly what the acceptance gate forbids.
+ *
+ *   3. Read discipline.  Unit block_read()s after every successful read and
+ *      re-enable_read()s when it wants more; multishot recv instead delivers
+ *      continuously, so a "blocked" conn would accumulate ring buffers (bounded
+ *      by TCP rcvbuf, but multiplied across conns) until ENOBUFS, needing the
+ *      degrade-to-poll+recv path to be robust.
+ *
+ * Because a subtly wrong recv path breaks the DEFAULT build's soak with
+ * signal-11, wiring it is left to a focused follow-up with its own soak gate;
+ * the ACCEPT tier already delivers the dominant measured win (herd removal).
+ * The RECV probe was removed together with this deferral; the follow-up
+ * reintroduces a fresh capability probe with the actual implementation.
+ */
+
+
+/*
+ * user_data layout returned verbatim in every CQE:
+ *
+ *   bit  0        DIR    0 = read, 1 = write
+ *   bit  1        KIND   0 = fd poll (slot-indexed), 1 = internal sentinel
+ *   bit  2        ACCEPT 1 = completion-mode accept op (res carries the fd)
+ *   bits 3..34    GEN    32-bit per-direction generation (stale-CQE rejection)
+ *   bits 35..63   IDX    29-bit slot index == fd number (up to ~536M fds)
+ *
+ * This unifies stage1's repacked layout with the completion-mode accept bit:
+ * KIND (internal-vs-fd) and ACCEPT (poll-vs-accept-op, only when KIND==fd) are
+ * independent 1-bit fields, GEN keeps stage1's full 32-bit width -- so the mask
+ * is an identity on the uint32_t slot counter and a stale CQE can only alias a
+ * live arming after 2^32 disable/enable cycles on one fd number -- and IDX
+ * gives up one bit (29, still ~536M fds, beyond any attainable RLIMIT_NOFILE)
+ * to make room.  The ACCEPT bit keeps an accept CQE self-describing: even a
+ * stale one (after cancel/close and possible fd reuse) is recognised and its
+ * already-accepted fd is closed rather than leaked, and the deferred cancel of
+ * a condemned accept arming reissues ASYNC_CANCEL under this exact user_data.
  */
 
 #define NXT_IOU_DIR_READ     0
@@ -81,16 +173,18 @@
  */
 #define nxt_iou_gen(g)        ((uint32_t) ((g) & NXT_IOU_GEN_MASK))
 
-#define nxt_iou_ud(idx, gen, dir)                                             \
-    ( ((uint64_t) (idx) << 34)                                                \
-      | (((uint64_t) ((gen) & NXT_IOU_GEN_MASK)) << 2)                        \
+#define nxt_iou_ud(idx, gen, dir, acc)                                        \
+    ( ((uint64_t) (idx) << 35)                                                \
+      | (((uint64_t) ((gen) & NXT_IOU_GEN_MASK)) << 3)                        \
+      | ((uint64_t) ((acc) != 0) << 2)                                        \
       | ((uint64_t) (NXT_IOU_KIND_FD) << 1)                                   \
       | (uint64_t) (dir) )
 
 #define nxt_iou_ud_dir(ud)    ((uint32_t) ((ud) & 0x1))
 #define nxt_iou_ud_kind(ud)   ((uint32_t) (((ud) >> 1) & 0x1))
-#define nxt_iou_ud_gen(ud)    ((uint32_t) (((ud) >> 2) & NXT_IOU_GEN_MASK))
-#define nxt_iou_ud_idx(ud)    ((uint32_t) ((ud) >> 34))
+#define nxt_iou_ud_accept(ud) ((uint32_t) (((ud) >> 2) & 0x1))
+#define nxt_iou_ud_gen(ud)    ((uint32_t) (((ud) >> 3) & NXT_IOU_GEN_MASK))
+#define nxt_iou_ud_idx(ud)    ((uint32_t) ((ud) >> 35))
 
 /* Internal sentinel user_data values (KIND == INTERNAL). */
 #define NXT_IOU_UD_POST      ((uint64_t) 0x2)   /* eventfd post channel     */
@@ -115,30 +209,33 @@ static nxt_int_t nxt_io_uring_create(nxt_event_engine_t *engine,
 static nxt_int_t nxt_io_uring_setup(nxt_event_engine_t *engine,
     nxt_uint_t mchanges, nxt_uint_t mevents);
 static nxt_bool_t nxt_io_uring_multishot_supported(struct io_uring *ring);
-static void nxt_io_uring_test_accept4(nxt_event_engine_t *engine,
-    nxt_conn_io_t *io);
+static nxt_bool_t nxt_io_uring_env_disabled(void);
+static nxt_int_t nxt_io_uring_force_cap(void);
+static nxt_int_t nxt_io_uring_kernel_tier(void);
+static nxt_bool_t nxt_io_uring_accept_supported(struct io_uring *ring);
 #if (NXT_HAVE_SIGNALFD)
 static nxt_int_t nxt_io_uring_add_signal(nxt_event_engine_t *engine);
-static void nxt_io_uring_signalfd_handler(nxt_task_t *task, void *obj,
-    void *data);
 #endif
 static void nxt_io_uring_free(nxt_event_engine_t *engine);
 static nxt_io_uring_slot_t *nxt_io_uring_slot(nxt_event_engine_t *engine,
     nxt_fd_t fd);
 static struct io_uring_sqe *nxt_io_uring_get_sqe(nxt_event_engine_t *engine);
 static nxt_bool_t nxt_io_uring_arm(nxt_event_engine_t *engine,
-    nxt_fd_event_t *ev, nxt_uint_t dir, nxt_bool_t multishot);
+    nxt_fd_event_t *ev, nxt_io_uring_slot_t *slot, nxt_uint_t dir,
+    nxt_bool_t multishot);
 static void nxt_io_uring_error_handler(nxt_task_t *task, void *obj, void *data);
 static void nxt_io_uring_arm_failed(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static void nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
     nxt_uint_t dir);
 static nxt_bool_t nxt_io_uring_submit_remove(nxt_event_engine_t *engine,
-    nxt_fd_t fd, uint32_t gen, nxt_uint_t dir);
+    nxt_fd_t fd, uint32_t gen, nxt_uint_t dir, nxt_bool_t accept);
 static void nxt_io_uring_retry_pending_removes(nxt_event_engine_t *engine);
 static void nxt_io_uring_arm_pend(nxt_event_engine_t *engine,
-    nxt_io_uring_slot_t *slot, nxt_uint_t dir);
+    nxt_io_uring_slot_t *slot, nxt_uint_t dir, nxt_bool_t accept);
 static void nxt_io_uring_retry_pending_arms(nxt_event_engine_t *engine);
+static nxt_bool_t nxt_io_uring_arm_accept(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev, nxt_io_uring_slot_t *slot);
 static void nxt_io_uring_slot_reconcile(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 
@@ -166,6 +263,8 @@ static void nxt_io_uring_oneshot_write(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static void nxt_io_uring_enable_accept(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
+static void nxt_io_uring_conn_io_accept(nxt_task_t *task, void *obj,
+    void *data);
 #if (NXT_HAVE_SIGNALFD)
 static nxt_int_t nxt_io_uring_enable_post(nxt_event_engine_t *engine,
     nxt_work_handler_t handler);
@@ -176,20 +275,16 @@ static void nxt_io_uring_handle_cqe(nxt_event_engine_t *engine,
     struct io_uring_cqe *cqe);
 static void nxt_io_uring_error(nxt_event_engine_t *engine,
     nxt_io_uring_slot_t *slot, nxt_fd_event_t *ev);
+static void nxt_io_uring_accept_cqe(nxt_event_engine_t *engine,
+    nxt_io_uring_slot_t *slot, uint32_t gen, struct io_uring_cqe *cqe);
 static void nxt_io_uring_internal_cqe(nxt_event_engine_t *engine,
     struct io_uring_cqe *cqe);
 
-#if (NXT_HAVE_ACCEPT4)
-static void nxt_io_uring_conn_io_accept4(nxt_task_t *task, void *obj,
-    void *data);
-#endif
-static ssize_t nxt_io_uring_conn_io_recvbuf(nxt_conn_t *c, nxt_buf_t *b);
-
-
 /*
- * A copy of nxt_unix_conn_io with recvbuf overridden by the edge-mode EOF
- * shim (see nxt_io_uring_conn_io_recvbuf); mirrors nxt_epoll_edge_conn_io.
- * Not const: create() may switch .accept to the accept4 variant.
+ * nxt_unix_conn_io with recvbuf overridden by the epoll edge engine's EOF
+ * shim, which this engine shares because multishot poll delivery is equally
+ * edge-like.  Not const: create() may switch .accept to the shared accept4
+ * variant (nxt_epoll_test_accept4).
  */
 
 static nxt_conn_io_t  nxt_io_uring_conn_io = {
@@ -197,7 +292,7 @@ static nxt_conn_io_t  nxt_io_uring_conn_io = {
     .accept = nxt_conn_io_accept,
 
     .read = nxt_conn_io_read,
-    .recvbuf = nxt_io_uring_conn_io_recvbuf,
+    .recvbuf = nxt_epoll_edge_conn_io_recvbuf,
     .recv = nxt_conn_io_recv,
 
     .write = nxt_conn_io_write,
@@ -310,7 +405,17 @@ nxt_io_uring_create(nxt_event_engine_t *engine, nxt_uint_t mchanges,
         }
 #endif
 
-        nxt_io_uring_test_accept4(engine, &nxt_io_uring_conn_io);
+        nxt_epoll_test_accept4(engine, &nxt_io_uring_conn_io);
+    }
+
+    /*
+     * In the ACCEPT tier connections arrive through IORING_OP_ACCEPT CQEs;
+     * the synchronous accept(2)/accept4() conn_io path must never run (see
+     * nxt_io_uring_conn_io_accept).  Installed after the accept4 probe so
+     * this override wins.
+     */
+    if (engine->u.io_uring.tier >= NXT_IOU_TIER_ACCEPT) {
+        nxt_io_uring_conn_io.accept = nxt_io_uring_conn_io_accept;
     }
 
     return NXT_OK;
@@ -322,41 +427,41 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
     nxt_uint_t mevents)
 {
     int                     ret;
-    char                    *force;
     uint32_t                nslots;
+    nxt_int_t               cap, tier;
     struct io_uring_params  params;
     nxt_io_uring_engine_t   *iou;
 
     iou = &engine->u.io_uring;
 
-    /*
-     * Operational kill switch: NXT_IO_URING=0 forces the epoll fallback with
-     * no rebuild.  Checked here as well as in the registration probe so an
-     * io_uring engine selected explicitly (bypassing the probe-gated default)
-     * still degrades cleanly.
-     */
-    force = getenv("NXT_IO_URING");
+#if !(NXT_HAVE_SIGNALFD)
+    /* Belt-and-braces: the probe already refuses to register (see there). */
+    return NXT_ERROR;
+#endif
 
-    if (force != NULL && nxt_strcmp(force, "0") == 0) {
+    /*
+     * Operational kill switch, checked before any io_uring syscall: forces
+     * the epoll fallback with no rebuild.  Checked here as well as in the
+     * registration probe so an io_uring engine selected explicitly (bypassing
+     * the probe-gated default) still degrades cleanly.
+     */
+    if (nxt_io_uring_env_disabled()) {
         nxt_log(&engine->task, NXT_LOG_INFO,
-                "io_uring disabled by NXT_IO_URING=0");
+                "io_uring disabled by NXT_IO_URING environment variable");
         return NXT_ERROR;
     }
 
     /*
-     * Debug override: NXT_IO_URING_FORCE_TIER=none (also failing the probe)
-     * or =create (probe passes, create fails) force this create() to fail
-     * cleanly so the caller degrades to epoll.  Any other value keeps the
-     * resolved tier (Stage 1 caps at POLL regardless).
+     * Debug override: NXT_IO_URING_FORCE_TIER caps the resolved tier.  =none
+     * (also failing the registration probe) and =create force this create() to
+     * fail cleanly so the caller degrades to epoll.  Any other value is a cap
+     * that never raises the tier above kernel support.
      */
-    force = getenv("NXT_IO_URING_FORCE_TIER");
+    cap = nxt_io_uring_force_cap();
 
-    if (force != NULL
-        && (nxt_strcmp(force, "none") == 0
-            || nxt_strcmp(force, "create") == 0))
-    {
+    if (cap == NXT_IOU_TIER_NONE) {
         nxt_log(&engine->task, NXT_LOG_INFO,
-                "io_uring disabled by NXT_IO_URING_FORCE_TIER=%s", force);
+                "io_uring disabled by NXT_IO_URING_FORCE_TIER");
         return NXT_ERROR;
     }
 
@@ -369,8 +474,21 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
     iou->sq_entries = nxt_io_uring_pow2(nxt_max(mchanges, 256));
     iou->cq_entries = nxt_io_uring_pow2(nxt_max(8 * (uint32_t) mevents, 4096));
 
+    /*
+     * IORING_SETUP_SINGLE_ISSUER / IORING_SETUP_DEFER_TASKRUN are deliberately
+     * NOT used.  Finding (design §2.5 correction): the kernel binds the ring's
+     * permitted submitter task at io_uring_setup() time -- verified on a 7.0
+     * kernel as -EEXIST on any submit from another task, even for
+     * SINGLE_ISSUER without DEFER_TASKRUN.  Unit creates each router worker's
+     * engine on the router-MAIN thread (nxt_event_engine_create in
+     * nxt_router_engines_create) and only later runs poll() on the spawned
+     * worker thread (nxt_event_engine_start) -- a different task -- so the
+     * flags busy-loop every worker's poll() on -EEXIST.  "One thread owns each
+     * engine" holds for the poll loop but NOT for engine creation, which the
+     * flags key off.  Revisit only if ring creation moves onto the polling
+     * thread.
+     */
     nxt_memzero(&params, sizeof(struct io_uring_params));
-
     params.flags = IORING_SETUP_CQSIZE;
     params.cq_entries = iou->cq_entries;
 
@@ -390,16 +508,38 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
 
     iou->ring_inited = 1;
 
-    nxt_debug(&engine->task, "io_uring_queue_init(): sq:%uD cq:%uD features:%uxD",
+    nxt_debug(&engine->task,
+              "io_uring_queue_init(): sq:%uD cq:%uD features:%uxD",
               iou->sq_entries, params.cq_entries, params.features);
 
-    if (!nxt_io_uring_multishot_supported(&iou->ring)) {
+    /*
+     * Resolve the kernel capability from a cached throwaway-ring probe rather
+     * than probing this engine's ring: with IORING_SETUP_SINGLE_ISSUER the
+     * kernel binds the ring to the FIRST submitting task, and Unit creates the
+     * router-worker engines on the router-main thread while poll() runs on the
+     * spawned worker thread (nxt_router.c: nxt_event_engine_create at engine
+     * setup vs nxt_event_engine_start on the worker).  Submitting a probe SQE
+     * here would bind the ring to the wrong thread and every worker submit
+     * would then fail with -EEXIST.  So create() performs NO submission; the
+     * first submit happens in poll() on the owning thread.  Multishot POLL_ADD
+     * is the floor; without it there is no point.
+     */
+    tier = nxt_io_uring_kernel_tier();
+
+    if (tier < NXT_IOU_TIER_POLL) {
         nxt_log(&engine->task, NXT_LOG_INFO,
                 "io_uring multishot poll is not supported");
         return NXT_ERROR;
     }
 
-    iou->tier = NXT_IOU_TIER_POLL;
+    if (tier > cap) {
+        tier = cap;
+    }
+
+    iou->tier = tier;
+
+    nxt_log(&engine->task, NXT_LOG_INFO,
+            "io_uring tier %d", (int) iou->tier);
 
     /* Slots are indexed by fd number; start small and grow on demand. */
     nslots = nxt_max((uint32_t) mevents * 2, 128);
@@ -412,6 +552,131 @@ nxt_io_uring_setup(nxt_event_engine_t *engine, nxt_uint_t mchanges,
     iou->nslots = nslots;
 
     return NXT_OK;
+}
+
+
+/*
+ * Operational kill-switch: NXT_IO_URING=0 or =off disables the engine before
+ * ANY io_uring syscall is made.  This is the escape hatch for seccomp
+ * SCMP_ACT_KILL policies (see the header comment): the probe and create()
+ * both consult it first, so a deployment can neutralise the startup
+ * io_uring_setup(2) without rebuilding.
+ */
+
+static nxt_bool_t
+nxt_io_uring_env_disabled(void)
+{
+    char  *v;
+
+    v = getenv("NXT_IO_URING");
+
+    return (v != NULL
+            && (nxt_strcmp(v, "0") == 0 || nxt_strcmp(v, "off") == 0));
+}
+
+
+/*
+ * Parse NXT_IO_URING_FORCE_TIER into a tier cap.  Returns NXT_IOU_TIER_NONE for
+ * "none"/"create" (create() must fail), otherwise the capped feature tier.
+ * Unset, "opt", or an unrecognised value means the full feature tier (RECV).
+ * The SINGLE_ISSUER/DEFER_TASKRUN setup flags are governed separately (see
+ * nxt_io_uring_setup); "opt" and "recv" therefore resolve to the same feature
+ * set, the design's OPT tier being RECV plus those flags.
+ */
+
+static nxt_int_t
+nxt_io_uring_force_cap(void)
+{
+    char  *force;
+
+    force = getenv("NXT_IO_URING_FORCE_TIER");
+
+    if (force == NULL) {
+        return NXT_IOU_TIER_RECV;
+    }
+
+    if (nxt_strcmp(force, "none") == 0 || nxt_strcmp(force, "create") == 0) {
+        return NXT_IOU_TIER_NONE;
+    }
+
+    if (nxt_strcmp(force, "poll") == 0) {
+        return NXT_IOU_TIER_POLL;
+    }
+
+    if (nxt_strcmp(force, "accept") == 0) {
+        return NXT_IOU_TIER_ACCEPT;
+    }
+
+    /* "recv", "opt", unset, or unrecognised: full feature tier. */
+    return NXT_IOU_TIER_RECV;
+}
+
+
+/*
+ * Kernel feature capability, probed once and cached process-wide (every engine
+ * in a process shares the same kernel).  Never parses uname: multishot poll is
+ * probed functionally and IORING_OP_ACCEPT via the opcode probe, both on one
+ * throwaway ring.  The result tops out at ACCEPT: the RECV tier has no
+ * implementation yet (see the deferral note above), and its probe will be
+ * reintroduced together with the actual completion-mode recv path.
+ */
+
+static nxt_int_t
+nxt_io_uring_kernel_tier(void)
+{
+    int                     ret;
+    struct io_uring         ring;
+    static nxt_int_t        cached = -1;
+
+    if (cached >= 0) {
+        return cached;
+    }
+
+    cached = NXT_IOU_TIER_NONE;
+
+    ret = io_uring_queue_init(64, &ring, 0);
+    if (ret < 0) {
+        return cached;
+    }
+
+    if (nxt_io_uring_multishot_supported(&ring)) {
+        cached = NXT_IOU_TIER_POLL;
+
+        if (nxt_io_uring_accept_supported(&ring)) {
+            cached = NXT_IOU_TIER_ACCEPT;
+        }
+    }
+
+    io_uring_queue_exit(&ring);
+
+    return cached;
+}
+
+
+/*
+ * IORING_OP_ACCEPT support (the accept tier uses ONESHOT accepts re-armed per
+ * completion; see nxt_io_uring_enable_accept) via the opcode probe -- accept
+ * is a first-class opcode, unlike multishot poll's flag bit, so no functional
+ * test or wait is needed.
+ */
+
+static nxt_bool_t
+nxt_io_uring_accept_supported(struct io_uring *ring)
+{
+    nxt_bool_t             ok;
+    struct io_uring_probe  *probe;
+
+    probe = io_uring_get_probe_ring(ring);
+
+    if (probe == NULL) {
+        return 0;
+    }
+
+    ok = io_uring_opcode_supported(probe, IORING_OP_ACCEPT);
+
+    io_uring_free_probe(probe);
+
+    return ok;
 }
 
 
@@ -493,20 +758,25 @@ done:
 nxt_int_t
 nxt_io_uring_probe(void)
 {
-    int              ret;
-    char             *force;
-    nxt_bool_t       ok;
-    struct io_uring  ring;
+#if !(NXT_HAVE_SIGNALFD)
+    /*
+     * Without signalfd the engine cannot deliver Unix signals: its eventfd
+     * doorbell carries no signo, so the sigwait()-thread fallback that
+     * signal_support=0 engines rely on would silently drop every signal
+     * routed through engine->event.signal().  Do not register the engine.
+     */
+    return NXT_ERROR;
+#else
+    char  *force;
 
     /*
-     * NXT_IO_URING=0 is the operational kill switch: it forces epoll for the
-     * whole process tree (the engine is never registered) with no rebuild --
-     * cheap insurance against a kernel/seccomp io_uring regression.
-     * NXT_IO_URING_FORCE_TIER=none is the debug-only equivalent.
+     * NXT_IO_URING=0 (or =off) is the operational kill switch: it forces
+     * epoll for the whole process tree (the engine is never registered) with
+     * no rebuild -- cheap insurance against a kernel/seccomp io_uring
+     * regression.  Checked BEFORE any io_uring syscall; see the header
+     * comment.  NXT_IO_URING_FORCE_TIER=none is the debug-only equivalent.
      */
-    force = getenv("NXT_IO_URING");
-
-    if (force != NULL && nxt_strcmp(force, "0") == 0) {
+    if (nxt_io_uring_env_disabled()) {
         return NXT_ERROR;
     }
 
@@ -516,44 +786,9 @@ nxt_io_uring_probe(void)
         return NXT_ERROR;
     }
 
-    ret = io_uring_queue_init(8, &ring, 0);
-    if (ret < 0) {
-        return NXT_ERROR;
-    }
-
-    ok = nxt_io_uring_multishot_supported(&ring);
-
-    io_uring_queue_exit(&ring);
-
-    return ok ? NXT_OK : NXT_ERROR;
-}
-
-
-static void
-nxt_io_uring_test_accept4(nxt_event_engine_t *engine, nxt_conn_io_t *io)
-{
-    static nxt_work_handler_t  handler;
-
-    if (handler == NULL) {
-
-        handler = io->accept;
-
-#if (NXT_HAVE_ACCEPT4)
-
-        (void) accept4(-1, NULL, NULL, SOCK_NONBLOCK);
-
-        if (nxt_errno != NXT_ENOSYS) {
-            handler = nxt_io_uring_conn_io_accept4;
-
-        } else {
-            nxt_log(&engine->task, NXT_LOG_INFO, "accept4() failed %E",
-                    NXT_ENOSYS);
-        }
-
+    return (nxt_io_uring_kernel_tier() >= NXT_IOU_TIER_POLL)
+           ? NXT_OK : NXT_ERROR;
 #endif
-    }
-
-    io->accept = handler;
 }
 
 
@@ -570,54 +805,41 @@ nxt_io_uring_test_accept4(nxt_event_engine_t *engine, nxt_conn_io_t *io)
 static nxt_int_t
 nxt_io_uring_add_signal(nxt_event_engine_t *engine)
 {
-    int                    fd;
+    nxt_io_uring_slot_t    *slot;
     nxt_io_uring_engine_t  *iou;
 
     iou = &engine->u.io_uring;
 
-    if (sigprocmask(SIG_BLOCK, &engine->signals->sigmask, NULL) != 0) {
-        nxt_alert(&engine->task, "sigprocmask(SIG_BLOCK) failed %E", nxt_errno);
+    /*
+     * The shared helper installs nxt_epoll_signalfd_handler, which drains the
+     * signalfd to EAGAIN -- required here because the engine's multishot poll
+     * is edge-like and the per-drain dedupe can collapse several queued
+     * signals into a single handler run.
+     */
+    if (nxt_epoll_signalfd_create(engine, &iou->signalfd) != NXT_OK) {
         return NXT_ERROR;
     }
-
-    fd = signalfd(-1, &engine->signals->sigmask, 0);
-
-    if (fd == -1) {
-        nxt_alert(&engine->task, "signalfd(%d) failed %E",
-                  iou->signalfd.fd, nxt_errno);
-        return NXT_ERROR;
-    }
-
-    iou->signalfd.fd = fd;
-
-    if (nxt_fd_nonblocking(&engine->task, fd) != NXT_OK) {
-        return NXT_ERROR;
-    }
-
-    nxt_debug(&engine->task, "io_uring signalfd(): %d", fd);
-
-    iou->signalfd.data = engine->signals->handler;
-    iou->signalfd.read_work_queue = &engine->fast_work_queue;
-    iou->signalfd.read_handler = nxt_io_uring_signalfd_handler;
-    iou->signalfd.log = engine->task.log;
-    iou->signalfd.task = &engine->task;
 
     /*
      * Arm the signalfd's multishot read poll through the fallible primitive
      * rather than nxt_io_uring_enable_read(): the latter reports a failed arm
      * only by queuing nxt_io_uring_error_handler, which is a no-op for an
      * internal fd (the signalfd has no error_handler).  A silently swallowed
-     * failure would let create() succeed with the signals blocked (sigprocmask
-     * above) but never delivered.  Propagate NXT_ERROR instead so create()
-     * unwinds -- nxt_io_uring_free() closes the signalfd, the sigmask stays
-     * blocked exactly as on the epoll engine's own signalfd failure paths --
-     * and the runtime falls back to epoll, whose add_signal() re-blocks and
-     * re-arms it, mirroring how epoll treats a failed epoll_ctl() there.
+     * failure would let create() succeed with the signals blocked (the shared
+     * helper's sigprocmask) but never delivered.  Propagate NXT_ERROR instead
+     * so create() unwinds -- nxt_io_uring_free() closes the signalfd, the
+     * sigmask stays blocked exactly as on the epoll engine's own signalfd
+     * failure paths -- and the runtime falls back to epoll, whose
+     * add_signal() re-blocks and re-arms it, mirroring how epoll treats a
+     * failed epoll_ctl() there.
      */
-    if (nxt_slow_path(!nxt_io_uring_arm(engine, &iou->signalfd,
+    slot = nxt_io_uring_slot(engine, iou->signalfd.fd);
+
+    if (nxt_slow_path(!nxt_io_uring_arm(engine, &iou->signalfd, slot,
                                         NXT_IOU_DIR_READ, 1)))
     {
-        nxt_alert(&engine->task, "io_uring failed to arm signalfd(%d)", fd);
+        nxt_alert(&engine->task, "io_uring failed to arm signalfd(%d)",
+                  iou->signalfd.fd);
         return NXT_ERROR;
     }
 
@@ -626,48 +848,6 @@ nxt_io_uring_add_signal(nxt_event_engine_t *engine)
     return NXT_OK;
 }
 
-
-static void
-nxt_io_uring_signalfd_handler(nxt_task_t *task, void *obj, void *data)
-{
-    int                      n;
-    nxt_err_t                err;
-    nxt_fd_event_t           *ev;
-    nxt_work_handler_t       handler;
-    struct signalfd_siginfo  sfd;
-
-    ev = obj;
-    handler = data;
-
-    nxt_debug(task, "io_uring signalfd handler");
-
-    /*
-     * Drain the signalfd to EAGAIN: multishot poll delivery is edge-like
-     * (one CQE per wakeup) and the CQ drain dedupes to one handler call, so
-     * a single read() would strand any additional queued siginfo records
-     * (e.g. a SIGTERM arriving while a SIGCHLD is already pending) until
-     * some later, unrelated wakeup.
-     */
-    for ( ;; ) {
-        n = read(ev->fd, &sfd, sizeof(struct signalfd_siginfo));
-        err = (n == -1) ? nxt_errno : 0;
-
-        nxt_debug(task, "read signalfd(%d): %d", ev->fd, n);
-
-        if (n != sizeof(struct signalfd_siginfo)) {
-            if (n == -1 && err == NXT_EAGAIN) {
-                return;
-            }
-
-            nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, err);
-            return;
-        }
-
-        nxt_debug(task, "signalfd(%d) signo:%d", ev->fd, sfd.ssi_signo);
-
-        handler(task, (void *) (uintptr_t) sfd.ssi_signo, NULL);
-    }
-}
 
 #endif
 
@@ -777,7 +957,6 @@ nxt_io_uring_get_sqe(nxt_event_engine_t *engine)
     if (nxt_slow_path(sqe == NULL)) {
         /* SQ ring full: submit the accumulated batch to free slots. */
         (void) io_uring_submit(&engine->u.io_uring.ring);
-        engine->u.io_uring.nsubmitted = 0;
 
         sqe = io_uring_get_sqe(&engine->u.io_uring.ring);
     }
@@ -830,15 +1009,13 @@ nxt_io_uring_arm_failed(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 
 
 static nxt_bool_t
-nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t dir,
-    nxt_bool_t multishot)
+nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
+    nxt_io_uring_slot_t *slot, nxt_uint_t dir, nxt_bool_t multishot)
 {
     uint32_t             gen;
     uint32_t             mask;
     struct io_uring_sqe  *sqe;
-    nxt_io_uring_slot_t  *slot;
 
-    slot = nxt_io_uring_slot(engine, ev->fd);
     if (nxt_slow_path(slot == NULL)) {
         nxt_alert(ev->task, "io_uring slot alloc failed for fd %d", ev->fd);
         return 0;
@@ -859,7 +1036,8 @@ nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t dir,
         if (nxt_slow_path(slot->read_remove_pending)) {
             if (!nxt_io_uring_submit_remove(engine, ev->fd,
                                             slot->read_remove_gen,
-                                            NXT_IOU_DIR_READ))
+                                            NXT_IOU_DIR_READ,
+                                            slot->read_remove_accept))
             {
                 return 0;
             }
@@ -871,7 +1049,7 @@ nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t dir,
         if (nxt_slow_path(slot->write_remove_pending)) {
             if (!nxt_io_uring_submit_remove(engine, ev->fd,
                                             slot->write_remove_gen,
-                                            NXT_IOU_DIR_WRITE))
+                                            NXT_IOU_DIR_WRITE, 0))
             {
                 return 0;
             }
@@ -893,6 +1071,7 @@ nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t dir,
         mask = NXT_IOU_READ_MASK;
         slot->read_armed = 1;
         slot->read_multishot = multishot;
+        slot->accept = 0;             /* a poll arming, not an accept         */
 
     } else {
         gen = slot->write_generation;
@@ -907,9 +1086,7 @@ nxt_io_uring_arm(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t dir,
         io_uring_prep_poll_add(sqe, ev->fd, mask);
     }
 
-    io_uring_sqe_set_data64(sqe, nxt_iou_ud(ev->fd, gen, dir));
-
-    engine->u.io_uring.nsubmitted++;
+    io_uring_sqe_set_data64(sqe, nxt_iou_ud(ev->fd, gen, dir, 0));
 
     nxt_debug(ev->task, "io_uring arm fd:%d dir:%d ms:%d gen:%uD",
               ev->fd, (int) dir, (int) multishot, (uint32_t) gen);
@@ -923,6 +1100,7 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
     nxt_uint_t dir)
 {
     uint32_t             gen;
+    nxt_bool_t           accept;
     nxt_io_uring_slot_t  *slot;
 
     slot = nxt_io_uring_slot(engine, ev->fd);
@@ -932,13 +1110,14 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
 
     /*
      * The armed flag is cleared and the generation bumped up front -- before
-     * the POLL_REMOVE SQE is (attempted to be) obtained.  This is deliberate:
+     * the cancel SQE is (attempted to be) obtained.  This is deliberate:
      * it keeps the slot immediately safe to re-arm and the fd safe to close and
      * reuse, because the bump invalidates every completion still in flight for
      * this arming (they carry the pre-bump generation and are rejected).  If
-     * the SQE cannot be obtained the cancel is not lost -- it is recorded and
-     * retried from nxt_io_uring_poll() under the pre-bump generation, so the
-     * leaked kernel poll's file reference is dropped even after a close/reuse.
+     * the SQE cannot be obtained the cancel is not lost -- it is recorded
+     * (together with the arming's kind, see read_remove_accept) and retried
+     * from nxt_io_uring_poll() under the pre-bump generation, so the leaked
+     * kernel arming's file reference is dropped even after a close/reuse.
      */
     /*
      * Any disable/delete/close/oneshot on a direction invalidates a re-arm
@@ -946,6 +1125,8 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
      * so drop the pending record before it is retried.  Cleared up front so
      * the !armed early-return below cannot skip it.
      */
+    accept = 0;
+
     if (dir == NXT_IOU_DIR_READ) {
         if (slot->read_arm_pending) {
             slot->read_arm_pending = 0;
@@ -957,7 +1138,9 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
             return;
         }
         gen = slot->read_generation;
+        accept = slot->accept;
         slot->read_armed = 0;
+        slot->accept = 0;
         slot->read_generation++;
 
     } else {
@@ -975,7 +1158,9 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
         slot->write_generation++;
     }
 
-    if (nxt_slow_path(!nxt_io_uring_submit_remove(engine, ev->fd, gen, dir))) {
+    if (nxt_slow_path(!nxt_io_uring_submit_remove(engine, ev->fd, gen, dir,
+                                                  accept)))
+    {
         nxt_alert(ev->task, "io_uring_get_sqe() failed for fd %d, "
                   "deferring poll cancel", ev->fd);
 
@@ -993,6 +1178,7 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
                 engine->u.io_uring.npending_removes++;
             }
             slot->read_remove_gen = gen;
+            slot->read_remove_accept = accept;
 
         } else {
             if (!slot->write_remove_pending) {
@@ -1005,22 +1191,25 @@ nxt_io_uring_remove(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
         return;
     }
 
-    nxt_debug(ev->task, "io_uring remove fd:%d dir:%d gen:%uD",
-              ev->fd, (int) dir, (uint32_t) gen);
+    nxt_debug(ev->task, "io_uring remove fd:%d dir:%d gen:%uD acc:%d",
+              ev->fd, (int) dir, (uint32_t) gen, (int) accept);
 }
 
 
 /*
- * Prepare and account a POLL_REMOVE for a specific (fd, generation, direction)
- * arming.  POLL_REMOVE matches by the exact user_data the POLL_ADD was issued
- * with, so the pre-bump generation must be used.  Returns 0 iff no SQE could be
- * obtained even after the get_sqe() submit-flush (SQ ring exhausted while the
- * CQ overflowed); the caller records the cancel for retry.
+ * Prepare and account the cancel for a specific (fd, generation, direction)
+ * arming.  Both cancel forms match by the exact user_data the arming was
+ * issued with, so the pre-bump generation must be used: POLL_REMOVE for a
+ * poll, ASYNC_CANCEL for a oneshot accept (which is not a poll and would be
+ * missed by POLL_REMOVE) -- the accept flag selects which, and MUST reflect
+ * the condemned arming's kind, not the slot's current one.  Returns 0 iff no
+ * SQE could be obtained even after the get_sqe() submit-flush (SQ ring
+ * exhausted while the CQ overflowed); the caller records the cancel for retry.
  */
 
 static nxt_bool_t
 nxt_io_uring_submit_remove(nxt_event_engine_t *engine, nxt_fd_t fd, uint32_t gen,
-    nxt_uint_t dir)
+    nxt_uint_t dir, nxt_bool_t accept)
 {
     struct io_uring_sqe  *sqe;
 
@@ -1029,23 +1218,30 @@ nxt_io_uring_submit_remove(nxt_event_engine_t *engine, nxt_fd_t fd, uint32_t gen
         return 0;
     }
 
-    io_uring_prep_poll_remove(sqe, nxt_iou_ud(fd, gen, dir));
-    io_uring_sqe_set_data64(sqe, NXT_IOU_UD_REMOVE);
+    if (accept) {
+        io_uring_prep_cancel64(sqe,
+                               nxt_iou_ud(fd, gen, NXT_IOU_DIR_READ, 1), 0);
 
-    engine->u.io_uring.nsubmitted++;
+    } else {
+        io_uring_prep_poll_remove(sqe, nxt_iou_ud(fd, gen, dir, 0));
+    }
+
+    io_uring_sqe_set_data64(sqe, NXT_IOU_UD_REMOVE);
 
     return 1;
 }
 
 
 /*
- * Retry, at the top of nxt_io_uring_poll(), the POLL_REMOVEs that could not get
+ * Retry, at the top of nxt_io_uring_poll(), the cancels that could not get
  * an SQE when their direction was disabled/deleted/closed.  Gated by
  * npending_removes so the slot scan never runs in steady state.  A still-live
- * kernel poll keeps its file reference until this lands, so retrying until an
- * SQE is available is what stops a close-with-live-poller from leaking that
+ * kernel arming keeps its file reference until this lands, so retrying until
+ * an SQE is available is what stops a close-with-live-poller from leaking that
  * reference to ring teardown; the generation bump done at record time keeps any
- * completion the poll emits meanwhile harmless (and safe across an fd reuse).
+ * completion the arming emits meanwhile harmless (and safe across an fd reuse).
+ * The recorded read_remove_accept restores the correct cancel form for a
+ * condemned accept arming.
  */
 
 static void
@@ -1062,7 +1258,8 @@ nxt_io_uring_retry_pending_removes(nxt_event_engine_t *engine)
 
         if (slot->read_remove_pending
             && nxt_io_uring_submit_remove(engine, fd, slot->read_remove_gen,
-                                          NXT_IOU_DIR_READ))
+                                          NXT_IOU_DIR_READ,
+                                          slot->read_remove_accept))
         {
             slot->read_remove_pending = 0;
             iou->npending_removes--;
@@ -1070,7 +1267,7 @@ nxt_io_uring_retry_pending_removes(nxt_event_engine_t *engine)
 
         if (slot->write_remove_pending
             && nxt_io_uring_submit_remove(engine, fd, slot->write_remove_gen,
-                                          NXT_IOU_DIR_WRITE))
+                                          NXT_IOU_DIR_WRITE, 0))
         {
             slot->write_remove_pending = 0;
             iou->npending_removes--;
@@ -1091,13 +1288,21 @@ nxt_io_uring_retry_pending_removes(nxt_event_engine_t *engine)
 
 static void
 nxt_io_uring_arm_pend(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
-    nxt_uint_t dir)
+    nxt_uint_t dir, nxt_bool_t accept)
 {
     if (dir == NXT_IOU_DIR_READ) {
         if (!slot->read_arm_pending) {
             slot->read_arm_pending = 1;
             engine->u.io_uring.npending_arms++;
         }
+
+        /*
+         * Record whether the owed R re-arm is a completion-mode accept op so
+         * the poll-loop retry reissues it via arm_accept (ASYNC_CANCEL-able,
+         * res carries the fd) rather than a POLL_ADD.  Write re-arms are never
+         * accepts.
+         */
+        slot->read_arm_accept = accept;
 
     } else {
         if (!slot->write_arm_pending) {
@@ -1141,9 +1346,15 @@ nxt_io_uring_retry_pending_arms(nxt_event_engine_t *engine)
             if (ev == NULL
                 || ev->read == NXT_EVENT_INACTIVE
                 || ev->read == NXT_EVENT_DISABLED
-                || slot->read_armed
-                || nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ,
-                                    slot->read_multishot))
+                || slot->read_armed)
+            {
+                slot->read_arm_pending = 0;
+                iou->npending_arms--;
+
+            } else if (slot->read_arm_accept
+                       ? nxt_io_uring_arm_accept(engine, ev, slot)
+                       : nxt_io_uring_arm(engine, ev, slot, NXT_IOU_DIR_READ,
+                                          slot->read_multishot))
             {
                 slot->read_arm_pending = 0;
                 iou->npending_arms--;
@@ -1157,7 +1368,7 @@ nxt_io_uring_retry_pending_arms(nxt_event_engine_t *engine)
                 || ev->write == NXT_EVENT_INACTIVE
                 || ev->write == NXT_EVENT_DISABLED
                 || slot->write_armed
-                || nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_WRITE, 1))
+                || nxt_io_uring_arm(engine, ev, slot, NXT_IOU_DIR_WRITE, 1))
             {
                 slot->write_arm_pending = 0;
                 iou->npending_arms--;
@@ -1236,14 +1447,16 @@ nxt_io_uring_enable(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     }
 
     if (!slot->read_armed
-        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 1)))
+        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                           NXT_IOU_DIR_READ, 1)))
     {
         nxt_io_uring_arm_failed(engine, ev);
         return;
     }
 
     if (!slot->write_armed
-        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_WRITE, 1)))
+        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                           NXT_IOU_DIR_WRITE, 1)))
     {
         nxt_io_uring_arm_failed(engine, ev);
         return;
@@ -1303,10 +1516,8 @@ nxt_io_uring_close(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_io_uring_delete(engine, ev);
 
-    if (engine->u.io_uring.nsubmitted != 0) {
-        (void) io_uring_submit(&engine->u.io_uring.ring);
-        engine->u.io_uring.nsubmitted = 0;
-    }
+    /* liburing skips the io_uring_enter() syscall when the SQ is empty. */
+    (void) io_uring_submit(&engine->u.io_uring.ring);
 
     return ev->changing;
 }
@@ -1331,7 +1542,8 @@ nxt_io_uring_enable_read(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
      * syscall reduction over epoll's re-MOD.
      */
     if (!slot->read_armed
-        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 1)))
+        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                           NXT_IOU_DIR_READ, 1)))
     {
         nxt_io_uring_arm_failed(engine, ev);
         return;
@@ -1355,7 +1567,8 @@ nxt_io_uring_enable_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     }
 
     if (!slot->write_armed
-        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_WRITE, 1)))
+        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                           NXT_IOU_DIR_WRITE, 1)))
     {
         nxt_io_uring_arm_failed(engine, ev);
         return;
@@ -1426,18 +1639,34 @@ nxt_io_uring_block_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
  * Cancelling first (remove bumps the generation, so a fresh enable_read()
  * re-arms a POLL_ADD that re-checks readiness at submission) also prevents a
  * duplicate poll when the armed direction is the one being re-armed here.
+ * Removing only the directions that are actually armed avoids registering a
+ * second poll under the SAME user_data and leaking an armed poll when the
+ * opposite direction is flipped INACTIVE.
  */
 
 static void
 nxt_io_uring_oneshot_read(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
-    nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_READ);
-    nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_WRITE);
+    nxt_io_uring_slot_t  *slot;
+
+    slot = nxt_io_uring_slot(engine, ev->fd);
+
+    if (slot != NULL) {
+        if (slot->read_armed) {
+            nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_READ);
+        }
+
+        if (slot->write_armed) {
+            nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_WRITE);
+        }
+    }
 
     ev->read = NXT_EVENT_ONESHOT;
     ev->write = NXT_EVENT_INACTIVE;
 
-    if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 0))) {
+    if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                        NXT_IOU_DIR_READ, 0)))
+    {
         nxt_io_uring_arm_failed(engine, ev);
     }
 }
@@ -1446,30 +1675,75 @@ nxt_io_uring_oneshot_read(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 static void
 nxt_io_uring_oneshot_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
-    nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_READ);
-    nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_WRITE);
+    nxt_io_uring_slot_t  *slot;
+
+    slot = nxt_io_uring_slot(engine, ev->fd);
+
+    if (slot != NULL) {
+        if (slot->read_armed) {
+            nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_READ);
+        }
+
+        if (slot->write_armed) {
+            nxt_io_uring_remove(engine, ev, NXT_IOU_DIR_WRITE);
+        }
+    }
 
     ev->read = NXT_EVENT_INACTIVE;
     ev->write = NXT_EVENT_ONESHOT;
 
-    if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_WRITE, 0))) {
+    if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                        NXT_IOU_DIR_WRITE, 0)))
+    {
         nxt_io_uring_arm_failed(engine, ev);
     }
 }
 
 
 /*
- * enable_accept arms a NON-multishot POLL_ADD (POLLIN) on the listen socket
- * while keeping the state ACTIVE.  Multishot poll posts one CQE per wait
- * queue wakeup and never re-reports a still-non-empty backlog, so a partial
- * accept batch would strand the remaining connections (edge stall, contract
- * item #5).  With a single POLL_ADD the CQE handler's !F_MORE branch re-arms
- * after every event, and POLL_ADD re-checks readiness at submission -- firing
- * immediately when the backlog is non-empty -- which emulates the required
- * level-triggered re-fire at one SQE per accept batch.  IORING_OP_POLL_ADD
- * has no EPOLLEXCLUSIVE analogue, so the cross-worker thundering herd is
- * accepted for Stage 1.
+ * Completion-mode accept (tier >= ACCEPT): a ONESHOT IORING_OP_ACCEPT per
+ * listen fd, re-armed after each completion.  res carries the accepted fd.
+ *
+ * Why oneshot and not IORING_ACCEPT_MULTISHOT: a multishot accept is a
+ * PERSISTENT wake-one registration.  With N worker rings arming multishot
+ * accepts on the same shared listen fd, the kernel keeps completing every
+ * incoming connection into the same (first-armed) ring's CQ regardless of
+ * whether that worker is busy -- one worker takes 100% of the connections
+ * while the rest idle, capping throughput at a single worker (observed:
+ * all 32 conns of a c=32 load accepted by one thread).  EPOLLEXCLUSIVE does
+ * not have this pathology because it wakes only workers actually WAITING in
+ * epoll_wait, so busy workers shed load organically.  A oneshot accept
+ * restores exactly that property: each ring keeps at most ONE pending accept,
+ * so the set of pending accepts is the set of workers that have reached
+ * poll() -- the kernel distributes connections among them like N threads
+ * blocked in accept(2), herd-free (accept is consuming) AND load-balanced
+ * (a saturated worker re-arms late, naturally yielding to idle workers).
+ * Because the SQ ring is only flushed at the top of poll(), a re-arm prepped
+ * during a CQ drain is submitted when the worker next enters poll(), i.e.
+ * after its queued work has run -- the arming inherently reflects worker
+ * progress.  IORING_OP_ACCEPT evaluates the backlog at submission and
+ * completes immediately when it is non-empty, so a burst larger than the
+ * per-completion batch cannot stall (level-equivalent, contract item #5).
+ *
+ * SOCK_NONBLOCK | SOCK_CLOEXEC is passed as the accept flag to match Unit's
+ * accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC) contract: nonblocking lets the
+ * accepted fd skip the per-conn fixup, and CLOEXEC keeps it from leaking into
+ * spawned application processes (the invariant the accept4 paths enforce).
+ * The remote sockaddr is filled per accepted fd with getpeername() rather than
+ * the accept addr buffer: the buffer would have to live in the slot across the
+ * completion, and getpeername on the accepted fd is exact and simpler.
+ *
+ * Backpressure reuses the existing accept machinery unchanged: when a conn slot
+ * cannot be allocated (max_connections) nxt_conn_accept_next -> _close_idle
+ * calls disable_read, which cancels a pending oneshot accept (ASYNC_CANCEL by
+ * its user_data), and the 100 ms listen timer's enable_accept re-arms it.  Any
+ * connection the kernel accepted into a CQE we cannot service (over the limit,
+ * or completed before the cancel took effect) is closed, never leaked.
  */
+
+static nxt_bool_t nxt_io_uring_arm_accept(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev, nxt_io_uring_slot_t *slot);
+
 
 static void
 nxt_io_uring_enable_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
@@ -1486,11 +1760,109 @@ nxt_io_uring_enable_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
         return;
     }
 
-    if (!slot->read_armed
-        && nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ, 0)))
+    if (slot->read_armed) {
+        return;
+    }
+
+    if (engine->u.io_uring.tier >= NXT_IOU_TIER_ACCEPT) {
+        if (nxt_slow_path(!nxt_io_uring_arm_accept(engine, ev, slot))) {
+            nxt_io_uring_arm_failed(engine, ev);
+        }
+        return;
+    }
+
+    /*
+     * Tier POLL: a NON-multishot POLL_ADD (POLLIN) re-armed per accept batch.
+     * Multishot poll never re-reports a still-non-empty backlog, so a partial
+     * accept batch would strand the remaining connections (edge stall, contract
+     * item #5); a single POLL_ADD re-checks readiness at submission -- firing
+     * immediately when the backlog is non-empty -- which the !F_MORE re-arm
+     * turns into the required level-triggered re-fire at one SQE per batch.
+     */
+    if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                        NXT_IOU_DIR_READ, 0)))
     {
         nxt_io_uring_arm_failed(engine, ev);
     }
+}
+
+
+static nxt_bool_t
+nxt_io_uring_arm_accept(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
+    nxt_io_uring_slot_t *slot)
+{
+    struct io_uring_sqe  *sqe;
+
+    if (nxt_slow_path(slot == NULL)) {
+        nxt_alert(ev->task, "io_uring slot alloc failed for fd %d", ev->fd);
+        return 0;
+    }
+
+    /*
+     * Flush the R direction's deferred cancel before installing the accept,
+     * mirroring nxt_io_uring_arm(): it keeps the recorded state bounded to a
+     * single condemned arming per direction.  Fail the arm if the cancel
+     * cannot get an SQE; the callers escalate exactly as for a failed arm.
+     */
+    if (nxt_slow_path(slot->read_remove_pending)) {
+        if (!nxt_io_uring_submit_remove(engine, ev->fd, slot->read_remove_gen,
+                                        NXT_IOU_DIR_READ,
+                                        slot->read_remove_accept))
+        {
+            return 0;
+        }
+        slot->read_remove_pending = 0;
+        engine->u.io_uring.npending_removes--;
+    }
+
+    sqe = nxt_io_uring_get_sqe(engine);
+    if (nxt_slow_path(sqe == NULL)) {
+        nxt_alert(ev->task, "io_uring_get_sqe() failed for fd %d", ev->fd);
+        return 0;
+    }
+
+    slot->ev = ev;
+    slot->read_armed = 1;
+    slot->accept = 1;
+    slot->read_multishot = 0;
+
+    io_uring_prep_accept(sqe, ev->fd, NULL, NULL,
+                         SOCK_NONBLOCK | SOCK_CLOEXEC);
+    io_uring_sqe_set_data64(sqe,
+                        nxt_iou_ud(ev->fd, slot->read_generation,
+                                   NXT_IOU_DIR_READ, 1));
+
+    nxt_debug(ev->task, "io_uring arm accept fd:%d gen:%uD",
+              ev->fd, (uint32_t) slot->read_generation);
+
+    return 1;
+}
+
+
+/*
+ * conn_io accept handler for the ACCEPT tier (installed by create(); the
+ * conn_io struct is process-global, matching the process-global tier
+ * resolution).  The generic nxt_conn_io_accept() drains the backlog with
+ * synchronous accept(2) batches driven by lev->ready, which completion mode
+ * never initializes: invoked from the 100 ms listen-timer retry path
+ * (nxt_conn_listen_timer_handler calls the cached lev->accept right after
+ * enable_accept) it would decrement lev->ready from zero, latch
+ * read_ready = 1 off the wrapped counter and loop the legacy accept path
+ * until EAGAIN -- monopolizing the whole backlog on the recovering worker
+ * while the IORING_OP_ACCEPT that enable_accept just armed is also pending.
+ * Connections only ever arrive through accept CQEs in this tier, so the
+ * handler's sole job is to guarantee a pending accept exists; enable_accept
+ * is idempotent (a no-op when already armed).
+ */
+
+static void
+nxt_io_uring_conn_io_accept(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_listen_event_t  *lev;
+
+    lev = obj;
+
+    nxt_io_uring_enable_accept(task->thread->engine, &lev->socket);
 }
 
 
@@ -1527,8 +1899,6 @@ nxt_io_uring_enable_post(nxt_event_engine_t *engine, nxt_work_handler_t handler)
 
     io_uring_prep_poll_multishot(sqe, fd, POLLIN);
     io_uring_sqe_set_data64(sqe, NXT_IOU_UD_POST);
-
-    iou->nsubmitted++;
 
     return NXT_OK;
 }
@@ -1592,7 +1962,6 @@ nxt_io_uring_poll(nxt_event_engine_t *engine, nxt_msec_t timeout)
         if (sqe != NULL) {
             io_uring_prep_poll_multishot(sqe, iou->eventfd.fd, POLLIN);
             io_uring_sqe_set_data64(sqe, NXT_IOU_UD_POST);
-            iou->nsubmitted++;
             iou->post_rearm_pending = 0;
         }
     }
@@ -1638,8 +2007,6 @@ nxt_io_uring_poll(nxt_event_engine_t *engine, nxt_msec_t timeout)
 
     /* One syscall flushes the batched SQEs and waits for a completion. */
     ret = io_uring_submit_and_wait_timeout(&iou->ring, &cqe, 1, pts, NULL);
-
-    iou->nsubmitted = 0;
 
     nxt_thread_time_update(engine->task.thread);
 
@@ -1716,6 +2083,16 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
 
     slot = &engine->u.io_uring.slots[idx];
 
+    /*
+     * A multishot-accept completion carries an accepted fd in res, not a poll
+     * mask, and is self-identified by the ACCEPT bit so it is routed correctly
+     * even after the slot's arming kind has changed (fd reuse).
+     */
+    if (nxt_iou_ud_accept(ud)) {
+        nxt_io_uring_accept_cqe(engine, slot, gen, cqe);
+        return;
+    }
+
     /* Reject completions for a stale (disabled/closed) arming. */
     if (dir == NXT_IOU_DIR_READ) {
         if (gen != nxt_iou_gen(slot->read_generation)) {
@@ -1768,10 +2145,10 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
                       "re-arming", ev->fd, -res);
 
             if (!slot->read_armed
-                && nxt_slow_path(!nxt_io_uring_arm(engine, ev,
+                && nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
                                                    NXT_IOU_DIR_READ, 1)))
             {
-                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ);
+                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ, 0);
             }
 
             return;
@@ -1805,7 +2182,7 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
      * - Data + FIN in one wakeup: a single CQE carries POLLIN|POLLRDHUP.
      *   recv() consuming the data as a short read clears read_ready (the
      *   level contract), losing the pending EOF.  The epoll_eof mark below
-     *   plus the nxt_io_uring_conn_io_recvbuf shim force read_ready back on
+     *   plus the nxt_epoll_edge_conn_io_recvbuf shim force read_ready back on
      *   so the caller loops and observes the EOF.  (The fix for the
      *   proxy-keepalive stall.)
      * - Full-buffer read (n == buffer size): recvbuf keeps read_ready set,
@@ -1814,9 +2191,10 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
      *   message + more-data single wakeup is fully consumed.  Safe.
      * - Write EAGAIN then later writability: the socket-buffer drain is a
      *   new wakeup, producing a new CQE on the still-armed W poll.  Safe.
-     * - BLOCKED fires -> disarm (below) -> enable_read re-arms a fresh
-     *   POLL_ADD, which re-checks readiness at submission and fires
-     *   immediately if the fd is still ready.  Safe.
+     * - BLOCKED fires -> latch read_ready only, poll stays armed (edge-like
+     *   multishot cannot re-report steady state, so no busy loop); the conn
+     *   read discipline consumes the latch on its next voluntary read and the
+     *   subsequent enable_read is a free state write.  Safe.
      * - Listen sockets: non-multishot POLL_ADD; the !F_MORE re-arm below
      *   re-checks the backlog at submission.  Safe (contract item #5).
      */
@@ -1862,17 +2240,30 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
         if (mask & POLLIN) {
             ev->read_ready = 1;
 
-            if (ev->read == NXT_EVENT_BLOCKED) {
-                /* Level-style: disarm to avoid a busy-loop of BLOCKED CQEs. */
-                nxt_io_uring_disable_read(engine, ev);
-                return;
-            }
-
             if (ev->read == NXT_EVENT_ONESHOT) {
                 ev->read = NXT_EVENT_DISABLED;
             }
 
+            /*
+             * Dispatch only an active, non-BLOCKED direction, once per drain.
+             *
+             * A BLOCKED direction latches read_ready above but is NOT
+             * dispatched and -- the Stage-1 refinement -- is NOT disarmed: the
+             * multishot poll stays armed exactly as epoll leaves a blocked fd
+             * in its set (block_read makes no syscall).  Multishot poll is
+             * edge-like (one CQE per new wait-queue wakeup, never a re-report
+             * of steady state), so a BLOCKED direction cannot busy-loop the way
+             * the Stage-1 disarm feared; staying armed makes the following
+             * enable_read a pure state write (zero SQEs), removing the
+             * POLL_REMOVE + POLL_ADD pair Stage 1 paid per read.  The load-
+             * bearing invariants are unchanged: dispatch is gated on state
+             * (never BLOCKED) and on the per-drain read_seq dedupe, generations
+             * still reject stale CQEs, and the conn read discipline consumes
+             * the latched read_ready on its next voluntary read.  DISABLED
+             * (a just-fired oneshot) still dispatches its single event.
+             */
             if (ev->read != NXT_EVENT_INACTIVE
+                && ev->read != NXT_EVENT_BLOCKED
                 && slot->read_seq != engine->u.io_uring.drain_seq
                 && slot->error_seq != engine->u.io_uring.drain_seq)
             {
@@ -1914,10 +2305,11 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
             && ev->read != NXT_EVENT_INACTIVE
             && ev->read != NXT_EVENT_DISABLED)
         {
-            if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, NXT_IOU_DIR_READ,
+            if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
+                                                NXT_IOU_DIR_READ,
                                                 slot->read_multishot)))
             {
-                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ);
+                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ, 0);
             }
         }
 
@@ -1931,16 +2323,13 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
         if (mask & POLLOUT) {
             ev->write_ready = 1;
 
-            if (ev->write == NXT_EVENT_BLOCKED) {
-                nxt_io_uring_disable_write(engine, ev);
-                return;
-            }
-
             if (ev->write == NXT_EVENT_ONESHOT) {
                 ev->write = NXT_EVENT_DISABLED;
             }
 
+            /* Stay-armed-while-BLOCKED, latch only (see the read branch). */
             if (ev->write != NXT_EVENT_INACTIVE
+                && ev->write != NXT_EVENT_BLOCKED
                 && slot->write_seq != engine->u.io_uring.drain_seq
                 && slot->error_seq != engine->u.io_uring.drain_seq)
             {
@@ -1965,10 +2354,10 @@ nxt_io_uring_handle_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
             && ev->write != NXT_EVENT_INACTIVE
             && ev->write != NXT_EVENT_DISABLED)
         {
-            if (nxt_slow_path(!nxt_io_uring_arm(engine, ev,
+            if (nxt_slow_path(!nxt_io_uring_arm(engine, ev, slot,
                                                 NXT_IOU_DIR_WRITE, 1)))
             {
-                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_WRITE);
+                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_WRITE, 0);
             }
         }
     }
@@ -2018,11 +2407,166 @@ nxt_io_uring_error(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
 }
 
 
+/*
+ * Oneshot-accept completion.  res is the accepted fd (>= 0) or a negative
+ * errno.  A oneshot accept CQE never carries F_MORE -- consuming the CQE
+ * consumes the arming -- so re-arming is the NORMAL path here, not the
+ * exception: every outcome below either re-arms (success, benign error),
+ * defers the re-arm to the 100 ms listen timer (resource errors, and
+ * max_connections backpressure via close_idle -> disable_read), or drops the
+ * listener deliberately (cancel/close).  Each CQE feeds an adapted
+ * nxt_conn_accept flow directly, replacing the poll-mode accept4 syscall.
+ */
+
+static void
+nxt_io_uring_accept_cqe(nxt_event_engine_t *engine, nxt_io_uring_slot_t *slot,
+    uint32_t gen, struct io_uring_cqe *cqe)
+{
+    int                 res;
+    socklen_t           socklen;
+    nxt_conn_t          *c;
+    nxt_fd_event_t      *ev;
+    nxt_listen_event_t  *lev;
+
+    res = cqe->res;
+
+    /*
+     * Stale arming: reject on generation mismatch -- the same load-bearing
+     * invariant used for poll CQEs -- but first close any fd the CQE carries
+     * so it is not leaked (the accept analogue of "a stale recv CQE must
+     * return its buffer").  A stale oneshot CQE with a real fd arises when the
+     * kernel completed the accept before a disable/close-issued ASYNC_CANCEL
+     * took effect: the cancel then finds nothing, the completed CQE still
+     * sits in the CQ, and the generation bump from the disable is what marks
+     * it stale.  The connection was already accepted from the backlog, so
+     * close(2) is the only correct disposition.
+     */
+    if (gen != nxt_iou_gen(slot->read_generation)) {
+        if (res >= 0) {
+            (void) close(res);
+        }
+        return;
+    }
+
+    /* Oneshot: the completion consumes the arming. */
+    slot->read_armed = 0;
+    slot->accept = 0;
+
+    ev = slot->ev;
+
+    if (nxt_slow_path(ev == NULL)) {
+        if (res >= 0) {
+            (void) close(res);
+        }
+        return;
+    }
+
+    lev = nxt_container_of(ev, nxt_listen_event_t, socket);
+
+    if (res < 0) {
+        /* -ECANCELED/-EBADF/-ENOENT: the accept was cancelled; fd is gone. */
+        if (res == -ECANCELED || res == -EBADF || res == -ENOENT) {
+            return;
+        }
+
+        /*
+         * nxt_conn_accept_error keeps the poll-path semantics: EAGAIN and
+         * ECONNABORTED are benign (listener stays ACTIVE -> re-arm below);
+         * EMFILE/ENFILE/ENOBUFS/ENOMEM schedule the idle-conn reaper, arm the
+         * 100 ms listen timer and disable the listener (INACTIVE -> the re-arm
+         * below is skipped; the timer's enable_accept re-arms instead).
+         */
+        nxt_conn_accept_error(ev->task, lev, "accept", -res);
+
+        if (ev->read == NXT_EVENT_ACTIVE) {
+            if (nxt_slow_path(!nxt_io_uring_arm_accept(engine, ev, slot))) {
+                nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ, 1);
+            }
+        }
+
+        return;
+    }
+
+    /* res >= 0: a newly accepted connection fd. */
+
+    c = lev->next;
+
+    if (nxt_slow_path(c == NULL)) {
+        /*
+         * No pre-allocated conn: max_connections backpressure is in force
+         * (close_idle disabled the listener and armed the 100 ms timer), but
+         * the kernel completed this accept before the cancel took effect.
+         * Close it; the timer will resume accepting.
+         */
+        (void) close(res);
+        return;
+    }
+
+    /*
+     * Fill the remote sockaddr for this specific fd with getpeername(): exact,
+     * and avoids keeping a per-arming addr buffer alive in the slot across the
+     * completion.  On failure (the peer already dropped the connection, e.g.
+     * an RST between the kernel's accept and this drain) the connection is
+     * DROPPED rather than served with a zeroed sockaddr: sa_family 0 would
+     * flow into access logs and ACL matching as a bogus client address.  The
+     * fd is closed, the pre-allocated conn stays in lev->next for the next
+     * completion, and the re-arm below continues accepting -- the same
+     * disposition as the poll-path accept4() failing for a torn-down peer.
+     */
+    socklen = c->remote->socklen;
+
+    if (nxt_slow_path(getpeername(res, &c->remote->u.sockaddr, &socklen)
+                      != 0))
+    {
+        nxt_debug(ev->task, "io_uring accept(%d): getpeername(%d) failed %E",
+                  ev->fd, res, nxt_errno);
+
+        (void) close(res);
+
+    } else {
+        c->socket.fd = res;
+
+        nxt_debug(ev->task, "io_uring accept(%d): %d", ev->fd, res);
+
+        /*
+         * Adapted accept flow: nxt_conn_accept sets the conn up, enqueues the
+         * listen handler, and pre-allocates the next lev->next (or triggers
+         * close_idle backpressure, which disables/cancels this listener).  Its
+         * poll-mode re-arm tail is inert here: lev->socket.read_ready is never
+         * set in completion mode, so it never reschedules the poll accept
+         * handler.
+         */
+        nxt_conn_accept(ev->task, lev, c);
+    }
+
+    /*
+     * Re-arm the oneshot accept unless backpressure disabled the listener
+     * (close_idle leaves it INACTIVE; the listen timer re-arms instead).  The
+     * SQE is prepped inline but only submitted when this worker next enters
+     * poll(), i.e. after all queued work has run -- so a busy worker's accept
+     * goes pending late, yielding connections to idle workers.  Deferring the
+     * re-arm to a work item behind the listen handler was measured to give an
+     * identical per-thread accept distribution (SQ batching already delays
+     * both to the same submit), so the inline form is kept as the simpler one.
+     * A failed re-arm must not silently strand the listener.  Unlike an initial
+     * arm, escalating a *re-arm* through the error path is swallowed by the
+     * per-drain dedupe (this fd just dispatched an accept), so defer it to the
+     * pending-arm retry, which reissues the accept via arm_accept next poll.
+     */
+    if (ev->read == NXT_EVENT_ACTIVE && !slot->read_armed) {
+        if (nxt_slow_path(!nxt_io_uring_arm_accept(engine, ev, slot))) {
+            nxt_io_uring_arm_pend(engine, slot, NXT_IOU_DIR_READ, 1);
+        }
+    }
+}
+
+
 static void
 nxt_io_uring_internal_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
 {
     ssize_t                n;
     uint64_t               value;
+    nxt_err_t              err;
     struct io_uring_sqe    *sqe;
     nxt_io_uring_engine_t  *iou;
 
@@ -2040,7 +2584,6 @@ nxt_io_uring_internal_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
         if (nxt_fast_path(sqe != NULL)) {
             io_uring_prep_poll_multishot(sqe, iou->eventfd.fd, POLLIN);
             io_uring_sqe_set_data64(sqe, NXT_IOU_UD_POST);
-            iou->nsubmitted++;
             iou->post_rearm_pending = 0;
 
         } else {
@@ -2055,79 +2598,32 @@ nxt_io_uring_internal_cqe(nxt_event_engine_t *engine, struct io_uring_cqe *cqe)
         }
     }
 
-    /* Drain the eventfd counter so the next post produces a fresh edge. */
-    do {
+    /*
+     * The maximum value after which write() to an eventfd descriptor blocks
+     * or returns EAGAIN is 0xFFFFFFFFFFFFFFFE, so the descriptor can be read
+     * once per many notifications, for example, once per 2^32-2
+     * notifications.  The multishot poll posts a CQE per write()-side wakeup
+     * regardless of the accumulated counter value, like EPOLLET in the epoll
+     * engine, so skipping the read never suppresses future doorbells.
+     */
+    if (iou->neventfd++ >= 0xFFFFFFFE) {
+        iou->neventfd = 0;
+
         n = read(iou->eventfd.fd, &value, sizeof(uint64_t));
-    } while (n == sizeof(uint64_t));
+
+        /* Save errno before nxt_debug(): logging may clobber it. */
+        err = (n == -1) ? nxt_errno : 0;
+
+        nxt_debug(&engine->task, "read(%d): %z events:%uL",
+                  iou->eventfd.fd, n, value);
+
+        if (n != sizeof(uint64_t)) {
+            nxt_alert(&engine->task, "read eventfd(%d) failed %E",
+                      iou->eventfd.fd, err);
+        }
+    }
 
     if (iou->post_handler != NULL) {
         iou->post_handler(&engine->task, NULL, NULL);
     }
-}
-
-
-#if (NXT_HAVE_ACCEPT4)
-
-static void
-nxt_io_uring_conn_io_accept4(nxt_task_t *task, void *obj, void *data)
-{
-    socklen_t           socklen;
-    nxt_conn_t          *c;
-    nxt_socket_t        s;
-    struct sockaddr     *sa;
-    nxt_listen_event_t  *lev;
-
-    lev = obj;
-    c = lev->next;
-
-    lev->ready--;
-    lev->socket.read_ready = (lev->ready != 0);
-
-    sa = &c->remote->u.sockaddr;
-    socklen = c->remote->socklen;
-    /*
-     * The returned socklen is ignored here,
-     * see comment in nxt_conn_io_accept().
-     *
-     * SOCK_CLOEXEC keeps the accepted client socket from leaking into spawned
-     * application processes, matching the fcntl(FD_CLOEXEC) that the generic
-     * nxt_conn_io_accept() applies on the plain accept() path.
-     */
-    s = accept4(lev->socket.fd, sa, &socklen, SOCK_NONBLOCK | SOCK_CLOEXEC);
-
-    if (s != -1) {
-        c->socket.fd = s;
-
-        nxt_debug(task, "accept4(%d): %d", lev->socket.fd, s);
-
-        nxt_conn_accept(task, lev, c);
-        return;
-    }
-
-    nxt_conn_accept_error(task, lev, "accept4", nxt_errno);
-}
-
-#endif
-
-
-/*
- * A wrapper around the standard nxt_conn_io_recvbuf() to enforce reading a
- * pending EOF under the engine's edge-like delivery, identical to the epoll
- * edge engine's shim: when data and FIN arrive in a single wakeup the kernel
- * posts one CQE and never re-reports the fd, so a short read that clears
- * read_ready would strand the EOF forever.
- */
-
-static ssize_t
-nxt_io_uring_conn_io_recvbuf(nxt_conn_t *c, nxt_buf_t *b)
-{
-    ssize_t  n;
-
-    n = nxt_conn_io_recvbuf(c, b);
-
-    if (n > 0 && c->socket.epoll_eof) {
-        c->socket.read_ready = 1;
-    }
-
-    return n;
 }

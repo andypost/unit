@@ -55,6 +55,8 @@ struct nxt_tls_bundle_conf_s {
     void                          *ctx;
 
     nxt_fd_t                      chain_file;
+    nxt_fd_t                      ocsp_file;
+    nxt_str_t                     ocsp_staple;
     nxt_str_t                     name;
 
     nxt_tls_bundle_conf_t         *next;
@@ -87,6 +89,7 @@ struct nxt_tls_init_s {
     nxt_time_t                    timeout;
     nxt_conf_value_t              *conf_cmds;
     nxt_conf_value_t              *tickets_conf;
+    nxt_bool_t                    ocsp_staple;
 
     nxt_tls_conf_t                *conf;
 };

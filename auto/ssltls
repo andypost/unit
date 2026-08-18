@@ -84,6 +84,25 @@ if [ $NXT_OPENSSL = YES ]; then
                           #endif
                       }"
     . auto/feature
+
+
+    nxt_feature="OpenSSL OCSP stapling"
+    nxt_feature_name=NXT_HAVE_OPENSSL_OCSP
+    nxt_feature_run=
+    nxt_feature_incs=
+    nxt_feature_libs="$NXT_OPENSSL_LIBS"
+    nxt_feature_test="#include <openssl/ssl.h>
+#include <openssl/tls1.h>
+
+                      int main(void) {
+                          SSL_CTX *ctx = NULL;
+                          SSL *ssl = NULL;
+                          SSL_CTX_set_tlsext_status_cb(ctx, NULL);
+                          SSL_CTX_set_tlsext_status_arg(ctx, NULL);
+                          SSL_set_tlsext_status_ocsp_resp(ssl, NULL, 0);
+                          return 0;
+                      }"
+    . auto/feature
 fi
 
 

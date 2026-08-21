@@ -59,6 +59,12 @@ cat << END
   --otel               enable otel library usage (OTLP/HTTP + OTLP/gRPC;
                        transport is chosen by settings/telemetry/protocol)
 
+  --io-uring           enable Linux io_uring event engine (opt-in, requires
+                       liburing); available by name, epoll stays default
+  --no-io-uring        disable the io_uring event engine (default)
+  --io-uring-default   enable io_uring and make it the default event engine
+                       (implies --io-uring; epoll used as fallback)
+
   --debug              enable debug logging
 
   --fuzz=ENGINE        enable fuzz testing

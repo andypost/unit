@@ -289,6 +289,11 @@ nxt_runtime_event_engines(nxt_task_t *task, nxt_runtime_t *rt)
         return NXT_ERROR;
     }
 
+    /*
+     * If the io_uring engine is the default but cannot be created (the
+     * probe-vs-create TOCTOU window, resource exhaustion), the engine is
+     * degraded to epoll inside nxt_event_engine_create().
+     */
     engine = nxt_event_engine_create(task, interface,
                                      nxt_main_process_signals, 0, 0);
 

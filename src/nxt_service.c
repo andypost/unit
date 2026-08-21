@@ -64,26 +64,77 @@ nxt_services_init(nxt_mp_t *mp)
     nxt_array_t          *services;
     nxt_service_t        *s;
     const nxt_service_t  *service;
+#if (NXT_HAVE_IO_URING)
+    nxt_bool_t           io_uring, prepend;
+#endif
 
     services = nxt_array_create(mp, 32, sizeof(nxt_service_t));
 
-    if (nxt_fast_path(services != NULL)) {
-
-        service = nxt_services;
-        n = nxt_nitems(nxt_services);
-
-        while (n != 0) {
-            s = nxt_array_add(services);
-            if (nxt_slow_path(s == NULL)) {
-                return NULL;
-            }
-
-            *s = *service;
-
-            service++;
-            n--;
-        }
+    if (nxt_slow_path(services == NULL)) {
+        return NULL;
     }
+
+#if (NXT_HAVE_IO_URING)
+
+    /*
+     * Register the io_uring engine only when a runtime probe confirms multishot
+     * poll works, so an unavailable io_uring (old/hardened kernel) never
+     * exposes a broken engine.  NXT_IO_URING_DEFAULT (from --io-uring-default)
+     * prepends it ahead of epoll so the NULL-name lookup selects it as the
+     * default for the whole process tree; otherwise it is appended and epoll
+     * stays the default.  These two build flavours give a clean A/B pair.
+     */
+
+    io_uring = (nxt_io_uring_probe() == NXT_OK);
+
+#if (NXT_IO_URING_DEFAULT)
+    prepend = io_uring;
+#else
+    prepend = 0;
+#endif
+
+    if (prepend) {
+        s = nxt_array_add(services);
+        if (nxt_slow_path(s == NULL)) {
+            return NULL;
+        }
+
+        s->type = "engine";
+        s->name = "io_uring";
+        s->service = &nxt_io_uring_engine;
+    }
+
+#endif
+
+    service = nxt_services;
+    n = nxt_nitems(nxt_services);
+
+    while (n != 0) {
+        s = nxt_array_add(services);
+        if (nxt_slow_path(s == NULL)) {
+            return NULL;
+        }
+
+        *s = *service;
+
+        service++;
+        n--;
+    }
+
+#if (NXT_HAVE_IO_URING)
+
+    if (io_uring && !prepend) {
+        s = nxt_array_add(services);
+        if (nxt_slow_path(s == NULL)) {
+            return NULL;
+        }
+
+        s->type = "engine";
+        s->name = "io_uring";
+        s->service = &nxt_io_uring_engine;
+    }
+
+#endif
 
     return services;
 }

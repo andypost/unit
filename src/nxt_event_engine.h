@@ -225,6 +225,159 @@ extern const nxt_event_interface_t  nxt_epoll_level_engine;
 #endif
 
 
+#if (NXT_HAVE_IO_URING)
+
+/*
+ * Per-fd io_uring bookkeeping.  The slot is indexed directly by the file
+ * descriptor number and its {generation, direction} is encoded into the SQE
+ * user_data so that completions produced before a disable/close (and thus
+ * possibly for a reused fd) are rejected.  Generations are per-direction so
+ * disabling one direction while the other stays armed does not drop the
+ * surviving direction's completions.
+ */
+
+typedef struct {
+    /* The event owning this fd's pollers; recovered in the CQE handler. */
+    nxt_fd_event_t                *ev;
+
+    /*
+     * Per-direction stale-CQE generation.  32 bits wide (the full width of the
+     * generation field packed into user_data, see nxt_iou_ud) so a wrap needs
+     * 2^32 disable/enable cycles on one long-lived fd number -- unreachable for
+     * any realistic churn, closing the theoretical stale-CQE aliasing window a
+     * 14-bit counter left open.
+     */
+    uint32_t                      read_generation;
+    uint32_t                      write_generation;
+    uint8_t                       read_armed;      /* R poll live in kernel   */
+    uint8_t                       write_armed;     /* W poll live in kernel   */
+
+    /*
+     * A re-arm (POLL_ADD) could not get an SQE (SQ ring exhausted).  Unlike a
+     * failed initial arm -- which escalates to the error_handler -- a failed
+     * *re-arm* of a still-wanted direction (e.g. the per-batch listen POLL_ADD,
+     * or a kernel-dropped multishot) must retry rather than tear down: escalating
+     * it silently dies inside nxt_io_uring_error()'s per-drain dedupe (the fd
+     * already dispatched a handler this drain), leaving the direction ACTIVE with
+     * no poller.  Recorded here and retried from nxt_io_uring_poll() under the
+     * *current* generation (a deferred re-arm is identical to arming fresh);
+     * cleared by any disable/delete/close/oneshot on the direction.
+     */
+    uint8_t                       read_arm_pending;
+    uint8_t                       write_arm_pending;
+
+    /*
+     * A POLL_REMOVE for a still-live kernel poll could not get an SQE (SQ ring
+     * exhausted while the CQ overflowed).  The direction's armed flag is already
+     * cleared and its generation bumped -- so the slot is safe to re-arm or for
+     * the fd to be closed and reused at once -- but the leaked kernel poll must
+     * still be cancelled to drop its file reference.  The cancel is retried from
+     * nxt_io_uring_poll() and matches the live poll by the *pre-bump* generation
+     * recorded here, so it works even after the fd is closed and even if the
+     * direction has since been re-armed under a newer generation.
+     */
+    uint8_t                       read_remove_pending;
+    uint8_t                       write_remove_pending;
+    uint32_t                      read_remove_gen;
+    uint32_t                      write_remove_gen;
+
+    /*
+     * Arming mode of the live R poll: 1 = multishot (conn fds), 0 = single
+     * POLL_ADD re-armed per event (listen fds; POLL_ADD re-checks readiness
+     * at submission, which emulates level trigger for the accept loop).
+     */
+    uint8_t                       read_multishot;
+
+    /*
+     * CQ-drain sequence numbers of the last read/write handler dispatch.
+     * Multishot poll posts one CQE per wait-queue wakeup without coalescing,
+     * so one drain can hold several CQEs for the same fd and direction;
+     * dispatching the handler more than once per drain would break epoll's
+     * one-event-per-fd-per-poll contract that Unit's handlers rely on.
+     */
+    uint64_t                      read_seq;
+    uint64_t                      write_seq;
+
+    /*
+     * CQ-drain sequence of the last error dispatch.  An errored socket wakes
+     * both its read and write pollers, so each posts its own error CQE; this
+     * dedupes them to a single error_handler per fd per drain, matching epoll
+     * where one event carries EPOLLERR|EPOLLHUP for the whole fd.
+     */
+    uint64_t                      error_seq;
+} nxt_io_uring_slot_t;
+
+
+typedef struct {
+    struct io_uring               ring;
+
+    uint32_t                      sq_entries;
+    uint32_t                      cq_entries;
+
+    uint8_t                       tier;         /* NXT_IOU_TIER_*             */
+    uint8_t                       overflowed;   /* 1 bit                      */
+
+    /*
+     * The eventfd doorbell's multishot poll terminated and its re-arm could not
+     * get an SQE.  Retried at the top of nxt_io_uring_poll(); while set, the
+     * poll wait is capped so a cross-thread post that wrote the eventfd but
+     * produced no CQE against the dead poll cannot cause an unbounded sleep.
+     */
+    uint8_t                       post_rearm_pending;
+
+    /*
+     * The ring was io_uring_queue_init()ed and must be io_uring_queue_exit()ed
+     * on free.  Tracked separately from the tier: setup() can fail between a
+     * successful queue_init and the tier assignment (feature gates), and free()
+     * keyed on the tier would leak the ring fd and its mmaps.
+     */
+    uint8_t                       ring_inited;
+
+    /* Side table of pollers, indexed by fd; grown on demand. */
+    nxt_io_uring_slot_t           *slots;
+    uint32_t                      nslots;
+
+    /* Pending SQEs accumulated since the last submit. */
+    nxt_uint_t                    nsubmitted;
+
+    /*
+     * Count of slot directions with a POLL_REMOVE owed but not yet submitted
+     * (see nxt_io_uring_slot_t.read_remove_pending).  Gates the recovery scan
+     * in nxt_io_uring_poll() so it stays off the hot path: zero in steady state.
+     */
+    uint32_t                      npending_removes;
+
+    /*
+     * Count of slot directions with a re-arm owed but not yet submitted (see
+     * nxt_io_uring_slot_t.read_arm_pending).  Gates the retry scan in
+     * nxt_io_uring_poll() so it stays off the hot path: zero in steady state.
+     */
+    uint32_t                      npending_arms;
+
+    /* Current CQ-drain sequence; see nxt_io_uring_slot_t.read_seq. */
+    uint64_t                      drain_seq;
+
+    nxt_work_handler_t            post_handler;
+    nxt_fd_event_t                eventfd;
+
+#if (NXT_HAVE_SIGNALFD)
+    nxt_fd_event_t                signalfd;
+#endif
+} nxt_io_uring_engine_t;
+
+
+extern const nxt_event_interface_t  nxt_io_uring_engine;
+
+/*
+ * Runtime functional probe: NXT_OK if a throwaway ring supports multishot
+ * poll, NXT_ERROR for every "unsupported" condition (used to keep epoll as the
+ * default when io_uring is unavailable).
+ */
+nxt_int_t nxt_io_uring_probe(void);
+
+#endif
+
+
 #if (NXT_HAVE_EVENTPORT)
 
 typedef struct {
@@ -428,6 +581,9 @@ struct nxt_event_engine_s {
 #endif
 #if (NXT_HAVE_EPOLL)
         nxt_epoll_engine_t     epoll;
+#endif
+#if (NXT_HAVE_IO_URING)
+        nxt_io_uring_engine_t  io_uring;
 #endif
 #if (NXT_HAVE_EVENTPORT)
         nxt_eventport_engine_t eventport;

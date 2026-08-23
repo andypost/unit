@@ -50,7 +50,7 @@ static int nxt_nxt_cert_pem_suffix(char *pem_str, const char *suffix);
 static nxt_conf_value_t *nxt_cert_details(nxt_mp_t *mp, nxt_cert_t *cert);
 static nxt_conf_value_t *nxt_cert_name_details(nxt_mp_t *mp, X509 *x509,
     nxt_bool_t issuer);
-static nxt_int_t nxt_cert_name_text(X509_NAME *x509_name, int nid,
+static nxt_int_t nxt_cert_name_text(const X509_NAME *x509_name, int nid,
     nxt_str_t *str);
 static nxt_conf_value_t *nxt_cert_alt_names_details(nxt_mp_t *mp,
     STACK_OF(GENERAL_NAME) *alt_names);
@@ -698,7 +698,7 @@ typedef struct {
 static nxt_conf_value_t *
 nxt_cert_name_details(nxt_mp_t *mp, X509 *x509, nxt_bool_t issuer)
 {
-    X509_NAME               *x509_name;
+    const X509_NAME         *x509_name;
     nxt_str_t               str;
     nxt_int_t               ret, found;
     nxt_uint_t              i, n, count;
@@ -801,11 +801,11 @@ nxt_cert_name_details(nxt_mp_t *mp, X509 *x509, nxt_bool_t issuer)
  */
 
 static nxt_int_t
-nxt_cert_name_text(X509_NAME *x509_name, int nid, nxt_str_t *str)
+nxt_cert_name_text(const X509_NAME *x509_name, int nid, nxt_str_t *str)
 {
-    int              i, len;
-    ASN1_STRING      *data;
-    X509_NAME_ENTRY  *entry;
+    int                    i, len;
+    const ASN1_STRING      *data;
+    const X509_NAME_ENTRY  *entry;
 
     i = X509_NAME_get_index_by_NID(x509_name, nid, -1);
     if (i < 0) {
@@ -828,7 +828,7 @@ nxt_cert_name_text(X509_NAME *x509_name, int nid, nxt_str_t *str)
 #if OPENSSL_VERSION_NUMBER > 0x10100000L
     str->start = (u_char *) ASN1_STRING_get0_data(data);
 #else
-    str->start = ASN1_STRING_data(data);
+    str->start = ASN1_STRING_data((ASN1_STRING *) data);
 #endif
 
     return NXT_OK;

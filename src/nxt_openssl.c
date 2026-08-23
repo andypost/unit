@@ -114,7 +114,7 @@ static void nxt_ssl_session_cache(SSL_CTX *ctx, size_t cache_size,
     time_t timeout);
 static nxt_uint_t nxt_openssl_cert_get_names(nxt_task_t *task, X509 *cert,
     nxt_tls_conf_t *conf, nxt_mp_t *mp);
-static nxt_int_t nxt_openssl_name_text(X509_NAME *x509_name, int nid,
+static nxt_int_t nxt_openssl_name_text(const X509_NAME *x509_name, int nid,
     nxt_str_t *str);
 static nxt_int_t nxt_openssl_bundle_hash_test(nxt_lvlhsh_query_t *lhq,
     void *data);
@@ -921,7 +921,7 @@ nxt_openssl_cert_get_names(nxt_task_t *task, X509 *cert, nxt_tls_conf_t *conf,
     nxt_mp_t *mp)
 {
     nxt_str_t                   domain, str;
-    X509_NAME                   *x509_name;
+    const X509_NAME             *x509_name;
     nxt_uint_t                  i, n;
     GENERAL_NAME                *name;
     nxt_tls_bundle_conf_t       *bundle;
@@ -1036,11 +1036,11 @@ fail:
  */
 
 static nxt_int_t
-nxt_openssl_name_text(X509_NAME *x509_name, int nid, nxt_str_t *str)
+nxt_openssl_name_text(const X509_NAME *x509_name, int nid, nxt_str_t *str)
 {
-    int              i, len;
-    ASN1_STRING      *data;
-    X509_NAME_ENTRY  *entry;
+    int                    i, len;
+    const ASN1_STRING      *data;
+    const X509_NAME_ENTRY  *entry;
 
     i = X509_NAME_get_index_by_NID(x509_name, nid, -1);
     if (i < 0) {
@@ -1063,7 +1063,7 @@ nxt_openssl_name_text(X509_NAME *x509_name, int nid, nxt_str_t *str)
 #if OPENSSL_VERSION_NUMBER > 0x10100000L
     str->start = (u_char *) ASN1_STRING_get0_data(data);
 #else
-    str->start = ASN1_STRING_data(data);
+    str->start = ASN1_STRING_data((ASN1_STRING *) data);
 #endif
 
     return NXT_OK;

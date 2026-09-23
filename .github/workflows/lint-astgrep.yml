@@ -1,0 +1,99 @@
+name: "Lint (ast-grep)"
+
+# Two independent gates on a pull request's diff:
+#
+# - ast-grep: re-scans src/ with tools/ast-grep's rules and fails only on
+#   violations not already in tools/ast-grep/baseline.json (see
+#   tools/ast-grep/check_baseline.py). The existing violations do not block
+#   a PR that doesn't touch them; a new one does.
+#
+# - require-tests: a diff that touches src/**/*.c or src/**/*.h without
+#   touching test/ or src/test/ fails, on the theory that a behavior change
+#   with no test anywhere in the tree is very likely untested. Opt out with
+#   the "no-test-needed" PR label, or a `No-Test-Reason: ...` trailer on any
+#   commit in the PR (a build/comment-only change, a revert, etc.).
+
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened, labeled, unlabeled ]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel superseded runs for the same pull request.  Non-PR events fall back
+  # to the run id, which is unique, so a push is never grouped with another:
+  # Actions keeps only one PENDING run per group and would drop a queued commit
+  # even with cancel-in-progress false, which would break bisectability.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ast-grep:
+    name: "ast-grep baseline"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install ast-grep
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ast-grep
+
+      - name: Check for new violations
+        run: python3 tools/ast-grep/check_baseline.py
+
+  require-tests:
+    name: "require a test for a src/ change"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check the diff has a matching test change
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          if echo "$LABELS" | grep -qi '"no-test-needed"'; then
+            echo "opted out via the 'no-test-needed' label"
+            exit 0
+          fi
+
+          if git log --format='%B' "$BASE_SHA..$HEAD_SHA" \
+             | grep -qiE '^No-Test-Reason:'; then
+            echo "opted out via a No-Test-Reason: trailer"
+            git log --format='%B' "$BASE_SHA..$HEAD_SHA" \
+              | grep -iE '^No-Test-Reason:'
+            exit 0
+          fi
+
+          changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
+
+          src_changed="$(echo "$changed" \
+            | grep -E '^src/.*\.(c|h)$' || true)"
+
+          if [ -z "$src_changed" ]; then
+            echo "no src/**/*.c or src/**/*.h changes; nothing to require"
+            exit 0
+          fi
+
+          test_changed="$(echo "$changed" \
+            | grep -E '^(test/|src/test/)' || true)"
+
+          if [ -n "$test_changed" ]; then
+            echo "src/ change is covered by a test/ or src/test/ change"
+            exit 0
+          fi
+
+          echo "::error::This PR changes src/**/*.c or src/**/*.h:"
+          echo "$src_changed"
+          echo
+          echo "::error::...without touching test/ or src/test/. Add a test," \
+               "or opt out with the 'no-test-needed' label or a" \
+               "'No-Test-Reason: <why>' trailer on a commit in this PR."
+          exit 1

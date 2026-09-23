@@ -21,4 +21,5 @@ test/fake_upstream/target/
 test/fake_otlp/target/
 /pkg/eol/build.log
 /clang-ast/
+/compile_commands.json
 /AGENTS.md

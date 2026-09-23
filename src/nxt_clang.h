@@ -12,6 +12,15 @@
 #define nxt_noinline   __attribute__((noinline))
 #define nxt_cdecl
 
+/*
+ * A deliberate switch fall-through, as a statement rather than a comment
+ * so that -Wimplicit-fallthrough (part of --hardening=strict, see
+ * auto/cc/hardening) recognizes it under both GCC and Clang; a "Fall
+ * through." comment alone satisfies GCC's default heuristic but not
+ * Clang's.
+ */
+#define nxt_fallthrough  __attribute__((fallthrough))
+
 
 /*
  * nxt_static_assert() fails the compilation when the condition does not

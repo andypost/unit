@@ -1424,7 +1424,9 @@ nxt_router_schedule_request_build(nxt_mp_t *mp, nxt_router_schedule_t *sched,
 
     *p++ = '\r'; *p++ = '\n';
 
-    nxt_assert(p == end);
+    if (nxt_slow_path(p != end)) {
+        return NXT_ERROR;
+    }
 
     sched->request.length = size;
 

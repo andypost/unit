@@ -22,6 +22,7 @@
 #include <nxt_app_queue.h>
 #include <nxt_port_queue.h>
 #include <nxt_http_compression.h>
+#include <nxt_router_schedule.h>
 
 #if (NXT_HAVE_OTEL)
 #define NXT_OTEL_BATCH_DEFAULT     128
@@ -2060,6 +2061,8 @@ nxt_router_conf_apply(nxt_task_t *task, void *obj, void *data)
 
     nxt_router_engines_post(router, tmcf);
 
+    nxt_router_schedules_apply(task, tmcf);
+
     nxt_queue_add(&router->sockets, &updating_sockets);
     nxt_queue_add(&router->sockets, &creating_sockets);
 
@@ -3077,7 +3080,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
         }
     }
 
-    ret = nxt_http_routes_resolve(task, tmcf);
+    ret = nxt_router_conf_resolve(task, tmcf, root);
     if (nxt_slow_path(ret != NXT_OK)) {
         goto fail;
     }

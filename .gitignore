@@ -1,4 +1,7 @@
 build/
+build-disasm-*/
+build-disasm-*.configure.log
+build-disasm-*.build.log
 Makefile
 *.pyc
 __pycache__/

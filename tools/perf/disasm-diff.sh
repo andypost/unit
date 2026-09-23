@@ -143,6 +143,33 @@ BINARIES="$UNITD"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
+# tools/perf/harness/mca_harness.c wraps the header-only `static inline`
+# hot functions (nxt_port_queue_*, nxt_app_queue_*, nxt_nncq_*,
+# nxt_app_nncq_*, nxt_port_mmap_get_free_chunk) in noinline wrappers, so
+# each one gets its own stable ELF symbol instead of only showing up
+# folded into whatever caller happens to survive at -O1/-O2 (the
+# hot-functions.txt entries above). It is compiled here with the exact
+# CC/CFLAGS/-I the real build just used (pulled from $BUILD_DIR/Makefile,
+# so --hardening and any other configure flag stay in sync automatically)
+# and only ever disassembled, never linked into unitd or libunit.
+echo "=== building harness ==="
+HARNESS_SRC="tools/perf/harness/mca_harness.c"
+HARNESS_OBJ="$WORK/mca_harness.o"
+if [ -f "$HARNESS_SRC" ]; then
+    mk_cflags=$(sed -n 's/^CFLAGS = \(.*\) \$(EXTRA_CFLAGS)$/\1/p' \
+                "$BUILD_DIR/Makefile" | head -1)
+    # shellcheck disable=SC2086
+    "$CC" -c $mk_cflags -I src -I "$BUILD_DIR/include" \
+        -o "$HARNESS_OBJ" "$HARNESS_SRC" \
+        >"$BUILD_DIR.harness.log" 2>&1 || {
+            echo "harness build failed, see $BUILD_DIR.harness.log" >&2
+            exit 1
+        }
+    BINARIES="$BINARIES $HARNESS_OBJ"
+else
+    echo "note: $HARNESS_SRC not found, skipping harness symbols" >&2
+fi
+
 # Normalize a disassembly block so unrelated diffs (absolute addresses,
 # per-build symbol offsets) don't drown out real instruction-level
 # changes:

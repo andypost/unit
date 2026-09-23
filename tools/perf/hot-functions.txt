@@ -49,3 +49,19 @@ nxt_unit_process_port_msg
 # app-side mmap chunk allocator (mirrors nxt_port_mmap_get_buf above)
 nxt_unit_mmap_buf_get
 nxt_unit_mmap_buf_send
+
+# tools/perf/harness/mca_harness.c: noinline wrappers around the same
+# header-only inline functions above, giving each one its own stable
+# symbol instead of only the inlined-into-caller view. Compiled fresh
+# by disasm-diff.sh every run with the build's own CC/CFLAGS, so these
+# always exist (no "inlined away, renamed, or optimized out" warnings).
+mca_port_queue_send
+mca_port_queue_recv
+mca_app_queue_send
+mca_app_queue_recv
+mca_app_queue_cancel
+mca_nncq_dequeue
+mca_nncq_enqueue
+mca_app_nncq_dequeue
+mca_app_nncq_enqueue
+mca_port_mmap_get_free_chunk

@@ -1,0 +1,91 @@
+name: "Perf gates (disasm + layout)"
+
+# Non-blocking (continue-on-error: true, see tools/perf/README.md) codegen
+# and struct-layout regression checks for the hot IPC paths.
+#
+#   * disasm-diff  -> objdump-based codegen diff against the pinned
+#                     clang-18 + glibc baseline (tools/perf/baseline/).
+#                     If the runner's clang is a different version than
+#                     the baseline's, this job WARNS and SKIPS the diff
+#                     rather than failing red on a toolchain mismatch
+#                     that has nothing to do with the PR's code.
+#   * layout-check  -> pahole-based struct-layout diff against
+#                      tools/perf/layout-baseline/. Same clang leg, plus
+#                      a musl-gcc leg for the layout check only (the
+#                      eval found glibc/musl identical on x86_64 for
+#                      every tracked struct; this leg exists for a
+#                      future architecture where that stops holding).
+#
+# Both steps are continue-on-error while the baselines are still fresh;
+# flip that to false in tools/perf/README.md and here together once a
+# normal run of PRs has gone through without a false positive.
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tools/perf/**'
+      - '.github/workflows/perf-gates.yml'
+  push:
+    branches: master
+    paths:
+      - 'src/**'
+      - 'tools/perf/**'
+      - '.github/workflows/perf-gates.yml'
+
+concurrency:
+  # Cancel superseded runs for the same pull request.  Non-PR events fall back
+  # to the run id, which is unique, so a push is never grouped with another:
+  # Actions keeps only one PENDING run per group and would drop a queued commit
+  # even with cancel-in-progress false, which would break bisectability.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  disasm-diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check clang version against the pinned gate baseline
+        id: clang_check
+        run: |
+          pinned="18"
+          have=$(clang --version | head -1 | grep -oE 'version [0-9]+' | grep -oE '[0-9]+')
+          echo "pinned=${pinned}" >> "$GITHUB_OUTPUT"
+          echo "have=${have}" >> "$GITHUB_OUTPUT"
+          if [ "${have}" != "${pinned}" ]; then
+            echo "::warning::Runner's clang major version (${have}) differs from" \
+                 "the pinned gate baseline (clang-${pinned}); skipping" \
+                 "disasm-diff.sh rather than false-failing on a toolchain" \
+                 "mismatch. Re-baseline with 'tools/perf/disasm-diff.sh" \
+                 "--cc clang --update' when this runner's clang moves."
+          fi
+
+      - name: tools/perf/disasm-diff.sh --cc clang
+        if: steps.clang_check.outputs.have == steps.clang_check.outputs.pinned
+        continue-on-error: true
+        run: tools/perf/disasm-diff.sh --cc clang
+
+  layout-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: tools/perf/layout-check.sh --cc clang
+        continue-on-error: true
+        run: tools/perf/layout-check.sh --cc clang
+
+      - name: Install musl-tools
+        id: musl_install
+        continue-on-error: true
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: tools/perf/layout-check.sh --cc musl-gcc (layout-only leg)
+        if: steps.musl_install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          tools/perf/layout-check.sh --cc musl-gcc \
+              --configure-opt=--no-regex

@@ -37,7 +37,7 @@ movb   $0x0,0x66(%rsp)
 xor    %r12d,%r12d
 cmp    $0x20,%edx
 je     <nxt_port_socket_write2+0x3fb>
-mov    0x1b0(%rbx),%r13
+mov    0x10(%rbx),%r13
 test   %r13,%r13
 je     <nxt_port_socket_write2+0x3fb>
 cmp    $0xffffffff,%ecx
@@ -66,7 +66,7 @@ jmp    <nxt_port_socket_write2+0xff>
 mov    $0x4000,%edx
 mov    $0xfffffffe,%ebp
 cmp    $0x4000,%edx
-je     <nxt_port_socket_write2+0x45a>
+je     <nxt_port_socket_write2+0x45b>
 mov    %edx,%eax
 shl    $0x5,%eax
 movb   $0x1,0x20014(%r13,%rax,1)
@@ -103,7 +103,7 @@ mov    %ecx,%eax
 lock cmpxchg %esi,0x20010(%r13)
 lock incl 0x0(%r13)
 cmp    $0x4000,%edx
-je     <nxt_port_socket_write2+0x45a>
+je     <nxt_port_socket_write2+0x45b>
 xor    %r12d,%r12d
 jmp    <nxt_port_socket_write2+0x3fb>
 mov    $0x1,%eax
@@ -121,7 +121,7 @@ movzwl 0x25(%r15),%eax
 shr    $0x2,%eax
 and    $0x1,%eax
 test   %eax,%eax
-je     <nxt_port_socket_write2+0xb5>
+je     <nxt_port_socket_write2+0xb2>
 lea    0x58(%rsp),%rax
 movups (%rax),%xmm0
 movaps %xmm0,0x10(%rsp)
@@ -246,35 +246,35 @@ mov    %r15,%rcx
 call   <nxt_work_queue_add>
 mov    %r12d,%esi
 test   %sil,%sil
-jne    <nxt_port_socket_write2+0x45a>
+jne    <nxt_port_socket_write2+0x45b>
 movb   $0x20,0x62(%rsp)
 movq   $0x0,0x40(%rsp)
 mov    $0x1,%r12b
-lea    0xb0(%rbx),%r15
+lea    0x98(%rbx),%r15
 mov    %r15,%rdi
 call   <nxt_thread_mutex_lock>
-cmpb   $0x0,0x13(%rbx)
-je     <nxt_port_socket_write2+0x46b>
-lea    0xa0(%rbx),%rax
-cmp    0xa0(%rbx),%rax
-jne    <nxt_port_socket_write2+0x46b>
+cmpb   $0x0,0x43(%rbx)
+je     <nxt_port_socket_write2+0x46c>
+lea    0xc0(%rbx),%rax
+cmp    0xc0(%rbx),%rax
+jne    <nxt_port_socket_write2+0x46c>
 mov    $0xfffffffd,%ebp
 mov    $0x1,%r13b
 mov    %r15,%rdi
 call   <nxt_thread_mutex_unlock>
 test   %r13b,%r13b
-je     <nxt_port_socket_write2+0x44c>
+je     <nxt_port_socket_write2+0x44d>
+lea    0x30(%rbx),%rsi
 lea    0x30(%rsp),%rdx
 lea    0xc(%rsp),%rcx
 mov    %r14,%rdi
-mov    %rbx,%rsi
 call   <nxt_port_write_msgs>
 mov    %eax,%ebp
 test   %ebp,%ebp
 sete   %al
 xor    $0x1,%r12b
 or     %al,%r12b
-je     <nxt_port_socket_write2+0x4b4>
+je     <nxt_port_socket_write2+0x4b5>
 mov    %ebp,%eax
 add    $0x78,%rsp
 pop    %rbx
@@ -288,13 +288,13 @@ lea    0x30(%rsp),%rdi
 call   <nxt_port_msg_alloc>
 xor    %ebp,%ebp
 test   %rax,%rax
-je     <nxt_port_socket_write2+0x4d2>
-lea    0xa0(%rbx),%rcx
-mov    0xa0(%rbx),%rdx
+je     <nxt_port_socket_write2+0x4d3>
+lea    0xc0(%rbx),%rcx
+mov    0xc0(%rbx),%rdx
 mov    %rdx,(%rax)
 mov    %rax,0x8(%rdx)
 mov    %rcx,0x8(%rax)
-mov    %rax,0xa0(%rbx)
+mov    %rax,0xc0(%rbx)
 mov    %r14,%rdi
 mov    %rbx,%rsi
 mov    $0x1,%edx
@@ -303,12 +303,12 @@ xor    %r13d,%r13d
 jmp    <nxt_port_socket_write2+0x428>
 xor    %ebp,%ebp
 cmpl   $0x0,0xc(%rsp)
-jne    <nxt_port_socket_write2+0x45a>
-lock incq 0x168(%rbx)
+jne    <nxt_port_socket_write2+0x45b>
+lock incq 0x120(%rbx)
 mov    %r14,%rdi
 mov    %rbx,%rsi
 call   <nxt_port_rearm>
-jmp    <nxt_port_socket_write2+0x45a>
+jmp    <nxt_port_socket_write2+0x45b>
 mov    $0xffffffff,%ebp
-jmp    <nxt_port_socket_write2+0x4ac>
-nopl   0x0(%rax)
+jmp    <nxt_port_socket_write2+0x4ad>
+nopw   0x0(%rax,%rax,1)

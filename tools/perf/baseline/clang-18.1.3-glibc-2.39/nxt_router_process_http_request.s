@@ -19,7 +19,7 @@ lea    OFF(%rip),%rcx        # <nxt_router_response_error_handler>
 mov    $0x58,%r8d
 call   <nxt_port_rpc_register_handler_ex>
 test   %rax,%rax
-je     <nxt_router_process_http_request+0xfe3>
+je     <nxt_router_process_http_request+0xfcf>
 mov    %rax,%r12
 mov    0x10(%rbx),%rdi
 call   <nxt_mp_retain>
@@ -55,7 +55,7 @@ mov    (%r14),%r15
 mov    %r15,%rdi
 call   <nxt_thread_mutex_lock>
 mov    0x138(%r15),%rbp
-lock incq 0x1a0(%rbp)
+lock incq 0x18(%rbp)
 mov    0xa4(%r15),%edx
 mov    0xa8(%r15),%ecx
 inc    %edx
@@ -65,25 +65,25 @@ lea    (%rcx,%rax,1),%esi
 add    0xb8(%r15),%esi
 mov    $0x1,%bl
 cmp    0xbc(%r15),%esi
-jae    <nxt_router_process_http_request+0x188>
+jae    <nxt_router_process_http_request+0x185>
 cmp    0xc4(%r15),%ecx
-jae    <nxt_router_process_http_request+0x188>
+jae    <nxt_router_process_http_request+0x185>
 mov    0xa0(%r15),%esi
 add    %ecx,%esi
 cmp    %esi,%edx
-ja     <nxt_router_process_http_request+0x17d>
+ja     <nxt_router_process_http_request+0x17a>
 mov    0xb0(%r15),%edx
 add    %ecx,%edx
 cmp    %edx,0xc0(%r15)
-jbe    <nxt_router_process_http_request+0x188>
+jbe    <nxt_router_process_http_request+0x185>
 inc    %ecx
 mov    %ecx,0xa8(%r15)
 xor    %ebx,%ebx
 xor    %ecx,%ecx
 test   %eax,%eax
-jne    <nxt_router_process_http_request+0x19d>
+jne    <nxt_router_process_http_request+0x19a>
 test   %bl,%bl
-je     <nxt_router_process_http_request+0x19d>
+je     <nxt_router_process_http_request+0x19a>
 cmpl   $0x0,0xa8(%r15)
 sete   %cl
 mov    %ecx,0x30(%rsp)
@@ -103,7 +103,7 @@ call   <nxt_mp_retain>
 mov    %rbp,0x10(%r14)
 movl   $0x1,0x18(%r14)
 cmpl   $0x0,0xd0(%r15)
-je     <nxt_router_process_http_request+0x239>
+je     <nxt_router_process_http_request+0x236>
 lea    0x2c8(%r12),%rsi
 lea    OFF(%rip),%rax        # <nxt_router_app_timeout>
 mov    %rax,0x2f0(%r12)
@@ -113,14 +113,14 @@ mov    0x118(%rax),%rdi
 mov    0xd0(%r15),%edx
 call   <nxt_timer_add>
 test   %bl,%bl
-je     <nxt_router_process_http_request+0x252>
+je     <nxt_router_process_http_request+0x24f>
 cmpb   $0x0,0x30(%rsp)
-je     <nxt_router_process_http_request+0x25d>
+je     <nxt_router_process_http_request+0x25a>
 mov    %r15,%rdi
 xor    %esi,%esi
 xor    %edx,%edx
 call   <nxt_router_app_start_failed>
-jmp    <nxt_router_process_http_request+0x25d>
+jmp    <nxt_router_process_http_request+0x25a>
 mov    %r13,%rdi
 mov    %r15,%rsi
 call   <nxt_router_start_app_process>
@@ -143,10 +143,10 @@ mov    0x70(%rbp),%rbx
 mov    0x98(%rbp),%r8
 mov    0x8(%r8),%r11
 cmp    0x78(%rbp),%r11
-je     <nxt_router_process_http_request+0x2c9>
+je     <nxt_router_process_http_request+0x2c6>
 mov    (%r8),%r11
 inc    %r11
-jmp    <nxt_router_process_http_request+0x2cc>
+jmp    <nxt_router_process_http_request+0x2c9>
 xor    %r11d,%r11d
 mov    0x0(%r13),%r8
 lea    OFF(%rip),%r14        # <nxt_app_msg_prefix>
@@ -171,12 +171,12 @@ cmove  %r9,%rcx
 mov    $0x1,%sil
 test   %al,%al
 mov    %r15,0x8(%rsp)
-je     <nxt_router_process_http_request+0x330>
+je     <nxt_router_process_http_request+0x32d>
 mov    %r15,%r9
 jmp    <nxt_router_process_http_request+0x363>
 test   %r9,%r9
 je     <nxt_router_process_http_request+0x34f>
-data16 cs nopw 0x0(%rax,%rax,1)
+data16 data16 data16 data16 cs nopw 0x0(%rax,%rax,1)
 cmpq   $0x0,0x8(%rcx)
 jne    <nxt_router_process_http_request+0x358>
 mov    (%rcx),%rcx
@@ -242,7 +242,7 @@ mov    %rax,0x68(%rsp)
 shl    $0x4,%r14
 add    %r14,%r15
 cmp    $0xa00001,%r15
-jae    <nxt_router_process_http_request+0xfeb>
+jae    <nxt_router_process_http_request+0xfd7>
 mov    0x40(%rsp),%rax
 lea    0x148(%rax),%rsi
 lea    (%r15,%rbx,1),%rax
@@ -761,7 +761,7 @@ mov    0x8(%rsp),%rax
 mov    0x18(%rax),%rax
 mov    %rbx,%r13
 test   %rax,%rax
-je     <nxt_router_process_http_request+0xfaa>
+je     <nxt_router_process_http_request+0xf96>
 mov    0x28(%rax),%rbp
 mov    %rax,0x8(%rsp)
 mov    0x30(%rax),%r12
@@ -839,7 +839,7 @@ mov    0x30(%rsp),%r13
 mov    0x18(%rsp),%r14
 mov    0x38(%rsp),%rsi
 test   %rbx,%rbx
-je     <nxt_router_process_http_request+0xfc7>
+je     <nxt_router_process_http_request+0xfb3>
 mov    %r14,%rax
 add    $0x30,%rax
 mov    %rbx,0x28(%r14)
@@ -876,15 +876,15 @@ mov    %rbx,%r12
 sub    0x50(%rbx),%rdi
 mov    (%r14),%r8d
 mov    0x68(%rsp),%rdx
-mov    0x184(%rdx),%r10d
-movzwl 0x180(%rdx),%r11d
+mov    0x4(%rdx),%r10d
+movzwl (%rdx),%r11d
 mov    (%rax),%r9d
-mov    0x1b0(%rsi),%rdx
-jmp    <nxt_router_process_http_request+0xe07>
-nopl   0x0(%rax)
+mov    0x10(%rsi),%rdx
+jmp    <nxt_router_process_http_request+0xdf7>
+nop
 inc    %ebx
 cmp    %bp,%bx
-je     <nxt_router_process_http_request+0xe46>
+je     <nxt_router_process_http_request+0xe36>
 mov    0x4(%rdx),%eax
 mov    %eax,%ebx
 and    $0x1ffff,%ebx
@@ -894,17 +894,17 @@ shr    $0x11,%ebx
 mov    %eax,%ebp
 shr    $0x11,%ebp
 cmp    %ebp,%ebx
-jne    <nxt_router_process_http_request+0xe00>
+jne    <nxt_router_process_http_request+0xdf0>
 lea    0x1(%rax),%ebx
 lock cmpxchg %ebx,0x4(%rdx)
-jne    <nxt_router_process_http_request+0xe07>
+jne    <nxt_router_process_http_request+0xdf7>
 and    $0x1ffff,%r15d
 cmp    $0x20000,%r15d
-je     <nxt_router_process_http_request+0xf49>
-jmp    <nxt_router_process_http_request+0xe59>
+je     <nxt_router_process_http_request+0xf39>
+jmp    <nxt_router_process_http_request+0xe49>
 mov    $0x20000,%r15d
 cmp    $0x20000,%r15d
-je     <nxt_router_process_http_request+0xf49>
+je     <nxt_router_process_http_request+0xf39>
 mov    %r15d,%eax
 lea    (%rax,%rax,8),%rax
 movb   $0x1c,0x100014(%rdx,%rax,4)
@@ -920,7 +920,7 @@ mov    %r8d,0x100034(%rdx,%rax,4)
 mov    %r15d,0x34(%r14)
 mov    %r15d,%edi
 and    $0x1ffff,%edi
-jmp    <nxt_router_process_http_request+0xedf>
+jmp    <nxt_router_process_http_request+0xecf>
 data16 data16 data16 data16 data16 cs nopw 0x0(%rax,%rax,1)
 lea    0x1(%rcx),%r8d
 mov    %ecx,%eax
@@ -935,15 +935,15 @@ shr    $0x11,%r9d
 mov    %ecx,%r10d
 shr    $0x11,%r10d
 cmp    %r10d,%r9d
-je     <nxt_router_process_http_request+0xed0>
+je     <nxt_router_process_http_request+0xec0>
 inc    %r9d
 cmp    %r10w,%r9w
-jne    <nxt_router_process_http_request+0xedf>
+jne    <nxt_router_process_http_request+0xecf>
 mov    %ecx,%r9d
 and    $0xfffe0000,%r9d
 or     %edi,%r9d
 lock cmpxchg %r9d,0x80010(%rdx,%r8,4)
-jne    <nxt_router_process_http_request+0xedf>
+jne    <nxt_router_process_http_request+0xecf>
 lea    0x1(%rcx),%edi
 mov    %ecx,%eax
 lock cmpxchg %edi,0x100010(%rdx)
@@ -952,12 +952,12 @@ xor    %eax,%eax
 lock cmpxchg %ecx,(%rdx)
 setne  %al
 cmp    $0x20000,%r15d
-je     <nxt_router_process_http_request+0x1007>
+je     <nxt_router_process_http_request+0xff3>
 test   $0x1,%al
-jne    <nxt_router_process_http_request+0xf88>
+jne    <nxt_router_process_http_request+0xf74>
 mov    (%r14),%r9d
 mov    0x68(%rsp),%rax
-movzwl 0x180(%rax),%eax
+movzwl (%rax),%eax
 mov    %r13,%rdi
 mov    $0x20,%edx
 mov    $0xffffffff,%ecx
@@ -988,10 +988,10 @@ mov    (%r14),%ecx
 mov    0x40(%rsp),%r8
 add    $0x90,%r8
 lea    OFF(%rip),%rdx        # <nxt_vsprintf.infinity+0x238c>
-jmp    <nxt_router_process_http_request+0x1021>
+jmp    <nxt_router_process_http_request+0x100d>
 mov    %r13,%rdi
 mov    %rbx,%rsi
-jmp    <nxt_router_process_http_request+0x102f>
+jmp    <nxt_router_process_http_request+0x101b>
 mov    0x8(%r13),%rsi
 lea    OFF(%rip),%rdx        # <nxt_vsprintf.infinity+0x23f3>
 xor    %edi,%edi
@@ -1019,4 +1019,4 @@ pop    %r14
 pop    %r15
 pop    %rbp
 jmp    <nxt_http_request_error>
-nopw   0x0(%rax,%rax,1)
+cs nopw 0x0(%rax,%rax,1)

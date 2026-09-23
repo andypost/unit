@@ -127,10 +127,46 @@ handful of others are one-offs. A Day-2 follow-up could extend `shim.h`
 for `PHP_FUNCTION` if that file's index quality matters for factory work
 there.
 
+## Applying an edit: `apply_edit.py`
+
+```
+python3 tools/fidx/apply_edit.py [--root REPO_ROOT] [--index PATH] \
+    [--edit-file EDIT.json] [--dry-run]
+```
+
+Takes one edit as JSON (stdin, or `--edit-file`):
+
+```jsonc
+{
+  "fid": "src/nxt_foo.c::nxt_foo_bar",
+  "base_body_sha": "<the fid's body_sha as of the caller's last read>",
+  "edits": [{"op": "replace_function", "text": "<the whole new function>"}],
+  "new_symbols": ["nxt_foo_helper"]
+}
+```
+
+It verifies `base_body_sha` against both the index and a fresh hash of
+the function's own bytes on disk, splices `text` into that exact byte
+range, re-parses the file, and refuses (exit 1, nothing written) unless
+every other function in the file is byte-identical to before and every
+brand-new function's name was declared in `new_symbols`. On success it
+prints a unified diff of the whole file and writes it (or, with
+`--dry-run`, prints the diff and validates without writing).
+
+`text` replaces exactly `[start_byte, end_byte)`, which for a function
+qualified with one of `shim.h`'s blanked storage-class macros
+(`nxt_inline`, `nxt_noinline`, `nxt_cdecl`, ...) starts **after** that
+qualifier -- match the record's `signature` field, which also omits it.
+
+`tools/fidx/test_apply_edit.py` exercises one accepted edit (a benign
+body comment) and two refused ones (a stale `base_body_sha`, and an
+edit that smuggles in an undeclared new function), all with `--dry-run`
+so it never touches the real tree.
+
 ## Not built yet
 
 - `tools/fidx/slice.py FID`: print a function, the struct definitions it
   uses, and its callees' signatures, from `functions.jsonl` plus a fresh
   read of the relevant files.
-- `enrich_clang.py`, `apply_edit.py`, `tools/factory/run.py` (A4–A7 in
-  the sprint plan) are out of scope for this pass.
+- `enrich_clang.py`, `tools/factory/run.py` (A4, A7 in the sprint plan)
+  are out of scope for this pass.

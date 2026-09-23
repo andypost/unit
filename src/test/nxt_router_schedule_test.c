@@ -14,7 +14,10 @@
  *     the same target, path and arguments as the same line from a client;
  *   - the reference chain run -> joint -> skcf -> rtcf: the configuration
  *     outlives both the joint's own reference and a run's, in either order,
- *     and the self-linked skcf never touches router->sockets.
+ *     and the self-linked skcf never touches router->sockets;
+ *   - the devnull protocol slot: the response is counted and its head kept,
+ *     every buffer, "last" included, is completed exactly once and never
+ *     inline, and the close reaches the owner once.
  */
 
 #include <nxt_main.h>
@@ -22,6 +25,8 @@
 #include <nxt_conf.h>
 #include <nxt_http.h>
 #include <nxt_router_schedule.h>
+#include <nxt_http_devnull.h>
+#include <nxt_event_engine.h>
 #include "nxt_tests.h"
 
 
@@ -624,6 +629,293 @@ nxt_router_schedule_resolve_test(nxt_thread_t *thr)
 }
 
 
+/*
+ * The devnull protocol (ADR section 6.4), through the nxt_http_proto[]
+ * slot the request code calls: the response is counted and its head kept,
+ * every buffer is completed exactly once -- which is what ends the request
+ * -- and nothing runs inside the caller's frame.
+ */
+
+static nxt_uint_t  nxt_router_schedule_test_mem_done;
+static nxt_uint_t  nxt_router_schedule_test_last_done;
+static nxt_uint_t  nxt_router_schedule_test_body_calls;
+static nxt_uint_t  nxt_router_schedule_test_closes;
+
+
+static void
+nxt_router_schedule_test_mem_completion(nxt_task_t *task, void *obj,
+    void *data)
+{
+    nxt_buf_t  *b;
+
+    for (b = obj; b != NULL; b = b->next) {
+        nxt_router_schedule_test_mem_done++;
+    }
+}
+
+
+static void
+nxt_router_schedule_test_last_completion(nxt_task_t *task, void *obj,
+    void *data)
+{
+    nxt_router_schedule_test_last_done++;
+}
+
+
+static void
+nxt_router_schedule_test_body(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_router_schedule_test_body_calls++;
+}
+
+
+static void
+nxt_router_schedule_test_close(nxt_task_t *task, nxt_http_devnull_t *dn,
+    nxt_socket_conf_joint_t *joint)
+{
+    nxt_router_schedule_test_closes++;
+}
+
+
+static void
+nxt_router_schedule_test_drain(nxt_task_t *task, nxt_event_engine_t *engine)
+{
+    void                *obj, *data;
+    nxt_task_t          *wq_task;
+    nxt_work_handler_t  handler;
+
+    while (engine->fast_work_queue.head != NULL) {
+        handler = nxt_work_queue_pop(&engine->fast_work_queue, &wq_task, &obj,
+                                     &data);
+        if (handler != NULL) {
+            handler(wq_task != NULL ? wq_task : task, obj, data);
+        }
+    }
+}
+
+
+static nxt_buf_t *
+nxt_router_schedule_test_last(nxt_http_request_t *r)
+{
+    nxt_buf_t  *last;
+
+    last = nxt_mp_zget(r->mem_pool, NXT_BUF_SYNC_SIZE);
+    if (last == NULL) {
+        return NULL;
+    }
+
+    nxt_buf_set_sync(last);
+    nxt_buf_set_last(last);
+    last->completion_handler = nxt_router_schedule_test_last_completion;
+    last->parent = r;
+
+    return last;
+}
+
+
+static nxt_buf_t *
+nxt_router_schedule_test_mem(nxt_http_request_t *r, const char *text)
+{
+    size_t     len;
+    nxt_buf_t  *b;
+
+    len = nxt_strlen(text);
+
+    b = nxt_buf_mem_alloc(r->mem_pool, len, 0);
+    if (b == NULL) {
+        return NULL;
+    }
+
+    b->mem.free = nxt_cpymem(b->mem.free, text, len);
+    b->completion_handler = nxt_router_schedule_test_mem_completion;
+    b->parent = r;
+
+    return b;
+}
+
+
+static nxt_int_t
+nxt_router_schedule_devnull_test(nxt_thread_t *thr)
+{
+    nxt_mp_t                  *mp;
+    nxt_int_t                 ret;
+    nxt_buf_t                 *a, *b, *last;
+    nxt_task_t                *task;
+    nxt_http_proto_t          proto;
+    nxt_http_request_t        *r;
+    nxt_http_devnull_t        dn;
+    nxt_event_engine_t        engine, *saved_engine;
+    nxt_socket_conf_joint_t   joint;
+
+    const nxt_http_proto_table_t  *devnull;
+
+    static const char  big[] = "0123456789abcdef0123456789abcdef"
+                               "0123456789abcdef0123456789abcdef"
+                               "0123456789abcdef0123456789abcdef"
+                               "0123456789abcdef0123456789abcdef"
+                               "0123456789abcdef0123456789abcdef"
+                               "0123456789abcdef0123456789abcdef"
+                               "0123456789abcdef0123456789abcdef"
+                               "0123456789abcdef0123456789abcdef"
+                               "tail beyond the head";
+
+    task = thr->task;
+    task->thread = thr;
+    saved_engine = thr->engine;
+
+    ret = NXT_ERROR;
+    r = NULL;
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return NXT_ERROR;
+    }
+
+    nxt_memzero(&engine, sizeof(engine));
+    nxt_work_queue_cache_create(&engine.work_queue_cache, 64);
+    engine.fast_work_queue.cache = &engine.work_queue_cache;
+    nxt_work_queue_name(&engine.fast_work_queue, "fast");
+    engine.mem_pool = mp;
+    engine.task.thread = thr;
+    engine.task.log = thr->log;
+
+    thr->engine = &engine;
+
+    devnull = &nxt_http_proto[NXT_HTTP_PROTO_DEVNULL];
+
+    if (devnull->send == NULL || devnull->header_send == NULL
+        || devnull->body_bytes_sent == NULL || devnull->discard == NULL
+        || devnull->close == NULL || devnull->body_read == NULL
+        || devnull->local_addr == NULL)
+    {
+        nxt_log_alert(thr->log, "devnull: the protocol slot is not filled");
+        goto done;
+    }
+
+    r = nxt_http_request_create(task);
+    if (r == NULL) {
+        goto done;
+    }
+
+    nxt_memzero(&dn, sizeof(dn));
+    dn.request = r;
+    dn.close = nxt_router_schedule_test_close;
+
+    r->protocol = NXT_HTTP_PROTO_DEVNULL;
+    r->proto.any = &dn;
+    r->status = NXT_HTTP_OK;
+
+    /* The header: queued body handler, nothing called in place. */
+
+    devnull->header_send(task, r, nxt_router_schedule_test_body, NULL);
+
+    if (nxt_router_schedule_test_body_calls != 0 || !r->header_sent
+        || dn.status != NXT_HTTP_OK)
+    {
+        nxt_log_alert(thr->log, "devnull: header send ran the body inline");
+        goto done;
+    }
+
+    nxt_router_schedule_test_drain(task, &engine);
+
+    if (nxt_router_schedule_test_body_calls != 1) {
+        nxt_log_alert(thr->log, "devnull: body handler ran %ui times",
+                      nxt_router_schedule_test_body_calls);
+        goto done;
+    }
+
+    /* The body: counted, head kept, every buffer completed once. */
+
+    a = nxt_router_schedule_test_mem(r, "hello ");
+    b = nxt_router_schedule_test_mem(r, big);
+    last = nxt_router_schedule_test_last(r);
+
+    if (a == NULL || b == NULL || last == NULL) {
+        goto done;
+    }
+
+    a->next = b;
+    b->next = last;
+
+    devnull->send(task, r, a);
+
+    if (nxt_router_schedule_test_last_done != 0) {
+        nxt_log_alert(thr->log, "devnull: \"last\" completed inline");
+        goto done;
+    }
+
+    nxt_router_schedule_test_drain(task, &engine);
+
+    proto.any = &dn;
+
+    if (nxt_router_schedule_test_mem_done != 2
+        || nxt_router_schedule_test_last_done != 1
+        || devnull->body_bytes_sent(task, proto)
+           != (nxt_off_t) (6 + nxt_length(big))
+        || dn.head_length != NXT_HTTP_DEVNULL_HEAD
+        || memcmp(dn.head, "hello 0123", 10) != 0
+        || dn.head[NXT_HTTP_DEVNULL_HEAD - 1] != big[NXT_HTTP_DEVNULL_HEAD - 7])
+    {
+        nxt_log_alert(thr->log, "devnull send: mem %ui, last %ui, bytes %O, "
+                      "head %uz", nxt_router_schedule_test_mem_done,
+                      nxt_router_schedule_test_last_done,
+                      devnull->body_bytes_sent(task, proto), dn.head_length);
+        goto done;
+    }
+
+    /* A header with no body handler completes "last" itself. */
+
+    r->last = nxt_router_schedule_test_last(r);
+    devnull->header_send(task, r, NULL, NULL);
+    nxt_router_schedule_test_drain(task, &engine);
+
+    if (r->last != NULL || nxt_router_schedule_test_last_done != 2) {
+        nxt_log_alert(thr->log, "devnull: header without body left \"last\"");
+        goto done;
+    }
+
+    /* An error discards: "last" completes, the run is marked. */
+
+    devnull->discard(task, r, nxt_router_schedule_test_last(r));
+    nxt_router_schedule_test_drain(task, &engine);
+
+    if (!dn.discarded || nxt_router_schedule_test_last_done != 3) {
+        nxt_log_alert(thr->log, "devnull: discard did not complete \"last\"");
+        goto done;
+    }
+
+    /* The close reports to the owner once and forgets the request. */
+
+    r->status = NXT_HTTP_SERVICE_UNAVAILABLE;
+    nxt_memzero(&joint, sizeof(joint));
+
+    devnull->close(task, proto, &joint);
+
+    if (nxt_router_schedule_test_closes != 1 || dn.request != NULL
+        || dn.status != NXT_HTTP_SERVICE_UNAVAILABLE)
+    {
+        nxt_log_alert(thr->log, "devnull: close reported %ui times",
+                      nxt_router_schedule_test_closes);
+        goto done;
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    if (r != NULL) {
+        nxt_mp_release(r->mem_pool);
+    }
+
+    thr->engine = saved_engine;
+
+    nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+    nxt_mp_destroy(mp);
+
+    return ret;
+}
+
+
 nxt_int_t
 nxt_router_schedule_test(nxt_thread_t *thr)
 {
@@ -634,7 +926,8 @@ nxt_router_schedule_test(nxt_thread_t *thr)
         || nxt_router_schedule_uri_public_test(thr) != NXT_OK
         || nxt_router_schedule_request_test(thr) != NXT_OK
         || nxt_router_schedule_joint_test(thr) != NXT_OK
-        || nxt_router_schedule_resolve_test(thr) != NXT_OK)
+        || nxt_router_schedule_resolve_test(thr) != NXT_OK
+        || nxt_router_schedule_devnull_test(thr) != NXT_OK)
     {
         return NXT_ERROR;
     }

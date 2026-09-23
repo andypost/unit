@@ -19,7 +19,11 @@
  * through." comment alone satisfies GCC's default heuristic but not
  * Clang's.
  */
-#define nxt_fallthrough  __attribute__((fallthrough))
+#if (NXT_HAVE_GCC_ATTRIBUTE_FALLTHROUGH)
+#define nxt_fallthrough  __attribute__((__fallthrough__))
+#else
+#define nxt_fallthrough
+#endif
 
 
 /*

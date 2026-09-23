@@ -1,0 +1,29 @@
+#ddev-generated
+# Switch the web container to FreeUnit (https://freeunit.org), built from
+# source in web-build/Dockerfile.freeunit against the same deb.sury.org PHP
+# package DDEV already installs for $DDEV_PHP_VERSION.
+#
+# webserver_type: generic tells DDEV not to start nginx or php-fpm at all;
+# web_extra_daemons starts our own start-freeunit.sh instead, and
+# web_extra_exposed_ports tells ddev-router to send plain HTTP traffic for
+# the project's normal host ports to FreeUnit's listener on container port
+# 80. TLS is still terminated by ddev-router, exactly as it is for
+# nginx-fpm/apache-fpm; FreeUnit itself never sees HTTPS.
+webserver_type: generic
+
+web_extra_daemons:
+  - name: "freeunit"
+    command: "bash ${DDEV_APPROOT}/.ddev/freeunit/start-freeunit.sh"
+    directory: /var/www/html
+
+web_extra_exposed_ports:
+  - name: "freeunit"
+    container_port: 80
+    http_port: 80
+    https_port: 443
+
+# Build-time-only packages the FreeUnit Dockerfile needs (compiler, the
+# PHP embed SAPI, headers). Pruned again at the end of that Dockerfile.
+webimage_extra_packages:
+  - "php${DDEV_PHP_VERSION}-embed"
+  - "php${DDEV_PHP_VERSION}-dev"

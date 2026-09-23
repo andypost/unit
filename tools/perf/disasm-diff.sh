@@ -113,6 +113,26 @@ echo "=== building unitd ==="
 # so the plain `make` right after picks up this build dir. Re-run
 # `./configure --tests` (default build dir) afterwards if you need the
 # normal build/ tree to be the active one again.
+# ./configure rewrites the top-level ./Makefile to point at $BUILD_DIR;
+# put the caller's Makefile back on exit so a later plain `make` keeps
+# building the tree it built before this script ran.
+MAKEFILE_SAVE=
+if [ -f Makefile ]; then
+    MAKEFILE_SAVE=$(mktemp)
+    cp -p Makefile "$MAKEFILE_SAVE"
+fi
+WORK=
+
+cleanup() {
+    if [ -n "$MAKEFILE_SAVE" ]; then
+        mv -f "$MAKEFILE_SAVE" Makefile
+    fi
+    if [ -n "$WORK" ]; then
+        rm -rf "$WORK"
+    fi
+}
+trap cleanup EXIT
+
 NXT_BUILD_DIR="$BUILD_DIR" ./configure --cc="$CC" --tests \
     >"$BUILD_DIR.configure.log" 2>&1 || {
         echo "configure failed, see $BUILD_DIR.configure.log" >&2
@@ -141,7 +161,6 @@ BINARIES="$UNITD"
 [ -f "$UNIT_APP_TEST" ] && BINARIES="$BINARIES $UNIT_APP_TEST"
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
 
 # tools/perf/harness/mca_harness.c wraps the header-only `static inline`
 # hot functions (nxt_port_queue_*, nxt_app_queue_*, nxt_nncq_*,

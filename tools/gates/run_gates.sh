@@ -191,25 +191,13 @@ gate_5() {
 
     if [ -x tools/perf/disasm-diff.sh ] && command -v objdump >/dev/null 2>&1 \
        && [ -d tools/perf/baseline ] && [ -n "$(ls -A tools/perf/baseline 2>/dev/null)" ]; then
-        # disasm-diff.sh's own ./configure rewrites the top-level ./Makefile
-        # to "include <its build dir>/Makefile" (it says so in its own
-        # header), which would silently redirect every later `make` in this
-        # script -- and any G1/G2/G3 gate re-run after this one in the same
-        # tree -- away from the default ./build the test suite expects.
-        # Save and restore it so disasm-diff is isolated from every other
-        # gate regardless of run order.
-        makefile_snapshot="$(mktemp)"
-        cp -p Makefile "$makefile_snapshot" 2>/dev/null || true
-        if tools/perf/disasm-diff.sh --cc gcc >/tmp/g5-disasm.log 2>&1; then
+        # clang-18 + glibc is the canonical gate baseline (tools/perf/README.md).
+        if tools/perf/disasm-diff.sh --cc clang >/tmp/g5-disasm.log 2>&1; then
             echo "G5 (disasm-diff): PASS"
         else
             tail -n 40 /tmp/g5-disasm.log
             fail 5 "disasm-diff reported a change, see /tmp/g5-disasm.log"
         fi
-        if [ -s "$makefile_snapshot" ]; then
-            cp -p "$makefile_snapshot" Makefile
-        fi
-        rm -f "$makefile_snapshot"
     else
         echo "G5 (disasm-diff): SKIP -- no stored baseline or objdump missing"
     fi

@@ -132,6 +132,26 @@ echo
 
 echo "=== building unitd + libunit ==="
 # shellcheck disable=SC2086
+# ./configure rewrites the top-level ./Makefile to point at $BUILD_DIR;
+# put the caller's Makefile back on exit so a later plain `make` keeps
+# building the tree it built before this script ran.
+MAKEFILE_SAVE=
+if [ -f Makefile ]; then
+    MAKEFILE_SAVE=$(mktemp)
+    cp -p Makefile "$MAKEFILE_SAVE"
+fi
+WORK=
+
+cleanup() {
+    if [ -n "$MAKEFILE_SAVE" ]; then
+        mv -f "$MAKEFILE_SAVE" Makefile
+    fi
+    if [ -n "$WORK" ]; then
+        rm -rf "$WORK"
+    fi
+}
+trap cleanup EXIT
+
 NXT_BUILD_DIR="$BUILD_DIR" ./configure --cc="$CC" --tests $CONFIGURE_OPTS \
     >"$BUILD_DIR.configure.log" 2>&1 || {
         echo "configure failed, see $BUILD_DIR.configure.log" >&2
@@ -170,7 +190,6 @@ nxt_unit_ctx_impl_s:$UNIT_O:local
 "
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
 
 dump_all() {
     out="$1"

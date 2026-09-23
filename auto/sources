@@ -196,6 +196,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_queued_fd_test.c \
     src/test/nxt_checked_test.c \
     src/test/nxt_router_schedule_test.c \
+    src/test/nxt_router_prepare_msg_test.c \
 "
 
 

@@ -290,6 +290,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_router_prepare_msg_test(thr) != NXT_OK) {
+        return 1;
+    }
+
 #if (NXT_HAVE_CGROUP)
     if (nxt_cgroup_test(thr) != NXT_OK) {
         return 1;

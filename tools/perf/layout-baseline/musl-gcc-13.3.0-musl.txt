@@ -136,65 +136,58 @@ struct nxt_unit_request_s {
 
 ### nxt_port_s (local)
 struct nxt_port_s {
-	nxt_fd_event_t             socket;               /*     0    80 */
-	/* --- cacheline 1 boundary (64 bytes) was 16 bytes ago --- */
-	nxt_queue_link_t           link;                 /*    80    16 */
-	nxt_process_t *            process;              /*    96     8 */
-	nxt_queue_link_t           app_link;             /*   104    16 */
-	nxt_app_t *                app;                  /*   120     8 */
+	nxt_port_id_t              id;                   /*     0     2 */
+
+	/* XXX 2 bytes hole, try to pack */
+
+	nxt_pid_t                  pid;                  /*     4     4 */
+	nxt_process_type_t         type;                 /*     8     4 */
+	nxt_fd_t                   queue_fd;             /*    12     4 */
+	void *                     queue;                /*    16     8 */
+	nxt_atomic_t               use_count;            /*    24     8 */
+	nxt_port_handler_t         handler;              /*    32     8 */
+	nxt_port_handler_t *       data;                 /*    40     8 */
+	nxt_fd_event_t             socket;               /*    48    80 */
 	/* --- cacheline 2 boundary (128 bytes) --- */
-	nxt_port_t *               main_app_port;        /*   128     8 */
-	nxt_queue_link_t           idle_link;            /*   136    16 */
-	nxt_msec_t                 idle_start;           /*   152     4 */
-
-	/* XXX 4 bytes hole, try to pack */
-
-	nxt_queue_t                messages;             /*   160    16 */
-	nxt_thread_mutex_t         write_mutex;          /*   176    40 */
-	/* --- cacheline 3 boundary (192 bytes) was 24 bytes ago --- */
-	uint32_t                   max_size;             /*   216     4 */
-	uint32_t                   max_share;            /*   220     4 */
-	uint32_t                   active_websockets;    /*   224     4 */
-	uint8_t                    detached;             /*   228     1 */
-	uint8_t                    detached_app;         /*   229     1 */
-
-	/* XXX 2 bytes hole, try to pack */
-
-	uint32_t                   detached_router;      /*   232     4 */
-	uint32_t                   active_requests;      /*   236     4 */
-	nxt_port_handler_t         handler;              /*   240     8 */
-	nxt_port_handler_t *       data;                 /*   248     8 */
+	nxt_mp_t *                 mem_pool;             /*   128     8 */
+	nxt_event_engine_t *       engine;               /*   136     8 */
+	nxt_socket_t               pair[2];              /*   144     8 */
+	nxt_thread_mutex_t         write_mutex;          /*   152    40 */
+	/* --- cacheline 3 boundary (192 bytes) --- */
+	nxt_queue_t                messages;             /*   192    16 */
+	nxt_queue_link_t           link;                 /*   208    16 */
+	nxt_queue_link_t           app_link;             /*   224    16 */
+	nxt_queue_link_t           idle_link;            /*   240    16 */
 	/* --- cacheline 4 boundary (256 bytes) --- */
-	nxt_mp_t *                 mem_pool;             /*   256     8 */
-	nxt_event_engine_t *       engine;               /*   264     8 */
-	nxt_work_t                 release_work;         /*   272    40 */
-	nxt_work_t                 rearm_work;           /*   312    40 */
-	/* --- cacheline 5 boundary (320 bytes) was 32 bytes ago --- */
-	nxt_atomic_t               rearm_pending;        /*   352     8 */
-	nxt_atomic_t               announce;             /*   360     8 */
-	nxt_buf_t *                free_bufs;            /*   368     8 */
-	nxt_socket_t               pair[2];              /*   376     8 */
-	/* --- cacheline 6 boundary (384 bytes) --- */
-	nxt_port_id_t              id;                   /*   384     2 */
+	nxt_process_t *            process;              /*   256     8 */
+	nxt_app_t *                app;                  /*   264     8 */
+	nxt_port_t *               main_app_port;        /*   272     8 */
+	nxt_atomic_t               rearm_pending;        /*   280     8 */
+	nxt_atomic_t               announce;             /*   288     8 */
+	nxt_buf_t *                free_bufs;            /*   296     8 */
+	void *                     socket_msg;           /*   304     8 */
+	nxt_msec_t                 idle_start;           /*   312     4 */
+	uint32_t                   max_size;             /*   316     4 */
+	/* --- cacheline 5 boundary (320 bytes) --- */
+	uint32_t                   max_share;            /*   320     4 */
+	uint32_t                   active_websockets;    /*   324     4 */
+	uint32_t                   detached_router;      /*   328     4 */
+	uint32_t                   active_requests;      /*   332     4 */
+	int                        from_socket;          /*   336     4 */
+	uint8_t                    detached;             /*   340     1 */
+	uint8_t                    detached_app;         /*   341     1 */
 
 	/* XXX 2 bytes hole, try to pack */
 
-	nxt_pid_t                  pid;                  /*   388     4 */
-	nxt_lvlhsh_t               rpc_streams;          /*   392     8 */
-	nxt_lvlhsh_t               rpc_peers;            /*   400     8 */
-	nxt_lvlhsh_t               frags;                /*   408     8 */
-	nxt_atomic_t               use_count;            /*   416     8 */
-	nxt_process_type_t         type;                 /*   424     4 */
-	nxt_fd_t                   queue_fd;             /*   428     4 */
-	void *                     queue;                /*   432     8 */
-	void *                     socket_msg;           /*   440     8 */
-	/* --- cacheline 7 boundary (448 bytes) --- */
-	int                        from_socket;          /*   448     4 */
+	nxt_work_t                 release_work;         /*   344    40 */
+	/* --- cacheline 6 boundary (384 bytes) --- */
+	nxt_work_t                 rearm_work;           /*   384    40 */
+	nxt_lvlhsh_t               rpc_streams;          /*   424     8 */
+	nxt_lvlhsh_t               rpc_peers;            /*   432     8 */
+	nxt_lvlhsh_t               frags;                /*   440     8 */
 
-	/* size: 456, cachelines: 8, members: 38 */
-	/* sum members: 444, holes: 3, sum holes: 8 */
-	/* padding: 4 */
-	/* last cacheline: 8 bytes */
+	/* size: 448, cachelines: 7, members: 38 */
+	/* sum members: 444, holes: 2, sum holes: 4 */
 };
 
 

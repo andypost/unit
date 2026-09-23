@@ -314,20 +314,57 @@ nxt_port_recv_msg_close_fds(nxt_port_recv_msg_t *msg)
 typedef struct nxt_app_s  nxt_app_t;
 
 struct nxt_port_s {
+    /*
+     * Hot fields, read on every message dispatched through this port
+     * (nxt_port_read_msg_process(), nxt_port_socket_write2(), the
+     * nxt_port_use()/nxt_port_release() refcount): id/pid/type identify
+     * the port and are read on lookup, queue/handler/data/socket drive
+     * every read/write, mem_pool and engine are dereferenced from the
+     * same handlers, and use_count and pair are touched on every
+     * reference and every socket op. Deliberately process-local only
+     * (never placed in shared memory or written to a socket by value --
+     * see the ABI note below), so reordering these is an ordinary
+     * optimization, not an ABI change.
+     */
+    nxt_port_id_t       id;
+    nxt_pid_t           pid;
+
+    nxt_process_type_t  type;
+
+    nxt_fd_t            queue_fd;
+    void                *queue;
+
+    nxt_atomic_t        use_count;
+
+    nxt_port_handler_t  handler;
+    nxt_port_handler_t  *data;
+
     nxt_fd_event_t      socket;
 
-    nxt_queue_link_t    link;       /* for nxt_process_t.ports */
-    nxt_process_t       *process;
+    nxt_mp_t            *mem_pool;
+    nxt_event_engine_t  *engine;
 
+    nxt_socket_t        pair[2];
+
+    /*
+     * Warm fields: touched on the less frequent lifecycle paths (idle
+     * transitions, websocket/detached accounting, the write queue and
+     * its mutex) but still well short of teardown/RPC.
+     */
+    nxt_thread_mutex_t  write_mutex;
+    nxt_queue_t         messages;   /* of nxt_port_send_msg_t */
+    nxt_queue_link_t    link;       /* for nxt_process_t.ports */
     nxt_queue_link_t    app_link;   /* for nxt_app_t.ports */
+    nxt_queue_link_t    idle_link;  /* for nxt_app_t.idle_ports */
+    nxt_process_t       *process;
     nxt_app_t           *app;
     nxt_port_t          *main_app_port;
+    nxt_atomic_t        rearm_pending;
+    nxt_atomic_t        announce;
+    nxt_buf_t           *free_bufs;
+    void                *socket_msg;
 
-    nxt_queue_link_t    idle_link;  /* for nxt_app_t.idle_ports */
     nxt_msec_t          idle_start;
-
-    nxt_queue_t         messages;   /* of nxt_port_send_msg_t */
-    nxt_thread_mutex_t  write_mutex;
 
     /* Maximum size of message part. */
     uint32_t            max_size;
@@ -340,6 +377,24 @@ struct nxt_port_s {
      * NXT_APR_WEBSOCKET_CLOSE, both in nxt_router_app_port_release().
      */
     uint32_t            active_websockets;
+
+    /*
+     * The router put the port in the detached state itself: one for each
+     * request it has given up on that the worker is still running.  A
+     * "limits": {"timeout"} expiry answers the client while the worker keeps
+     * executing, and the port may not rejoin the idle economy until every
+     * such request has been answered or the port closes.  A count rather
+     * than a flag because one worker can run several of them at once, and
+     * kept apart from detached_app so that neither clear drops the other's
+     * reason.  As wide as active_requests below it, which counts the same
+     * population: "threads" is validated up to NXT_INT32_T_MAX, and a wrap
+     * would leave a settle unable to clear the state at all.
+     */
+    uint32_t            detached_router;
+
+    uint32_t            active_requests;
+
+    int                 from_socket;
 
     /*
      * The application answered a request on this port and kept running.
@@ -358,28 +413,12 @@ struct nxt_port_s {
     uint8_t             detached_app;
 
     /*
-     * The router put the port in the detached state itself: one for each
-     * request it has given up on that the worker is still running.  A
-     * "limits": {"timeout"} expiry answers the client while the worker keeps
-     * executing, and the port may not rejoin the idle economy until every
-     * such request has been answered or the port closes.  A count rather
-     * than a flag because one worker can run several of them at once, and
-     * kept apart from detached_app so that neither clear drops the other's
-     * reason.  As wide as active_requests below it, which counts the same
-     * population: "threads" is validated up to NXT_INT32_T_MAX, and a wrap
-     * would leave a settle unable to clear the state at all.
-     */
-    uint32_t            detached_router;
-
-    uint32_t            active_requests;
-
-    nxt_port_handler_t  handler;
-    nxt_port_handler_t  *data;
-
-    nxt_mp_t            *mem_pool;
-    nxt_event_engine_t  *engine;
-
-    /*
+     * Cold fields: teardown and RPC bookkeeping, touched only on the
+     * (rare, by message-count) paths that release the last reference,
+     * re-arm the write event, or track/complete an in-flight RPC or a
+     * fragmented message. Kept at the back so the hot fields above fit
+     * in as few cachelines as possible.
+     *
      * The deferral that carries the last reference drop to port->engine.
      * Embedded rather than allocated, so that nxt_port_use() has no failure
      * path -- see the comment there.  Single-instance: use_count reaches
@@ -410,29 +449,11 @@ struct nxt_port_s {
      * out.
      */
     nxt_work_t          rearm_work;
-    nxt_atomic_t        rearm_pending;
-    nxt_atomic_t        announce;
-
-    nxt_buf_t           *free_bufs;
-    nxt_socket_t        pair[2];
-
-    nxt_port_id_t       id;
-    nxt_pid_t           pid;
 
     nxt_lvlhsh_t        rpc_streams; /* stream to nxt_port_rpc_reg_t */
     nxt_lvlhsh_t        rpc_peers;   /* peer to queue of nxt_port_rpc_reg_t */
 
     nxt_lvlhsh_t        frags;
-
-    nxt_atomic_t        use_count;
-
-    nxt_process_type_t  type;
-
-    nxt_fd_t            queue_fd;
-    void                *queue;
-
-    void                *socket_msg;
-    int                 from_socket;
 };
 
 

@@ -160,6 +160,57 @@ FreeUnit includes built-in OpenTelemetry support (compiled with `--otel`):
 FreeUnit supports running WebAssembly Components (WASI 0.2).
 For configuration details see the [OpenAPI spec](docs/unit-openapi.yaml).
 
+## Schedules
+
+FreeUnit can run periodic internal requests to an application itself —
+cron, essentially — with no client and no sidecar process, through a
+top-level `"schedules"` object:
+
+```json
+{
+  "schedules": {
+    "drupal-cron": {
+      "pass": "applications/drupal/index",
+      "uri": "/cron/SECRET_KEY",
+      "interval": 300,
+      "jitter": 15,
+      "timeout": 240,
+      "overlap": "skip",
+      "headers": { "Host": "example.org" }
+    }
+  }
+}
+```
+
+See [`docs/schedules.md`](docs/schedules.md) for the field reference,
+semantics and operational caveats, and
+[`docs/adr/0004-schedules.md`](docs/adr/0004-schedules.md) for the design.
+
+**Schedules plan B.** If a schedule ever needs to be ruled out live —
+during a demo, or while debugging — fall back to an external loop against
+the same target, with no FreeUnit configuration change required. Against
+the control socket, to hit a listener exactly as the schedule would:
+
+```sh
+while sleep 300; do
+    curl -fsS -H "Host: example.org" "http://127.0.0.1/cron/SECRET_KEY" \
+        >/dev/null || echo "cron failed" >&2
+done &
+```
+
+Or, bypassing the listener entirely and going straight to the control API
+to confirm FreeUnit itself is healthy while `schedules` is suspected of
+misbehaving:
+
+```sh
+curl -s --unix-socket /var/run/control.unit.sock http://localhost/status
+```
+
+Because the next iteration only starts `interval` seconds after the
+previous `curl` returns, this loop never overlaps by construction, unlike
+`overlap: "queue"`, and it is invisible to `/status` — exactly the
+trade-off in ADR 0004 §10 (plan B2).
+
 ## OpenAPI Specification
 
 The [OpenAPI specification](docs/unit-openapi.yaml) aims to simplify

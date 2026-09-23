@@ -1,0 +1,11 @@
+id: narrowing-to-proto
+valid:
+  - |
+    void f(nxt_buf_t *b, uint32_t *out) {
+        nxt_size_to_uint32(b->len, out);
+    }
+invalid:
+  - |
+    void f(nxt_buf_t *b) {
+        uint8_t n = (uint8_t) b->len;
+    }

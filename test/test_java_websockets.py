@@ -1377,6 +1377,26 @@ def test_java_websockets_max_frame_size():
     check_close(sock, 1009)  # 1009 - CLOSE_TOO_LARGE
 
 
+def test_java_websockets_send_text_one_frame():
+    client.load('websockets_mirror')
+
+    _, sock, _ = ws.upgrade()
+
+    # 64 KiB is well under DEFAULT_BUFFER_SIZE == 8 MiB (see
+    # test/java/websockets_mirror/app.java) but far above the java module's
+    # 8 KiB encode buffer, which used to fragment any message this large into
+    # eight TEXT/CONT frames regardless of "max_frame_size".  A complete
+    # message already in memory must leave as a single frame with fin=True.
+    payload = '*' * 64 * 1024
+
+    ws.frame_write(sock, ws.OP_TEXT, payload)
+
+    frame = ws.frame_read(sock)
+    check_frame(frame, True, ws.OP_TEXT, payload)
+
+    close_connection(sock)
+
+
 def test_java_websockets_read_timeout():
     client.load('websockets_mirror')
 
@@ -1410,5 +1430,26 @@ def test_java_websockets_keepalive_interval():
 
     frame = ws.frame_read(sock)
     check_frame(frame, True, ws.OP_PING, '')  # PING frame
+
+    sock.close()
+
+
+def test_java_websockets_binary_message_too_big_reason():
+    # A fragmented binary message over the session's binary buffer used to
+    # report the text-message close reason (issue #435); an unfragmented
+    # binary message never reaches the check, so this needs two frames.
+    client.load('websockets_binary_toobig')
+
+    _, sock, _ = ws.upgrade()
+
+    ws.frame_write(sock, ws.OP_BINARY, '*' * 600, fin=False)
+    ws.frame_write(sock, ws.OP_CONT, '*' * 600, fin=True)
+
+    frame = ws.frame_read(sock)
+
+    assert frame['opcode'] == ws.OP_CLOSE, 'close opcode'
+    assert frame['code'] == 1009, 'close code'
+    assert 'text message' not in frame['reason'], 'reason names the wrong kind'
+    assert 'binary' in frame['reason'], 'reason names the binary message'
 
     sock.close()

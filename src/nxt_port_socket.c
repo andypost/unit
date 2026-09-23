@@ -8,6 +8,7 @@
 #include <nxt_socket_msg.h>
 #include <nxt_port_queue.h>
 #include <nxt_port_memory_int.h>
+#include <nxt_usdt.h>
 
 
 #define NXT_PORT_MAX_ENQUEUE_BUF_SIZE \
@@ -296,6 +297,8 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
     msg.port_msg.mmap = 0;
     msg.port_msg.nf = 0;
     msg.port_msg.mf = 0;
+
+    NXT_USDT(port__send, nxt_pid, stream, type);
 
     if (port->queue != NULL && type != _NXT_PORT_MSG_READ_QUEUE) {
 
@@ -1436,6 +1439,8 @@ nxt_port_read_handler(nxt_task_t *task, void *obj, void *data)
     struct iovec         iov[2];
 
     port = msg.port = nxt_container_of(obj, nxt_port_t, socket);
+
+    NXT_USDT(port__recv, nxt_pid, port->pid);
 
     nxt_assert(port->engine == task->thread->engine);
 

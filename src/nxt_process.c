@@ -5,6 +5,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_usdt.h>
 
 #include <nxt_application.h>
 #include <nxt_cgroup.h>
@@ -665,6 +666,8 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
     /* Parent. */
 
     nxt_debug(task, "fork(%s): %PI", process->name, pid);
+
+    NXT_USDT(process__spawn, nxt_pid, pid);
 
 #if (NXT_HAVE_LINUX_NS)
     if (use_pidns) {

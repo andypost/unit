@@ -1,0 +1,52 @@
+#!/usr/bin/env bpftrace
+/*
+ * Copyright (C) NGINX, Inc.
+ *
+ * Request count and latency by HTTP status, plus overall request rate,
+ * using request__start / request__done (src/nxt_http_request.c).
+ *
+ * Not run in the container this was written in (no BPF privileges /
+ * no uprobe_events -- see tools/usdt/port-rtt.bt for the exact error);
+ * reviewed but unverified against a live target.
+ *
+ * Usage:
+ *   bpftrace tools/usdt/requests-by-status.bt -p $(pgrep -f 'unit: router')
+ *
+ * Requires a --usdt build (see docs/observability/usdt.md).
+ * request__start args: (nxt_pid, request pointer as a stable per-request id)
+ * request__done  args: (nxt_pid, request pointer, status)
+ */
+
+BEGIN
+{
+    printf("Tracing freeunit requests by status. Ctrl-C to stop.\n");
+}
+
+usdt:/usr/sbin/unitd:freeunit:request__start
+{
+    @req_start[arg1] = nsecs;
+    @inflight++;
+}
+
+usdt:/usr/sbin/unitd:freeunit:request__done
+{
+    @by_status[arg2] = count();
+
+    if (@req_start[arg1]) {
+        @latency_by_status_ns[arg2] = hist(nsecs - @req_start[arg1]);
+        delete(@req_start[arg1]);
+    }
+
+    @inflight--;
+}
+
+interval:s:10
+{
+    print(@by_status);
+    print(@inflight);
+}
+
+END
+{
+    clear(@req_start);
+}

@@ -1,0 +1,53 @@
+#!/usr/bin/env bpftrace
+/*
+ * Copyright (C) NGINX, Inc.
+ *
+ * App-queue (nxt_app_queue_t, src/nxt_app_queue.h) slot residency: time
+ * between queue__enqueue (router side, nxt_app_queue_send()) and
+ * queue__dequeue (worker side, nxt_app_queue_recv()) for the same slot
+ * index, plus current queue depth as items go in and out.
+ *
+ * Not run in the container this was written in (no BPF privileges /
+ * no uprobe_events -- see tools/usdt/port-rtt.bt for the exact error);
+ * reviewed but unverified against a live target.
+ *
+ * Usage:
+ *   bpftrace tools/usdt/queue-residency.bt -p <router-or-worker-pid>
+ *
+ * Requires a --usdt build (see docs/observability/usdt.md). The
+ * enqueue side lives in unitd; the dequeue side lives in libunit, i.e.
+ * inside each application process (php/python/etc, or unit_app_test).
+ * Point -p / -c at whichever process you need, or trace both with two
+ * separate USDT probe specs bound to their own binaries.
+ */
+
+BEGIN
+{
+    printf("Tracing freeunit app-queue enqueue -> dequeue residency. Ctrl-C to stop.\n");
+    @depth = 0;
+}
+
+usdt:/usr/sbin/unitd:freeunit:queue__enqueue
+{
+    /* arg1 is the slot index (the "cookie"), arg2 the tracking id. */
+    @qstart[arg1] = nsecs;
+    @depth++;
+}
+
+usdt:*:freeunit:queue__dequeue
+/@qstart[arg1]/
+{
+    @queue_residency_ns = hist(nsecs - @qstart[arg1]);
+    delete(@qstart[arg1]);
+    @depth--;
+}
+
+interval:s:5
+{
+    print(@depth);
+}
+
+END
+{
+    clear(@qstart);
+}

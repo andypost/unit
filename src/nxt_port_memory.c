@@ -5,6 +5,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_usdt.h>
 
 #if (NXT_HAVE_MEMFD_CREATE)
 
@@ -313,6 +314,8 @@ nxt_port_incoming_port_mmap(nxt_task_t *task, nxt_process_t *process,
 
         return NULL;
     }
+
+    NXT_USDT(mmap__chunk__alloc, nxt_pid, process->pid, PORT_MMAP_SIZE);
 
     hdr = mem;
 

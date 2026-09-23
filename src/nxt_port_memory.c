@@ -5,6 +5,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_span.h>
 #include <nxt_usdt.h>
 
 #if (NXT_HAVE_MEMFD_CREATE)
@@ -914,27 +915,51 @@ nxt_port_mmap_write(nxt_task_t *task, nxt_port_t *port,
 }
 
 
+/*
+ * The buffers of an mmap message carry an array of nxt_port_mmap_msg_t
+ * written by the peer, which may be an untrusted application process.  The
+ * array is walked with nxt_span_copy(), so a buffer whose length is not a
+ * whole number of records -- a partial tail of 1 to 11 bytes -- is refused
+ * at the tail instead of being read as a record that runs past mem.free.
+ * Each record is copied out before any field is used; the fields are then
+ * bounds-checked by nxt_port_mmap_get_incoming_buf(): mmap_id against the
+ * sender's incoming segments, chunk_id and size by
+ * nxt_port_mmap_chunk_range_valid().
+ */
+
 void
 nxt_port_mmap_read(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     nxt_buf_t            *b, **pb;
-    nxt_port_mmap_msg_t  *end, *mmap_msg;
+    nxt_span_t           span;
+    nxt_port_mmap_msg_t  mmap_msg;
 
     pb = &msg->buf;
     msg->size = 0;
 
     for (b = msg->buf; b != NULL; b = b->next) {
 
-        mmap_msg = (nxt_port_mmap_msg_t *) b->mem.pos;
-        end = (nxt_port_mmap_msg_t *) b->mem.free;
+        nxt_span_init(&span, b->mem.pos, b->mem.free);
 
-        while (mmap_msg < end) {
+        while (nxt_span_len(&span) != 0) {
+
+            if (nxt_slow_path(nxt_span_copy(&span, &mmap_msg,
+                                            sizeof(nxt_port_mmap_msg_t))
+                              != 0))
+            {
+                nxt_alert(task, "invalid mmap message from pid %PI: "
+                          "%uz trailing bytes are not a whole record",
+                          msg->port_msg.pid, nxt_span_len(&span));
+
+                break;
+            }
+
             nxt_debug(task, "mmap_msg={%D, %D, %D} from %PI",
-                      mmap_msg->mmap_id, mmap_msg->chunk_id, mmap_msg->size,
+                      mmap_msg.mmap_id, mmap_msg.chunk_id, mmap_msg.size,
                       msg->port_msg.pid);
 
             *pb = nxt_port_mmap_get_incoming_buf(task, msg->port,
-                                                 msg->port_msg.pid, mmap_msg);
+                                                 msg->port_msg.pid, &mmap_msg);
             if (nxt_slow_path(*pb == NULL)) {
                 nxt_log_error(NXT_LOG_ERR, task->log,
                               "failed to get mmap buffer");
@@ -942,9 +967,8 @@ nxt_port_mmap_read(nxt_task_t *task, nxt_port_recv_msg_t *msg)
                 break;
             }
 
-            msg->size += mmap_msg->size;
+            msg->size += mmap_msg.size;
             pb = &(*pb)->next;
-            mmap_msg++;
 
             /* Mark original buf as complete. */
             b->mem.pos += sizeof(nxt_port_mmap_msg_t);

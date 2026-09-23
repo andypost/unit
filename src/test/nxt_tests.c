@@ -203,6 +203,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_port_mmap_read_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_port_ready_test(thr) != NXT_OK) {
         return 1;
     }
@@ -283,6 +287,18 @@ main(int argc, char **argv)
     }
 
     if (nxt_router_schedule_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_prepare_msg_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_frag_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_release_test(thr) != NXT_OK) {
         return 1;
     }
 

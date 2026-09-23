@@ -8,6 +8,7 @@
 #include <nxt_socket_msg.h>
 #include <nxt_port_queue.h>
 #include <nxt_port_memory_int.h>
+#include <nxt_checked.h>
 #include <nxt_usdt.h>
 
 
@@ -39,6 +40,8 @@ static void nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
     nxt_port_recv_msg_t *msg);
 static nxt_buf_t *nxt_port_buf_alloc(nxt_port_t *port);
 static void nxt_port_buf_free(nxt_port_t *port, nxt_buf_t *b);
+static void nxt_port_frag_unaccount(nxt_port_t *port,
+    nxt_port_recv_msg_t *fmsg);
 static void nxt_port_announce(nxt_task_t *task, nxt_port_t *port);
 static void nxt_port_rearm_now(nxt_task_t *task, nxt_port_t *port);
 static void nxt_port_rearm_work_handler(nxt_task_t *task, void *obj,
@@ -1900,6 +1903,23 @@ nxt_port_frag_start(nxt_task_t *task, nxt_port_t *port,
 
     nxt_debug(task, "start frag stream #%uD", msg->port_msg.stream);
 
+    if (nxt_slow_path(port->frag_streams >= NXT_PORT_FRAG_STREAMS_MAX)) {
+        nxt_alert(task, "port %d: %uD fragmented messages already in "
+                  "progress, dropping stream #%uD from pid %PI",
+                  port->socket.fd, port->frag_streams, msg->port_msg.stream,
+                  msg->port_msg.pid);
+        return NULL;
+    }
+
+    if (nxt_slow_path(msg->size > NXT_PORT_FRAG_SIZE_MAX
+                      || msg->size > NXT_PORT_FRAG_TOTAL_MAX - port->frag_size))
+    {
+        nxt_alert(task, "port %d: fragmented message #%uD from pid %PI "
+                  "exceeds the reassembly limit, dropped", port->socket.fd,
+                  msg->port_msg.stream, msg->port_msg.pid);
+        return NULL;
+    }
+
     fmsg = nxt_mp_alloc(port->mem_pool, sizeof(nxt_port_recv_msg_t));
 
     if (nxt_slow_path(fmsg == NULL)) {
@@ -1924,6 +1944,9 @@ nxt_port_frag_start(nxt_task_t *task, nxt_port_t *port,
     switch (res) {
 
     case NXT_OK:
+        port->frag_streams++;
+        port->frag_size += fmsg->size;
+
         return fmsg;
 
     case NXT_DECLINED:
@@ -1973,6 +1996,10 @@ nxt_port_frag_find(nxt_task_t *task, nxt_port_t *port, nxt_port_recv_msg_t *msg)
     switch (res) {
 
     case NXT_OK:
+        if (last) {
+            nxt_port_frag_unaccount(port, lhq.value);
+        }
+
         return lhq.value;
 
     default:
@@ -1981,6 +2008,99 @@ nxt_port_frag_find(nxt_task_t *task, nxt_port_t *port, nxt_port_recv_msg_t *msg)
 
         return NULL;
     }
+}
+
+
+static void
+nxt_port_frag_unaccount(nxt_port_t *port, nxt_port_recv_msg_t *fmsg)
+{
+    port->frag_streams--;
+    port->frag_size -= fmsg->size;
+}
+
+
+/*
+ * Would appending "msg" to the stream being reassembled in "fmsg" pass a
+ * limit?  The per-port total is checked only for a fragment that keeps the
+ * stream open: the last one hands the whole message over at once.
+ */
+static nxt_bool_t
+nxt_port_frag_fits(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_recv_msg_t *fmsg, nxt_port_recv_msg_t *msg)
+{
+    size_t  size;
+
+    if (nxt_slow_path(nxt_size_add(fmsg->size, msg->size, &size) != 0
+                      || size > NXT_PORT_FRAG_SIZE_MAX))
+    {
+        nxt_alert(task, "port %d: fragmented message #%uD from pid %PI "
+                  "exceeds %d bytes, dropped", port->socket.fd,
+                  msg->port_msg.stream, msg->port_msg.pid,
+                  NXT_PORT_FRAG_SIZE_MAX);
+        return 0;
+    }
+
+    if (msg->port_msg.mf != 0
+        && nxt_slow_path(nxt_size_add(port->frag_size, msg->size, &size) != 0
+                         || size > NXT_PORT_FRAG_TOTAL_MAX))
+    {
+        nxt_alert(task, "port %d: fragmented messages in progress exceed "
+                  "%d bytes, dropping stream #%uD from pid %PI",
+                  port->socket.fd, NXT_PORT_FRAG_TOTAL_MAX,
+                  msg->port_msg.stream, msg->port_msg.pid);
+        return 0;
+    }
+
+    return 1;
+}
+
+
+/*
+ * Drops a stream that passed a limit: out of ->frags if it is still there,
+ * then everything it had accumulated -- buffers, the first fragment's
+ * descriptors, the stream itself.  Its later fragments find no stream and
+ * are discarded by the "not found" path.
+ */
+static void
+nxt_port_frag_drop(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_recv_msg_t *fmsg, nxt_bool_t in_hash)
+{
+    nxt_buf_t            *b, *next;
+    nxt_lvlhsh_query_t   lhq;
+    nxt_port_frag_key_t  frag_key;
+
+    if (in_hash) {
+        frag_key.stream = fmsg->port_msg.stream;
+        frag_key.pid = fmsg->port_msg.pid;
+
+        lhq.key_hash = nxt_murmur_hash2(&frag_key,
+                                        sizeof(nxt_port_frag_key_t));
+        lhq.key.length = sizeof(nxt_port_frag_key_t);
+        lhq.key.start = (u_char *) &frag_key;
+        lhq.proto = &lvlhsh_frag_proto;
+        lhq.pool = port->mem_pool;
+
+        if (nxt_lvlhsh_delete(&port->frags, &lhq) == NXT_OK) {
+            nxt_port_frag_unaccount(port, fmsg);
+        }
+    }
+
+    for (b = fmsg->buf; b != NULL; b = next) {
+        next = b->next;
+        b->next = NULL;
+
+        if (nxt_buf_is_port_mmap(b)) {
+            nxt_work_queue_add(port->socket.read_work_queue,
+                               b->completion_handler, task, b, b->parent);
+
+        } else {
+            nxt_port_buf_free(port, b);
+        }
+    }
+
+    nxt_port_close_fds(fmsg->fd);
+
+    nxt_mp_free(port->mem_pool, fmsg);
 }
 
 
@@ -2022,9 +2142,24 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
                 nxt_port_mmap_read(task, msg);
             }
 
+            if (nxt_slow_path(!nxt_port_frag_fits(task, port, fmsg, msg))) {
+                /* The last fragment's lookup took the stream out already. */
+                nxt_port_frag_drop(task, port, fmsg, msg->port_msg.mf != 0);
+
+                /* This fragment's own buffers complete on the common path. */
+                b = msg->buf;
+
+                goto fmsg_failed;
+            }
+
             nxt_buf_chain_add(&fmsg->buf, msg->buf);
 
             fmsg->size += msg->size;
+
+            if (msg->port_msg.mf != 0) {
+                port->frag_size += msg->size;
+            }
+
             msg->buf = NULL;
             b = NULL;
 

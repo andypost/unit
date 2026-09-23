@@ -23,6 +23,7 @@
 #include <nxt_port_queue.h>
 #include <nxt_http_compression.h>
 #include <nxt_router_schedule.h>
+#include <nxt_checked.h>
 #include <nxt_usdt.h>
 
 #if (NXT_HAVE_OTEL)
@@ -382,7 +383,8 @@ static void nxt_router_http_request_done(nxt_task_t *task, void *obj,
 static void nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data);
 static nxt_buf_t *nxt_router_prepare_msg(nxt_task_t *task,
-    nxt_http_request_t *r, nxt_app_t *app, const nxt_str_t *prefix);
+    nxt_http_request_t *r, nxt_app_t *app, const nxt_str_t *prefix,
+    nxt_http_status_t *status);
 
 static void nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data);
 static void nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj,
@@ -5511,7 +5513,12 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         nxt_request_rpc_data_unlink(task, req_rpc_data);
 
     } else {
-        if (app->timeout != 0) {
+        /*
+         * The deadline bounds the worker's answer, and an upgraded
+         * WebSocket has had its answer: the frames that follow are a
+         * session, however quiet (#422).
+         */
+        if (app->timeout != 0 && r->state != &nxt_http_websocket) {
             r->timer.handler = nxt_router_app_timeout;
             r->timer_data = req_rpc_data;
             nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
@@ -5686,6 +5693,13 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
             nxt_debug(task, "stream #%uD upgrade", req_rpc_data->stream);
 
             r->state = &nxt_http_websocket;
+
+            /*
+             * The 101 arrived as a non-last message, which re-armed the
+             * request deadline above; the upgrade ends the request, so the
+             * deadline goes with it (#422).
+             */
+            nxt_timer_disable(task->thread->engine, &r->timer);
 
         } else {
             r->state = &nxt_http_request_send_state;
@@ -7599,6 +7613,7 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_buf_t         *buf, *body;
     nxt_int_t         res;
     nxt_port_t        *port, *reply_port;
+    nxt_http_status_t  status;
 
     int                   notify;
     struct {
@@ -7619,13 +7634,14 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     reply_port = task->thread->engine->port;
 
     buf = nxt_router_prepare_msg(task, req_rpc_data->request, app,
-                                 nxt_app_msg_prefix[app->type]);
+                                 nxt_app_msg_prefix[app->type], &status);
     if (nxt_slow_path(buf == NULL)) {
-        nxt_alert(task, "stream #%uD, app '%V': failed to prepare app message",
-                  req_rpc_data->stream, &app->name);
+        if (status == NXT_HTTP_INTERNAL_SERVER_ERROR) {
+            nxt_alert(task, "stream #%uD, app '%V': failed to prepare app "
+                      "message", req_rpc_data->stream, &app->name);
+        }
 
-        nxt_http_request_error(task, req_rpc_data->request,
-                               NXT_HTTP_INTERNAL_SERVER_ERROR);
+        nxt_http_request_error(task, req_rpc_data->request, status);
 
         return;
     }
@@ -7693,14 +7709,40 @@ nxt_router_app_prepare_request(nxt_task_t *task,
 
 
 
+/*
+ * Builds the nxt_unit_request_t for the application in shared memory.
+ *
+ * Every length that lands in a narrow field of the libunit protocol is
+ * checked before the buffer is allocated, and the request is refused rather
+ * than having the field truncated: a truncated length makes the application
+ * see a different string from the one that was copied (a 256-byte method
+ * arrived as an empty one), with the NUL terminator somewhere else.
+ *
+ *   - method_length is uint8_t, and the HTTP parser does not bound a method
+ *     (it is limited only by the header buffer): 501.
+ *   - a field's name_length is uint8_t.  nxt_http_parse_field_name() caps a
+ *     name at 255 bytes (NXT_HTTP_MAX_FIELD_NAME), which fits alone, but the
+ *     PHP/Perl/Ruby prefix "HTTP_" is added on top: names of 251..255 bytes
+ *     wrapped to 0..4.  431.
+ *   - version, the address and port texts are uint8_t as well but produced
+ *     by Unit itself; they are checked all the same, and fail with 500.
+ *   - the uint32_t lengths (server name, target, path, query, values) are
+ *     bounded by req_size <= PORT_MMAP_DATA_SIZE, which is summed with
+ *     overflow checks.
+ *
+ * On failure NULL is returned and *status says what to answer.
+ */
+
 static nxt_buf_t *
 nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_app_t *app, const nxt_str_t *prefix)
+    nxt_app_t *app, const nxt_str_t *prefix, nxt_http_status_t *status)
 {
     void                *target_pos, *query_pos;
     u_char              *pos, *end, *p, c;
     size_t              fields_count, req_size, size, free_size;
     size_t              copy_size;
+    uint8_t             u8;
+    nxt_uint_t          overflow;
     nxt_off_t           content_length;
     nxt_buf_t               *b, *buf, *out, **tail;
     nxt_http_field_t        *field, *dup;
@@ -7708,15 +7750,51 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_fields_iter_t  iter, dup_iter;
     nxt_unit_request_t      *req;
 
-    req_size = sizeof(nxt_unit_request_t)
-               + r->method->length + 1
-               + r->version.length + 1
-               + r->remote->address_length + 1
-               + r->local->address_length + 1
-               + nxt_sockaddr_port_length(r->local) + 1
-               + r->server_name.length + 1
-               + r->target.length + 1
-               + (r->path->start != r->target.start ? r->path->length + 1 : 0);
+    *status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+
+    if (nxt_slow_path(nxt_u8_from_size(r->method->length, &u8) != 0)) {
+        nxt_log(task, NXT_LOG_INFO, "request method of %uz bytes is too long "
+                "for the application protocol", r->method->length);
+
+        *status = NXT_HTTP_NOT_IMPLEMENTED;
+        return NULL;
+    }
+
+    if (nxt_slow_path(nxt_u8_from_size(r->version.length, &u8) != 0
+                      || nxt_u8_from_size(r->remote->address_length, &u8)
+                         != 0
+                      || nxt_u8_from_size(r->local->address_length, &u8) != 0
+                      || nxt_u8_from_size(nxt_sockaddr_port_length(r->local),
+                                          &u8)
+                         != 0))
+    {
+        nxt_alert(task, "request version or address too long for the "
+                  "application protocol");
+
+        return NULL;
+    }
+
+    overflow = 0;
+
+    req_size = sizeof(nxt_unit_request_t);
+
+    overflow |= nxt_size_add(req_size, r->method->length + 1, &req_size);
+    overflow |= nxt_size_add(req_size, r->version.length + 1, &req_size);
+    overflow |= nxt_size_add(req_size, r->remote->address_length + 1,
+                             &req_size);
+    overflow |= nxt_size_add(req_size, r->local->address_length + 1,
+                             &req_size);
+    overflow |= nxt_size_add(req_size, nxt_sockaddr_port_length(r->local) + 1,
+                             &req_size);
+    overflow |= nxt_size_add(req_size, r->server_name.length, &req_size);
+    overflow |= nxt_size_add(req_size, 1, &req_size);
+    overflow |= nxt_size_add(req_size, r->target.length, &req_size);
+    overflow |= nxt_size_add(req_size, 1, &req_size);
+
+    if (r->path->start != r->target.start) {
+        overflow |= nxt_size_add(req_size, r->path->length, &req_size);
+        overflow |= nxt_size_add(req_size, 1, &req_size);
+    }
 
     content_length = r->content_length_n < 0 ? 0 : r->content_length_n;
     fields_count = 0;
@@ -7726,15 +7804,29 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     {
         fields_count++;
 
-        req_size += field->name_length + prefix->length + 1
-                    + field->value_length + 1;
+        if (nxt_slow_path(nxt_u8_from_size(field->name_length
+                                           + prefix->length, &u8)
+                          != 0))
+        {
+            nxt_log(task, NXT_LOG_INFO, "header field name of %d bytes is "
+                    "too long for the application protocol with prefix "
+                    "\"%V\"", (int) field->name_length, prefix);
+
+            *status = NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE;
+            return NULL;
+        }
+
+        overflow |= nxt_size_add(req_size, field->name_length + prefix->length
+                                           + 1, &req_size);
+        overflow |= nxt_size_add(req_size, field->value_length, &req_size);
+        overflow |= nxt_size_add(req_size, 1, &req_size);
+        overflow |= nxt_size_add(req_size, sizeof(nxt_unit_field_t),
+                                 &req_size);
     } nxt_http_fields_loop;
 
-    req_size += fields_count * sizeof(nxt_unit_field_t);
-
-    if (nxt_slow_path(req_size > PORT_MMAP_DATA_SIZE)) {
-        nxt_alert(task, "headers to big to fit in shared memory (%d)",
-                  (int) req_size);
+    if (nxt_slow_path(overflow != 0 || req_size > PORT_MMAP_DATA_SIZE)) {
+        nxt_alert(task, "headers too big to fit in shared memory (%uz%s)",
+                  req_size, overflow != 0 ? ", overflowed" : "");
 
         return NULL;
     }
@@ -7837,6 +7929,7 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 
         dst_field->hash = field->hash;
         dst_field->skip = 0;
+        /* Checked to fit uint8_t when req_size was summed. */
         dst_field->name_length = field->name_length + prefix->length;
         dst_field->value_length = field->value_length;
 
@@ -7976,6 +8069,30 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 
     return out;
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * For src/test/nxt_router_prepare_msg_test.c, which repeats this prototype:
+ * nxt_router.h cannot name nxt_http_status_t.
+ */
+
+nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status);
+
+
+nxt_buf_t *
+nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status)
+{
+    return nxt_router_prepare_msg(task, r, app,
+                                  use_http_prefix ? &http_prefix
+                                                  : &empty_prefix,
+                                  status);
+}
+
+#endif
 
 
 static void

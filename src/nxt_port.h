@@ -454,7 +454,33 @@ struct nxt_port_s {
     nxt_lvlhsh_t        rpc_peers;   /* peer to queue of nxt_port_rpc_reg_t */
 
     nxt_lvlhsh_t        frags;
+
+    /*
+     * The fragment streams in ->frags and the bytes they hold, kept against
+     * the NXT_PORT_FRAG_* limits below.  Touched only by the port's reader.
+     */
+    uint32_t            frag_streams;
+    uint32_t            frag_size;      /* <= NXT_PORT_FRAG_TOTAL_MAX */
 };
+
+
+/*
+ * Limits on fragment reassembly at a receiving port (#394).  A sender
+ * controls how many fragmented messages it opens and how long it keeps
+ * each one going, and the receiver holds every fragment until the last
+ * one arrives: without a bound, a peer that never sends the last fragment
+ * -- or sends a new stream id for each message -- grows the receiver
+ * without limit.  libunit never fragments, so the legitimate senders are
+ * Unit's own processes, one message at a time per destination port; the
+ * largest such message is a configuration pushed from the controller.
+ *
+ * A stream that would pass a limit is dropped as a whole, with an alert:
+ * what it had accumulated is released and its later fragments are
+ * discarded as belonging to no stream.
+ */
+#define NXT_PORT_FRAG_STREAMS_MAX  64                    /* per port */
+#define NXT_PORT_FRAG_SIZE_MAX     (128 * 1024 * 1024)   /* per stream */
+#define NXT_PORT_FRAG_TOTAL_MAX    (256 * 1024 * 1024)   /* per port */
 
 
 typedef struct {

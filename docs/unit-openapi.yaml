@@ -5600,6 +5600,71 @@ paths:
         "404":
           $ref: "#/components/responses/responseNotFound"
 
+  /status/schedules:
+    summary: "Endpoint for the `schedules` status object"
+    get:
+      operationId: getStatusSchedules
+      summary: "Retrieve the schedules status object"
+      description: "Retrieves the `schedules` status object that represents
+        the run counters and last-run result of each configured
+        [schedule](https://unit.nginx.org/statusapi/). The object is
+        omitted entirely from `/status` when no `schedules` are
+        configured, so its absence there is how a client tells a build
+        or configuration with no schedules from one whose schedules have
+        simply not run yet."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `schedules` object exists in
+            the configuration."
+
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/statusSchedules"
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusSchedules"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/schedules/{scheduleName}:
+    summary: "Endpoint for the schedule status object"
+    get:
+      operationId: getStatusSchedulesSchedule
+      summary: "Retrieve one schedule's status object"
+      description: "Retrieves the status object for one configured
+        [schedule](https://unit.nginx.org/statusapi/): its run counters
+        and the result of its most recently finished run."
+
+      tags:
+        - status
+
+      parameters:
+        - $ref: "#/components/parameters/scheduleName"
+
+      responses:
+        "200":
+          description: "OK; the schedule object exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/statusSchedulesSchedule"
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusSchedulesSchedule"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
 components:
   # -- PARAMETERS --
 
@@ -5608,6 +5673,14 @@ components:
       in: path
       description: "An application's name in the configuration."
       name: appName
+      required: true
+      schema:
+        type: string
+
+    scheduleName:
+      in: path
+      description: "A schedule's name in the configuration (`schedules`)."
+      name: scheduleName
       required: true
       schema:
         type: string
@@ -6380,6 +6453,16 @@ components:
               detached: 0
             requests:
               active: 15
+        schedules:
+          cron:
+            runs: 42
+            skipped: 1
+            failed: 0
+            timed_out: 0
+            running: 0
+            last_status: 200
+            last_duration_ms: 8
+            last_start: 1732300042
 
     # /status/modules
     statusModules:
@@ -6492,6 +6575,33 @@ components:
       value:
         exported: 4096
         failed: 0
+
+    # /status/schedules
+    statusSchedules:
+      summary: "Regular schedules status object"
+      value:
+        cron:
+          runs: 42
+          skipped: 1
+          failed: 0
+          timed_out: 0
+          running: 0
+          last_status: 200
+          last_duration_ms: 8
+          last_start: 1732300042
+
+    # /status/schedules/{scheduleName}
+    statusSchedulesSchedule:
+      summary: "Regular schedule status object"
+      value:
+        runs: 42
+        skipped: 1
+        failed: 0
+        timed_out: 0
+        running: 0
+        last_status: 200
+        last_duration_ms: 8
+        last_start: 1732300042
 
   # -- RESPONSES --
 
@@ -7960,6 +8070,9 @@ components:
         applications:
           $ref: "#/components/schemas/statusApplications"
 
+        schedules:
+          $ref: "#/components/schemas/statusSchedules"
+
     # /status/modules
     statusModules:
       description: "Lists currently loaded language modules."
@@ -8083,6 +8196,69 @@ components:
           type: integer
           format: int64
           description: "Spans whose export failed."
+
+    # /status/schedules
+    statusSchedules:
+      description: "Lists the run counters and last-run result of each
+        configured schedule (`schedules`), keyed by schedule name. The
+        object is omitted entirely from `/status` when no schedules are
+        configured, so its absence is how a client tells a build or
+        configuration with no schedules from one whose schedules simply
+        have not run yet."
+      type: object
+      additionalProperties:
+        $ref: "#/components/schemas/statusSchedulesSchedule"
+
+    # /status/schedules/{scheduleName}
+    statusSchedulesSchedule:
+      description: "Represents one schedule's run counters and the result
+        of its most recently finished run."
+      type: object
+      properties:
+        runs:
+          type: integer
+          format: int64
+          description: "Runs dispatched to a worker so far."
+
+        skipped:
+          type: integer
+          format: int64
+          description: "Runs skipped because the previous one was still
+            running and `overlap` is `\"skip\"`."
+
+        failed:
+          type: integer
+          format: int64
+          description: "Runs that could not start, or that finished with
+            no valid response."
+
+        timed_out:
+          type: integer
+          format: int64
+          description: "Runs that hit the schedule's own `timeout`,
+            counted separately from `failed`."
+
+        running:
+          type: integer
+          description: "1 if a run is in flight right now, 0 otherwise."
+
+        last_status:
+          type: integer
+          description: "The HTTP status of the most recently finished
+            run; 0 before any run has finished."
+
+        last_duration_ms:
+          type: integer
+          format: int64
+          description: "The most recently finished run's duration, in
+            milliseconds."
+
+        last_start:
+          type: integer
+          format: int64
+          description: "Wall-clock start of the most recently dispatched
+            run, in whole seconds since the Epoch; 0 before any run has
+            started."
 
     # /status/connections
     statusConnections:

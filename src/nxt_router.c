@@ -22,6 +22,7 @@
 #include <nxt_app_queue.h>
 #include <nxt_port_queue.h>
 #include <nxt_http_compression.h>
+#include <nxt_router_schedule.h>
 #include <nxt_usdt.h>
 
 #if (NXT_HAVE_OTEL)
@@ -2061,6 +2062,8 @@ nxt_router_conf_apply(nxt_task_t *task, void *obj, void *data)
 
     nxt_router_engines_post(router, tmcf);
 
+    nxt_router_schedules_apply(task, tmcf);
+
     nxt_queue_add(&router->sockets, &updating_sockets);
     nxt_queue_add(&router->sockets, &creating_sockets);
 
@@ -3078,7 +3081,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
         }
     }
 
-    ret = nxt_http_routes_resolve(task, tmcf);
+    ret = nxt_router_conf_resolve(task, tmcf, root);
     if (nxt_slow_path(ret != NXT_OK)) {
         goto fail;
     }
@@ -5289,6 +5292,28 @@ nxt_router_conf_release(nxt_task_t *task, nxt_socket_conf_joint_t *joint)
         nxt_mp_thread_adopt(rtcf->mem_pool);
 
         nxt_mp_destroy(rtcf->mem_pool);
+    }
+}
+
+
+/*
+ * Release a joint from its own engine, and let a worker engine that is
+ * quitting exit once no joint holds it, as a connection's release does in
+ * nxt_router_listen_event_release().  For the internal requests of
+ * src/nxt_router_schedule.c.  Does not return if the engine exits.
+ */
+
+void
+nxt_router_joint_release(nxt_task_t *task, nxt_socket_conf_joint_t *joint)
+{
+    nxt_event_engine_t  *engine;
+
+    engine = task->thread->engine;
+
+    nxt_router_conf_release(task, joint);
+
+    if (engine->shutdown && nxt_queue_is_empty(&engine->joints)) {
+        nxt_router_worker_thread_exit(task);
     }
 }
 
@@ -7886,17 +7911,28 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 static void
 nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
 {
-    nxt_timer_t              *timer;
-    nxt_msg_info_t           *msg_info;
-    nxt_http_request_t       *r;
-    nxt_request_rpc_data_t   *req_rpc_data;
-
-    timer = obj;
+    nxt_http_request_t  *r;
 
     nxt_debug(task, "router app timeout");
 
-    r = nxt_timer_data(timer, nxt_http_request_t, timer);
-    req_rpc_data = r->timer_data;
+    r = nxt_timer_data(obj, nxt_http_request_t, timer);
+
+    (void) nxt_router_request_expire(task, r, r->timer_data);
+}
+
+
+/*
+ * The request deadline, shared by "limits": {"timeout"} above and a
+ * schedule's own "timeout" (src/nxt_router_schedule.c).  Returns 0 when the
+ * request was left alone because a worker claimed it and has not
+ * acknowledged it yet; the caller decides when to look again.
+ */
+
+nxt_bool_t
+nxt_router_request_expire(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_msg_info_t  *msg_info;
 
     msg_info = &req_rpc_data->msg_info;
 
@@ -7934,7 +7970,7 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
         nxt_debug(task, "stream #%uD: claimed, waiting for the ack",
                   req_rpc_data->stream);
 
-        return;
+        return 0;
     }
 
     /*
@@ -7969,6 +8005,8 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
     nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
 
     nxt_request_rpc_data_unlink(task, req_rpc_data);
+
+    return 1;
 }
 
 

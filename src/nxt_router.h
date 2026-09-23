@@ -25,6 +25,7 @@ typedef struct nxt_upstreams_s                 nxt_upstreams_t;
 typedef struct nxt_router_access_log_s         nxt_router_access_log_t;
 typedef struct nxt_router_access_log_format_s  nxt_router_access_log_format_t;
 typedef struct nxt_http_comp_conf_s            nxt_http_comp_conf_t;
+typedef struct nxt_router_schedules_s          nxt_router_schedules_t;
 
 
 #define NXT_HTTP_ACTION_ERROR  ((nxt_http_action_t *) -1)
@@ -75,6 +76,9 @@ typedef struct {
      * cannot leave a pointer into a freed pool behind (#167).
      */
     nxt_http_comp_conf_t            *compression;
+
+    /* "schedules", or NULL; see src/nxt_router_schedule.h. */
+    nxt_router_schedules_t          *schedules;
 } nxt_router_conf_t;
 
 

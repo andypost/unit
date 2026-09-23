@@ -1,6 +1,6 @@
 #!/usr/bin/env bpftrace
 /*
- * Copyright (C) NGINX, Inc.
+ * Copyright (C) FreeUnit contributors.
  *
  * Port send -> recv round-trip latency histogram.
  *
@@ -27,26 +27,29 @@ BEGIN
 usdt:/usr/sbin/unitd:freeunit:port__send
 {
     /*
-     * arg0 is nxt_pid at the send call site (src/nxt_port_socket.c);
-     * keyed the same way the N3 plan sketch did, one in-flight send per
-     * pid at a time on that pid's port-write path.
+     * Neither probe's own args carry the firing process's pid (see
+     * docs/observability/usdt.md -- every USDT consumer already exposes
+     * it as a builtin, so the probes don't pass it), so key on
+     * bpftrace's own `pid` builtin instead. port__send's args are
+     * (stream, type); not used by this coarse histogram.
      */
-    @start[arg0] = nsecs;
+    @start[pid] = nsecs;
 }
 
 /*
- * Coarse by design: nxt_pid is constant for one process, so with a
- * single router process this tracks time-to-next-recv rather than a
- * true per-message match. Good enough for a rough distribution; add a
- * stream/cookie key to port__send/port__recv if per-message pairing is
- * needed later.
+ * Coarse by design: one in-flight send per pid at a time on that pid's
+ * port-write path, so with a single router process this tracks
+ * time-to-next-recv rather than a true per-message match. Good enough
+ * for a rough distribution; add a stream/cookie key to port__send if
+ * per-message pairing is needed later (port__recv's own arg is the
+ * peer port's pid, not a message id, so it can't provide that key).
  */
 
 usdt:/usr/sbin/unitd:freeunit:port__recv
-/@start[arg0]/
+/@start[pid]/
 {
-    @port_rtt_ns = hist(nsecs - @start[arg0]);
-    delete(@start[arg0]);
+    @port_rtt_ns = hist(nsecs - @start[pid]);
+    delete(@start[pid]);
 }
 
 END

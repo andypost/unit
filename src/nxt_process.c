@@ -667,7 +667,7 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
 
     nxt_debug(task, "fork(%s): %PI", process->name, pid);
 
-    NXT_USDT(process__spawn, nxt_pid, pid);
+    NXT_USDT(process__spawn, pid);
 
 #if (NXT_HAVE_LINUX_NS)
     if (use_pidns) {

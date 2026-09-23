@@ -283,7 +283,7 @@ nxt_http_request_create(nxt_task_t *task)
 
     task->thread->engine->requests_cnt++;
 
-    NXT_USDT(request__start, nxt_pid, (uintptr_t) r);
+    NXT_USDT(request__start, (uintptr_t) r);
 
     r->tstr_cache.var.pool = mp;
 
@@ -1066,7 +1066,7 @@ nxt_http_request_done(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "http request done");
 
-    NXT_USDT(request__done, nxt_pid, (uintptr_t) r, (nxt_int_t) r->status);
+    NXT_USDT(request__done, (uintptr_t) r, (nxt_int_t) r->status);
 
     nxt_http_request_close_handler(task, r, r->proto.any);
 }

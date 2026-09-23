@@ -1,5 +1,5 @@
 /*
- * Copyright (C) F5, Inc.
+ * Copyright (C) FreeUnit contributors.
  */
 
 #ifndef _NXT_USDT_H_INCLUDED_
@@ -22,10 +22,20 @@
  * Usage, one line per call site so probe insertions stay a trivial diff
  * against unrelated changes to the same function:
  *
- *     NXT_USDT(port__send, pid, size);
+ *     NXT_USDT(port__send, stream, type);
  *
  * The probe name uses "__" the way the DTrace/SDT convention renders it as
  * "-" in the provider:probe form (e.g. "port__send" -> "port-send").
+ *
+ * Arguments must stay cheap: a plain local, at most one pointer
+ * dereference (e.g. `port->pid`), never a function call. There is no
+ * semaphore guard, so every argument expression is evaluated at the call
+ * site whenever the build has NXT_HAVE_USDT, whether or not a tracer is
+ * attached -- an expensive argument costs on every call, not just while
+ * traced. Never pass the firing process's own pid: every USDT consumer
+ * (bpftrace, SystemTap, dtrace) already exposes it as a builtin (`pid` in
+ * bpftrace/dtrace, `%pid`/tapset in SystemTap), so it would be redundant
+ * as well as an extra getpid() call at every site under --usdt.
  */
 
 #if (NXT_HAVE_USDT)

@@ -315,7 +315,7 @@ nxt_port_incoming_port_mmap(nxt_task_t *task, nxt_process_t *process,
         return NULL;
     }
 
-    NXT_USDT(mmap__chunk__alloc, nxt_pid, process->pid, PORT_MMAP_SIZE);
+    NXT_USDT(mmap__chunk__alloc, process->pid, PORT_MMAP_SIZE);
 
     hdr = mem;
 

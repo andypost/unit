@@ -65,7 +65,7 @@ inserted at (immediately before/after the marked statement).
 
 | # | Probe | File:line | Notes |
 |---|-------|-----------|-------|
-| 1 | `port__send` | `src/nxt_port_socket.c:264` (`nxt_port_socket_write2`, entry) | Args: port pid, message type, size. Covers both the direct write and the enqueue-for-later path inside the same call. |
+| 1 | `port__send` | `src/nxt_port_socket.c:264` (`nxt_port_socket_write2`, entry) | Args: message type, size. (Not the firing process's pid -- every USDT consumer already exposes that as a builtin.) Covers both the direct write and the enqueue-for-later path inside the same call. |
 | 2 | `port__recv` | `src/nxt_port_socket.c:1428` (`nxt_port_read_handler`, entry) | Fires once per readv() cycle; pairs with #1 for router↔worker latency histograms. |
 | 3 | `mmap__chunk__alloc` | `src/nxt_port_memory.c:308` (`nxt_mem_mmap()` call in `nxt_port_incoming_port_mmap`) | New shared-memory segment mapped for a port; rare (per-port, not per-request) but marks SHM growth. |
 | 4 | `mmap__chunk__get` | `src/nxt_router.c:7646` (`nxt_port_mmap_get_buf()` call in `nxt_router_prepare_msg`) | The actual per-request chunk handout; this is the hot one for chunk-reuse pressure, not #3. |

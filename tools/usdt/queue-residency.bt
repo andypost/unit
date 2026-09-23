@@ -1,6 +1,6 @@
 #!/usr/bin/env bpftrace
 /*
- * Copyright (C) NGINX, Inc.
+ * Copyright (C) FreeUnit contributors.
  *
  * App-queue (nxt_app_queue_t, src/nxt_app_queue.h) slot residency: time
  * between queue__enqueue (router side, nxt_app_queue_send()) and
@@ -29,16 +29,17 @@ BEGIN
 
 usdt:/usr/sbin/unitd:freeunit:queue__enqueue
 {
-    /* arg1 is the slot index (the "cookie"), arg2 the tracking id. */
-    @qstart[arg1] = nsecs;
+    /* arg0 is the slot index (the "cookie"), arg1 the tracking id. */
+    @qstart[arg0] = nsecs;
     @depth++;
 }
 
 usdt:*:freeunit:queue__dequeue
-/@qstart[arg1]/
+/@qstart[arg0]/
 {
-    @queue_residency_ns = hist(nsecs - @qstart[arg1]);
-    delete(@qstart[arg1]);
+    /* arg0 is the slot index -- queue__dequeue takes no other argument. */
+    @queue_residency_ns = hist(nsecs - @qstart[arg0]);
+    delete(@qstart[arg0]);
     @depth--;
 }
 

@@ -7649,7 +7649,7 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     if (nxt_slow_path(out == NULL)) {
         return NULL;
     }
-    NXT_USDT(mmap__chunk__get, nxt_pid, req_size + content_length);
+    NXT_USDT(mmap__chunk__get, req_size + content_length);
 
     req = (nxt_unit_request_t *) out->mem.free;
     out->mem.free += req_size;

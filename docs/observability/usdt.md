@@ -40,7 +40,7 @@ Per the SDT contract, a probe compiles to one `nop` instruction (plus a
 the `nop` -- in a default build. Each call site is one line, e.g.:
 
 ```c
-NXT_USDT(port__send, nxt_pid, stream, type);
+NXT_USDT(port__send, stream, type);
 ```
 
 so a probe insertion is a trivial one-line diff against unrelated changes
@@ -52,24 +52,39 @@ directly with the underlying `sizeof`/`typeof` machinery in `sys/sdt.h`;
 cast it to a plain integer type first, as `request__done` does with
 `(nxt_int_t) r->status`.
 
-`nxt_pid` (the process-global pid, `nxt_main.h`) is only linked into
-`unitd`; app-side code that is also compiled into `libunit` (the code
-behind `nxt_app_queue.h`, used by both the router and every application
-process) uses `getpid()` at the probe call site instead.
+There is no semaphore guard (the cheap, "no expensive argument" contract
+this macro is scoped to does not need one): every argument expression is
+evaluated at the call site whenever the build has `NXT_HAVE_USDT`,
+whether or not a tracer is attached. Arguments must therefore stay a
+plain local or at most one pointer dereference (`port->pid`,
+`process->pid`), never a function call. In particular, never pass the
+firing process's own pid: `bpftrace`, SystemTap and `dtrace` all expose
+it as a builtin already (`pid` in bpftrace/dtrace, the SystemTap
+tapset), so passing it here would be both redundant and -- for the two
+probes in `src/nxt_app_queue.h`, which also compiles into `libunit` and
+so cannot use the router-only `nxt_pid` global -- an extra `getpid()`
+syscall on every call under `--usdt` (glibc no longer caches it). An
+earlier draft of these probes did exactly that; removed.
 
 ## Probe list
 
 | Provider:probe | File:line (call site) | Args |
 |---|---|---|
-| `freeunit:port-send` | `src/nxt_port_socket.c:301` (`nxt_port_socket_write2`) | `nxt_pid, stream, type` |
-| `freeunit:port-recv` | `src/nxt_port_socket.c:1443` (`nxt_port_read_handler`, entry) | `nxt_pid, port->pid` |
-| `freeunit:mmap-chunk-alloc` | `src/nxt_port_memory.c:318` (`nxt_port_incoming_port_mmap`, after `nxt_mem_mmap()`) | `nxt_pid, process->pid, PORT_MMAP_SIZE` |
-| `freeunit:mmap-chunk-get` | `src/nxt_router.c:7652` (`nxt_router_prepare_msg`, after `nxt_port_mmap_get_buf()`) | `nxt_pid, req_size + content_length` |
-| `freeunit:queue-enqueue` | `src/nxt_app_queue.h:81` (`nxt_app_queue_send`, after `nxt_app_nncq_enqueue()`) | `getpid(), slot index, tracking id` |
-| `freeunit:queue-dequeue` | `src/nxt_app_queue.h:127` (`nxt_app_queue_recv`, after the slot is claimed) | `getpid(), slot index` |
-| `freeunit:process-spawn` | `src/nxt_process.c:670` (`nxt_process_create`, parent branch, after `fork()`) | `nxt_pid, child pid` |
-| `freeunit:request-start` | `src/nxt_http_request.c:286` (`nxt_http_request_create`) | `nxt_pid, (uintptr_t) r` |
-| `freeunit:request-done` | `src/nxt_http_request.c:1069` (`nxt_http_request_done`) | `nxt_pid, (uintptr_t) r, (nxt_int_t) r->status` |
+| `freeunit:port-send` | `src/nxt_port_socket.c:301` (`nxt_port_socket_write2`) | `stream, type` |
+| `freeunit:port-recv` | `src/nxt_port_socket.c:1443` (`nxt_port_read_handler`, entry) | `port->pid` |
+| `freeunit:mmap-chunk-alloc` | `src/nxt_port_memory.c:318` (`nxt_port_incoming_port_mmap`, after `nxt_mem_mmap()`) | `process->pid, PORT_MMAP_SIZE` |
+| `freeunit:mmap-chunk-get` | `src/nxt_router.c:7652` (`nxt_router_prepare_msg`, after `nxt_port_mmap_get_buf()`) | `req_size + content_length` |
+| `freeunit:queue-enqueue` | `src/nxt_app_queue.h:81` (`nxt_app_queue_send`, after `nxt_app_nncq_enqueue()`) | `slot index, tracking id` |
+| `freeunit:queue-dequeue` | `src/nxt_app_queue.h:127` (`nxt_app_queue_recv`, after the slot is claimed) | `slot index` |
+| `freeunit:process-spawn` | `src/nxt_process.c:670` (`nxt_process_create`, parent branch, after `fork()`) | `child pid` |
+| `freeunit:request-start` | `src/nxt_http_request.c:286` (`nxt_http_request_create`) | `(uintptr_t) r` |
+| `freeunit:request-done` | `src/nxt_http_request.c:1069` (`nxt_http_request_done`) | `(uintptr_t) r, (nxt_int_t) r->status` |
+
+None of these pass the firing process's own pid -- every USDT consumer
+(bpftrace/dtrace's `pid` builtin, the SystemTap tapset) already exposes
+it without an argument, and adding it here would cost a `getpid()`
+syscall per call under `--usdt` for the two `nxt_app_queue.h` probes
+(see above).
 
 `(uintptr_t) r` (the `nxt_http_request_t` pointer) is the per-request id
 that pairs `request-start` with `request-done`; it is unique for the

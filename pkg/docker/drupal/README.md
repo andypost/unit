@@ -183,8 +183,66 @@ Other requests keep being served by the remaining workers.
 
 ## Cron
 
-Until FreeUnit's `schedules` lands (see `docs/adr/0004-schedules.md`), run
-cron with `docker exec -u www-data drupal-dev drush cron` (recommended-project;
-`docker exec` bypasses the entrypoint, so pick the user yourself) or enable
-`automated_cron`. `automated_cron` works on FreeUnit because
-`fastcgi_finish_request()` is supported.
+Set `DRUPAL_CRON_KEY` to have FreeUnit run Drupal's cron itself, on a
+schedule, with no client, sidecar process or `automated_cron` involved (see
+`docs/adr/0004-schedules.md` and `docs/schedules.md`):
+
+```sh
+docker run -d --name drupal-dev -p 8080:80 \
+    -e DRUPAL_AUTO_INSTALL=1 \
+    -e DRUPAL_CRON_KEY=$(openssl rand -hex 16) \
+    -v "$PWD:/var/www/drupal/web" \
+    "$IMAGE"
+```
+
+`drupal-dev.sh` then renders a `schedules.drupal-cron` object into the
+FreeUnit configuration:
+
+```json
+"schedules": {
+    "drupal-cron": {
+        "pass": "applications/drupal/index",
+        "uri": "/cron/<DRUPAL_CRON_KEY>",
+        "interval": 300,
+        "jitter": 15,
+        "timeout": 300,
+        "overlap": "skip"
+    }
+}
+```
+
+Leave `DRUPAL_CRON_KEY` unset (the default) and no `schedules` member is
+added at all — the configuration is exactly what it was before. Drupal's own
+cron key is site-specific: read it back with `drush state:get
+system.cron_key`, or set `DRUPAL_CRON_KEY` to the value that key already
+holds instead of a fresh one, so `/cron/<key>` matches what Drupal expects.
+
+| variable | default | |
+|---|---|---|
+| `DRUPAL_CRON_KEY` | unset | Drupal's cron key; setting it adds the schedule |
+| `DRUPAL_CRON_INTERVAL` | `300` | seconds between runs |
+| `DRUPAL_CRON_JITTER` | `15` | up to this many extra seconds, randomized |
+| `DRUPAL_CRON_HOST` | unset | `Host` header the run sends; see below |
+
+**Set `DRUPAL_CRON_HOST`.** Drupal's `trusted_host_patterns` rejects a
+`Host` it does not expect. With no `DRUPAL_CRON_HOST`, the run has no `Host`
+header and falls back to `server_name` `localhost`, which the docroot's
+default `settings.php` in this dev kit trusts; a checkout with a narrower
+`trusted_host_patterns` needs `DRUPAL_CRON_HOST` set to a host it trusts, or
+the cron run gets a `400`.
+
+**The schedule `timeout` does not stop PHP.** It is capped at
+`UNIT_APP_TIMEOUT`/`UNIT_APP_TIMEOUT_XDEBUG` (whichever the entrypoint used
+for `limits.timeout`), but a cron run that runs past its own `timeout` keeps
+executing in an abandoned worker, which still counts against
+`applications.drupal.processes.max` (`8` here) until it finishes. See
+`docs/schedules.md` for the rest of the caveats: the access log gets the
+full `/cron/<key>` URI, and if Drupal's own `automated_cron` is also left on
+(it should not be, once a schedule replaces it), a request that finishes
+early with `fastcgi_finish_request()` defeats `overlap: "skip"`'s guarantee.
+
+**Fallback**, if the schedule needs to be ruled out or bypassed live: run
+cron directly with `docker exec -u www-data drupal-dev drush cron`
+(recommended-project; `docker exec` bypasses the entrypoint, so pick the
+user yourself), or a curl loop against the control socket or the listener
+(see the project root `README.md`, "Schedules plan B").

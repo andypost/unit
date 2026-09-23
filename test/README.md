@@ -115,7 +115,12 @@ make -j$(nproc)
 sudo ./configure python --config=python3-config
 sudo make python3
 
-./configure php
+# If no PHP embed SAPI is installed system-wide (check with
+# `ldconfig -p | grep -i php` and `ls /usr/local/lib/php-embed`),
+# see test/setup-php-embed.sh for how one was staged for this container,
+# then:
+./configure php --config=/path/to/php-config8.3 \
+    --lib-path=/usr/local/lib/php-embed --module=php
 make php
 
 ./configure ruby

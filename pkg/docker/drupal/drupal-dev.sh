@@ -25,6 +25,14 @@ DRUPAL_ADMIN_PASS=${DRUPAL_ADMIN_PASS:-admin}
 DRUPAL_SITE_NAME=${DRUPAL_SITE_NAME:-FreeUnit Drupal}
 DRUPAL_DB_URL=${DRUPAL_DB_URL:-sqlite://sites/default/files/.ht.sqlite}
 
+# Cron via FreeUnit's "schedules" (docs/adr/0004-schedules.md), in place of
+# "drush cron" or "automated_cron". Unset (the default): no schedule is
+# added, and the "Cron" section of README.md's fallback still applies.
+DRUPAL_CRON_KEY=${DRUPAL_CRON_KEY:-}
+DRUPAL_CRON_INTERVAL=${DRUPAL_CRON_INTERVAL:-300}
+DRUPAL_CRON_JITTER=${DRUPAL_CRON_JITTER:-15}
+DRUPAL_CRON_HOST=${DRUPAL_CRON_HOST:-}
+
 WEB_USER=${WEB_USER:-www-data}
 
 UNITD=${UNITD:-unitd}
@@ -146,18 +154,62 @@ unit_conf()
 
     # shellcheck disable=SC2016  # PHP source, expanded by PHP, not the shell.
     TEMPLATE="$UNIT_CONF_TEMPLATE" OUT="$UNIT_CONF" TIMEOUT="$timeout" \
-    DOCROOT="${DRUPAL_DOCROOT%/}" WEB_USER="$WEB_USER" php -n -r '
+    DOCROOT="${DRUPAL_DOCROOT%/}" WEB_USER="$WEB_USER" \
+    CRON_KEY="$DRUPAL_CRON_KEY" CRON_INTERVAL="$DRUPAL_CRON_INTERVAL" \
+    CRON_JITTER="$DRUPAL_CRON_JITTER" CRON_HOST="$DRUPAL_CRON_HOST" \
+    php -n -r '
         $raw = file_get_contents(getenv("TEMPLATE"));
         $raw = str_replace("/var/www/drupal/web", getenv("DOCROOT"), $raw);
         $conf = json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
         $conf["applications"]["drupal"]["limits"]["timeout"] = (int) getenv("TIMEOUT");
         $conf["applications"]["drupal"]["user"] = getenv("WEB_USER") ?: "www-data";
         $conf["applications"]["drupal"]["group"] = getenv("WEB_USER") ?: "www-data";
+
+        // FreeUnit "schedules": Drupal cron, in place of "drush cron" or
+        // "automated_cron" (docs/adr/0004-schedules.md, docs/schedules.md).
+        // The cron key is per site, so the schedule is only added when
+        // DRUPAL_CRON_KEY is set; leaving it unset keeps the config exactly
+        // as before, with no "schedules" member at all.
+        $cronKey = getenv("CRON_KEY");
+
+        if ($cronKey !== false && $cronKey !== "") {
+            $timeout = (int) getenv("TIMEOUT");
+            $scheduleTimeout = min($timeout, (int) getenv("CRON_INTERVAL"));
+            $host = getenv("CRON_HOST");
+
+            $schedule = [
+                "pass" => "applications/drupal/index",
+                "uri" => "/cron/" . $cronKey,
+                "interval" => (int) getenv("CRON_INTERVAL"),
+                "jitter" => (int) getenv("CRON_JITTER"),
+                // At or below limits.timeout (ADR 0004 R5/§7.2): a timeout
+                // does not stop the worker, so it must not outlive the
+                // application deadline that would eventually reclaim it.
+                "timeout" => $scheduleTimeout > 0 ? $scheduleTimeout : $timeout,
+                "overlap" => "skip",
+            ];
+
+            // trusted_host_patterns rejects a Host it does not expect
+            // (ADR 0004 R4); with no DRUPAL_CRON_HOST, the run falls back to
+            // "localhost", which the default drupal-dev settings.php trusts.
+            if ($host !== false && $host !== "") {
+                $schedule["headers"] = ["Host" => $host];
+            }
+
+            $conf["schedules"]["drupal-cron"] = $schedule;
+        }
+
         file_put_contents(getenv("OUT"), json_encode($conf,
             JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
     '
 
-    log "FreeUnit config rendered to $UNIT_CONF (limits.timeout=${timeout}s)"
+    if [ -n "$DRUPAL_CRON_KEY" ]; then
+        log "FreeUnit config rendered to $UNIT_CONF (limits.timeout=${timeout}s," \
+            "schedules.drupal-cron every ${DRUPAL_CRON_INTERVAL}s)"
+    else
+        log "FreeUnit config rendered to $UNIT_CONF (limits.timeout=${timeout}s," \
+            "no cron schedule: set DRUPAL_CRON_KEY to add one)"
+    fi
 }
 
 

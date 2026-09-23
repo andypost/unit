@@ -776,3 +776,94 @@ def test_schedules_run_lifecycle():
             live.discard(m.group(1))
 
     assert not live, f'configurations never destroyed: {live}'
+
+
+# /status "schedules" (docs/observability/status-extensions.md).
+
+
+def status_schedules():
+    return client.conf_get('/status/schedules')
+
+
+def wait_for_runs(name, n, timeout):
+    end = time.monotonic() + timeout
+
+    while time.monotonic() < end:
+        scheds = status_schedules()
+
+        if name in scheds and scheds[name]['runs'] >= n:
+            return scheds[name]
+
+        time.sleep(0.1)
+
+    pytest.fail(
+        f'schedule "{name}" did not reach {n} runs in status: '
+        f'{status_schedules()}'
+    )
+
+
+def test_schedules_status_absent():
+    # No "schedules" configured: the key is left out entirely, not emptied.
+    assert 'success' in client.conf(run_conf({}))
+    assert 'schedules' not in client.conf_get('/status')
+
+
+def test_schedules_status_counters():
+    put_run(run_schedule(uri="/status-counters"))
+
+    wait_for_starts(2, 10)
+
+    begin = time.time()
+    sched = wait_for_runs('cron', 2, 5)
+
+    assert sched['skipped'] == 0
+    assert sched['failed'] == 0
+    assert sched['timed_out'] == 0
+    assert sched['running'] in (0, 1)
+    assert sched['last_status'] == 200
+    assert sched['last_duration_ms'] >= 0
+    # last_start is wall-clock seconds since the Epoch, close to "now".
+    assert abs(sched['last_start'] - begin) < 10, sched
+
+
+def test_schedules_status_skipped():
+    put_run(run_schedule(uri="/?sleep=2.5", overlap="skip", timeout=10))
+
+    wait_for_starts(2, 10)
+    time.sleep(1)
+
+    sched = status_schedules()['cron']
+    assert sched['skipped'] >= 2, sched
+    assert sched['runs'] >= 2, sched
+
+
+def test_schedules_status_timeout():
+    put_run(run_schedule(uri="/?sleep=3", interval=2, timeout=1))
+
+    def timed_out_reached():
+        return status_schedules().get('cron', {}).get('timed_out', 0) >= 1
+
+    end = time.monotonic() + 10
+
+    while time.monotonic() < end and not timed_out_reached():
+        time.sleep(0.1)
+
+    sched = status_schedules()['cron']
+    assert sched['timed_out'] >= 1, sched
+    assert sched['failed'] == 0, sched
+
+
+def test_schedules_status_several():
+    put_run(
+        {
+            "a": {"pass": "applications/schedule", "uri": "/a", "interval": 1},
+            "b": {"pass": "applications/schedule", "uri": "/b", "interval": 1},
+        }
+    )
+
+    wait_for_starts(4, 10)
+
+    scheds = status_schedules()
+    assert set(scheds.keys()) >= {'a', 'b'}, scheds
+    assert scheds['a']['runs'] >= 1
+    assert scheds['b']['runs'] >= 1

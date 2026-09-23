@@ -54,6 +54,14 @@ typedef struct {
     uint32_t                 timed_out;
     nxt_msec_t               last_duration;
     nxt_http_status_t        last_status;
+
+    /*
+     * Wall-clock start of the most recently dispatched run, seconds since
+     * the Epoch; zero until the first run starts.  /status only (section
+     * "Implementation notes" in docs/observability/status-extensions.md):
+     * everything else here is monotonic-clock or counter state.
+     */
+    nxt_time_t               last_start;
 } nxt_router_schedule_state_t;
 
 
@@ -924,6 +932,7 @@ static void
 nxt_router_schedule_start(nxt_task_t *task, nxt_router_schedule_state_t *state)
 {
     size_t                     n;
+    nxt_realtime_t             now;
     nxt_event_engine_t         *engine;
     nxt_router_schedule_t      *sched;
     nxt_router_schedules_t     *sc;
@@ -963,6 +972,9 @@ nxt_router_schedule_start(nxt_task_t *task, nxt_router_schedule_state_t *state)
     run->uri_cut = (run->uri_length < sched->uri.length);
 
     state->running = 1;
+
+    nxt_realtime(&now);
+    state->last_start = now.sec;
 
     nxt_debug(task, "schedule \"%V\": run %uD posted to engine %p",
               &state->name, run->seq, engine);
@@ -1431,4 +1443,67 @@ nxt_router_schedule_request_build(nxt_mp_t *mp, nxt_router_schedule_t *sched,
     sched->request.length = size;
 
     return NXT_OK;
+}
+
+
+/*
+ * /status support (docs/observability/status-extensions.md).  Both walk
+ * nxt_router_schedule_states exactly as nxt_router_schedule_state_find()
+ * does: main engine only, no lock, because the states and this walk are
+ * both touched only there.  A state whose "conf" is already NULL (removed,
+ * but its last run has not finished yet) is still included -- it is part of
+ * the router's live state until nxt_router_schedule_state_free() drops it,
+ * and a run's counters should not vanish from /status mid-flight.
+ */
+
+nxt_uint_t
+nxt_router_schedules_status_count(void)
+{
+    nxt_uint_t        n;
+    nxt_queue_link_t  *lnk;
+
+    if (nxt_router_schedule_states.head.next == NULL) {
+        return 0;
+    }
+
+    n = 0;
+
+    for (lnk = nxt_queue_first(&nxt_router_schedule_states);
+         lnk != nxt_queue_tail(&nxt_router_schedule_states);
+         lnk = nxt_queue_next(lnk))
+    {
+        n++;
+    }
+
+    return n;
+}
+
+
+void
+nxt_router_schedules_status_each(nxt_router_schedule_status_cb_t cb,
+    void *ctx)
+{
+    nxt_status_schedule_t        item;
+    nxt_router_schedule_state_t  *state;
+
+    if (nxt_router_schedule_states.head.next == NULL) {
+        return;
+    }
+
+    nxt_queue_each(state, &nxt_router_schedule_states,
+                   nxt_router_schedule_state_t, link)
+    {
+        item.name = state->name;
+        item.runs = state->runs;
+        item.skipped = state->skipped;
+        item.failed = state->failed;
+        item.timed_out = state->timed_out;
+        item.running = state->running;
+        item.last_status = state->last_status;
+        item.last_duration = state->last_duration;
+        item.last_start = state->last_start;
+
+        cb(&item, ctx);
+
+    } nxt_queue_loop;
 }

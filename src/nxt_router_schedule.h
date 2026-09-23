@@ -9,6 +9,7 @@
 
 #include <nxt_router.h>
 #include <nxt_conf.h>
+#include <nxt_status.h>
 
 
 /*
@@ -112,6 +113,21 @@ nxt_msec_t nxt_router_schedule_delay(nxt_msec_t interval, nxt_msec_t jitter,
 size_t nxt_router_schedule_uri_public(const nxt_str_t *uri);
 nxt_int_t nxt_router_schedule_request_build(nxt_mp_t *mp,
     nxt_router_schedule_t *sched, nxt_conf_value_t *headers);
+
+/*
+ * /status support (docs/observability/status-extensions.md).  Main engine
+ * only, same as nxt_router_schedule_states itself: no lock is needed because
+ * both the counters and this walk happen on the same engine as
+ * nxt_router_status_handler() in src/nxt_router.c.  "item" is only valid for
+ * the duration of the callback: it points at live state, not a copy, so
+ * item->name.start must be read (or copied out) before returning.
+ */
+typedef void (*nxt_router_schedule_status_cb_t)(nxt_status_schedule_t *item,
+    void *ctx);
+
+nxt_uint_t nxt_router_schedules_status_count(void);
+void nxt_router_schedules_status_each(nxt_router_schedule_status_cb_t cb,
+    void *ctx);
 
 
 #endif /* _NXT_ROUTER_SCHEDULE_H_INCLUDED_ */

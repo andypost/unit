@@ -1,115 +1,170 @@
-# `/status` additions (N4): design note
+# `/status` additions (N4)
 
-Status: design only, not implemented. Written against
-`src/nxt_status.c` (the `/status` JSON builder, `nxt_status_get()`) as of
-this branch. No source changes in this note -- see "Implementation notes"
-for the follow-up shape.
+Status: **`schedules` shipped** on this branch (`stream/obs-d3`).
+**`queue` and `shared_memory` deferred** -- see "Deferred: per-app queue
+depth and SHM fill" below for why, and what would need to change to pick
+them up later.
 
-## Why these three
+This note was originally a design-only document (see git history for that
+version); it is now updated to describe what actually landed, against
+`src/nxt_status.c` (the `/status` JSON builder, `nxt_status_get()`),
+`src/nxt_router.c`'s `nxt_router_status_handler()` (the router-side
+collector), and `src/nxt_router_schedule.c` (the schedules feature itself,
+ADR 0004) as of this branch.
 
-`/status` today reports per-language modules, per-listener connection
+## Why "schedules"
+
+`/status` already reports per-language modules, per-listener connection
 counters, per-app request/process counters, and (when built with
-`--otel`) exported/failed span counts (`src/nxt_status.c:163`, the
-`telemetry` object gated on `report->otel_configured`). It has no
-visibility into three things this stream's USDT probes and Day-1 work
-now make easy to source cheaply:
+`--otel`) exported/failed span counts. It had no visibility into whether
+the "schedules" feature (ADR 0004: periodic internal requests to an
+application) is doing its job -- whether a schedule is actually firing on
+time, how often it is skipped or times out, and what its last run
+answered. Every one of those numbers is already tracked, in
+`nxt_router_schedule_state_t` (`src/nxt_router_schedule.c`): `runs`,
+`skipped`, `failed`, `timed_out`, `running`, `last_status`,
+`last_duration`. `/status` only had to expose them.
 
-Referenced line numbers below (`src/nxt_status.c:54`, `nxt_status_get()`'s
-object-size arithmetic; `:163`, the `telemetry` gate) are current as of
-this branch; re-check them if `nxt_status.c` has moved since.
+## JSON shape (as shipped)
 
-1. **App-queue depth** -- how full the router-to-worker SHM ring
-   (`nxt_app_queue_t`, `src/nxt_app_queue.h`) is, per app. A queue that
-   is chronically near-full is a leading indicator of a worker that
-   cannot keep up, well before requests start timing out.
-2. **SHM (mmap) fill** -- how much of each `PORT_MMAP_DATA_SIZE` segment
-   (`src/nxt_port_memory_int.h`) is actually allocated as chunks, and how
-   many segments exist. This is the "are we about to hit `oosm`"
-   (out-of-shared-memory) signal.
-3. **Schedules counters** -- the DRUPAL-stream "schedules" hook near
-   `nxt_router_conf_create` (owned by another in-flight stream on
-   `nxt_router.c`) is expected to maintain its own counters; this design
-   reserves their shape in `/status` without depending on that stream's
-   internals landing first.
-
-## JSON shape
-
-Extending the existing per-application object
-(`src/nxt_status.c`'s `apps_str` / `app_obj`, currently
-`{processes: {...}, requests: {...}}` per app name) with a new
-`queue` member, and adding a top-level `shared_memory` object:
+A new top-level `schedules` object, sibling to `applications`, keyed by
+schedule name:
 
 ```json
 {
-  "applications": {
-    "my_python_app": {
-      "processes": { "running": 2, "starting": 0, "idle": 1 },
-      "requests": { "active": 3, "total": 41022 },
-      "queue": {
-        "depth": 6,
-        "capacity": 254,
-        "high_water": 40
-      }
-    }
-  },
-  "shared_memory": {
-    "segments": 3,
-    "segment_size": 10486784,
-    "chunk_size": 16384,
-    "chunks_total": 1920,
-    "chunks_free": 512,
-    "oosm_count": 0
-  },
+  "connections": { "accepted": 1067, "active": 13, "idle": 4, "closed": 1050 },
+  "requests": { "total": 1307 },
+  "applications": { "...": "..." },
   "schedules": {
-    "total": 12,
-    "due": 1,
-    "overdue": 0,
-    "last_run_ms_ago": 4210
+    "cron": {
+      "runs": 42,
+      "skipped": 1,
+      "failed": 0,
+      "timed_out": 0,
+      "running": 0,
+      "last_status": 200,
+      "last_duration_ms": 8,
+      "last_start": 1732300042
+    }
   }
 }
 ```
 
-`queue` and `schedules` are per-app-family objects that follow the same
-"omit rather than zero" convention `telemetry` already uses
-(`src/nxt_status.c:54`, the `4 + (report->otel_configured != 0)` sizing):
-a build/config where the feature does not
-apply (no app queue configured, no schedules configured) leaves the key
-out entirely, so existing consumers that pattern-match `/status` see no
-new required field and no ambiguous zero.
+Field meanings:
 
-## Where each value comes from
+| Field | Meaning |
+|---|---|
+| `runs` | Runs dispatched to a worker so far (a run that never got dispatched, e.g. no worker engine, does not increment this; it increments `failed` instead). |
+| `skipped` | Runs skipped because the previous one was still running and `overlap` is `"skip"`. |
+| `failed` | Runs that could not start, or that finished with no valid response (status 0, >= 400, or a discarded/oversized response). |
+| `timed_out` | Runs that hit the schedule's own `timeout` (ADR 0004 section 7.2), distinct from `failed`. |
+| `running` | `1` if a run is in flight right now, `0` otherwise. |
+| `last_status` | The HTTP status of the most recently *finished* run; `0` before any run has finished. |
+| `last_duration_ms` | The most recently finished run's duration, in milliseconds. |
+| `last_start` | Wall-clock start of the most recently *dispatched* run, whole seconds since the Epoch; `0` before any run has started. Lags `running` while that run is still in flight (`last_status`/`last_duration_ms` describe the run *before* it). |
 
-| Field | Source | Notes |
-|---|---|---|
-| `applications.<app>.queue.depth` | `nxt_app_queue_t.queue` head/tail distance, via `nxt_app_nncq_t` (`src/nxt_nncq.h`), read where `nxt_app_queue_send()`/`nxt_app_queue_recv()` already touch it (`src/nxt_app_queue.h:81`, `:127` -- the same two lines carrying `NXT_USDT(queue__enqueue/dequeue, ...)` from this stream) | Cheapest as a running counter maintained alongside the two USDT call sites (increment on enqueue, decrement on dequeue) rather than re-derived from the ring's head/tail on every `/status` request, which would need a lock/atomic read racing live traffic. |
-| `applications.<app>.queue.capacity` | `NXT_APP_QUEUE_SIZE` (`src/nxt_app_queue.h:15`) | Compile-time constant, not per-app; included per-app for convenience so a client does not need a second lookup. |
-| `applications.<app>.queue.high_water` | New running max alongside `depth`, reset semantics TBD (e.g. reset on each `/status` read, like a counter snapshot, or free-running) | Needs a decision in implementation: free-running (never resets) answers "how bad has it ever been", reset-on-read answers "how bad since I last looked". Either is a one-line addition next to the existing depth counter. |
-| `shared_memory.segments` | Count of `nxt_process_t.outgoing`/`incoming` mmap handles (`src/nxt_port_memory_int.h`, `nxt_port_mmap_handler_t`), summed across processes the router tracks | Existing `nxt_port_mmap_get_buf()` call site is already probed (`freeunit:mmap-chunk-get`, `src/nxt_router.c:7652`); segment *creation* is `freeunit:mmap-chunk-alloc` (`src/nxt_port_memory.c:318`) -- a running counter incremented there and decremented on the existing unmap path is the same pattern as the queue depth counter above. |
-| `shared_memory.segment_size` / `chunk_size` | `PORT_MMAP_DATA_SIZE`, `PORT_MMAP_CHUNK_SIZE` (`src/nxt_port_memory_int.h:18-31`) | Compile-time constants (differ under `NXT_MMAP_TINY_CHUNK`); report as-built. |
-| `shared_memory.chunks_total` / `chunks_free` | `nxt_port_mmap_header_t.free_map[]` (`src/nxt_port_memory_int.h:73`), a per-segment bitmap already walked by the chunk allocator | `chunks_free` needs a popcount over `free_map[]` per segment, summed; doable at `/status`-read time (bounded, `MAX_FREE_IDX` words per segment) without needing a new running counter, unlike the queue depth case where the ring's own head/tail is not safely readable cross-process without extra synchronization. |
-| `shared_memory.oosm_count` | `nxt_port_mmap_header_t.oosm` (`nxt_atomic_t`, already flipped on out-of-shared-memory) | Sum (or max) across segments; already an atomic flag, so reading it for `/status` needs no new instrumentation. |
-| `schedules.total` / `due` / `overdue` / `last_run_ms_ago` | The DRUPAL stream's "schedules" hook, expected near `nxt_router_conf_create` in `src/nxt_router.c` | Deliberately not designed further here: that stream owns the counters' actual field names and update points. This section only reserves the `/status` JSON shape (a `schedules` object, sibling to `applications`) so both streams can land independently without a `/status` merge conflict beyond the obvious one-line addition to `nxt_status_get()`. |
+Following the existing `telemetry` precedent (`nxt_status_get()`'s object
+size arithmetic, `4 + (report->otel_configured != 0) + ...`), the whole
+`schedules` object is **omitted rather than emptied** when no schedule is
+configured -- so a build/config with no schedules reports exactly what it
+did before this change, and a client pattern-matching `/status` sees no
+new required key and no ambiguous empty object.
 
-## Implementation notes (not done here)
+A schedule that was just removed from the configuration but whose last
+run has not finished yet is still reported: its name stays a key in
+`schedules` (with `running: 1`, most likely) until that run's result
+comes back, matching how the router itself keeps that state alive.
 
-- `nxt_status_get()`'s object-size arithmetic (`src/nxt_status.c:54`,
-  `4 + (report->otel_configured != 0)`) would grow by up to two more
-  conditional members (`shared_memory` always present if any segment
-  exists; `schedules` present iff the schedules feature is configured),
-  following the existing `telemetry` precedent exactly.
-- The queue depth/high-water counters are new fields on whatever struct
-  already backs `nxt_status_report_t` per app (or a new small struct
-  reachable from it); populated where the USDT probes already sit, so
-  landing this after (or alongside) the USDT probes is naturally a
-  one-line addition per counter at each existing call site, not a new
-  code path.
-- `shared_memory.chunks_free`'s per-segment popcount is read-only and
-  does not need a new lock: `free_map[]` is already read without
-  additional synchronization by the allocator itself (it is designed to
-  tolerate concurrent chunk claims), so `/status` can read the same
-  bitmap the same way.
-- None of this requires `--usdt`: the counters are ordinary router-side
-  state, updated at the same call sites the USDT probes were added to,
-  but independent of whether USDT tracing is compiled in. USDT and
-  `/status` are two different consumers of the same "something happened
-  here" call sites.
+## Where it comes from
+
+- `src/nxt_status.h` gained `nxt_status_schedule_t` (one schedule's
+  counters, mirroring the existing `nxt_status_app_t`) and two new fields
+  on `nxt_status_report_t`: `schedules_count`, and a comment explaining
+  that the `nxt_status_schedule_t` array sits *after* the last
+  `nxt_status_app_t` in `apps[]` -- C allows only one flexible array
+  member per struct, and the whole report is one contiguous buffer copied
+  across the router/controller port, so both the router (writer) and
+  `nxt_status_get()` (reader) compute that second array's address the
+  same way: `nxt_status_report_schedules(report)`, a small inline helper
+  next to the struct.
+- `src/nxt_router_schedule.c`/`.h` gained a `/status`-only accessor,
+  `nxt_router_schedules_status_each()`, that hands each schedule's
+  counters to a callback -- the states queue
+  (`nxt_router_schedule_states`) is private to that file, so this is the
+  only way `nxt_router.c` can read it. No lock: both this walk and the
+  counters themselves are touched only on the main engine, exactly like
+  the existing `nxt_router_schedule_state_find()` walk.
+- `src/nxt_router_schedule.c` also gained one new field,
+  `nxt_router_schedule_state_t.last_start`, set from `nxt_realtime()` at
+  the point a run is actually dispatched (`nxt_router_schedule_start()`,
+  right after `state->running = 1`) -- everything else already existed.
+- `src/nxt_router.c`'s `nxt_router_status_handler()` builds the
+  `schedules` part of the report the same two-pass way it already builds
+  `apps`: one pass to size the buffer (`nxt_router_schedules_status_count()`
+  plus a size-summing callback), one to fill it (a second callback that
+  copies each name into the same reverse-growing name area the app names
+  already use, then writes the offset-relocated `nxt_status_schedule_t`).
+- `src/nxt_status.c`'s `nxt_status_get()` turns that array into the
+  `schedules` JSON object, one member per schedule, using
+  `nxt_conf_set_member_dup` for the (possibly reconfiguration-surviving)
+  name the same way `applications` already does.
+
+None of this touches a struct on `tools/perf/layout-check.sh`'s SHM list;
+`nxt_status_report_t` is a router-to-controller port message, not a
+shared-memory mapping, so it was never checked by that gate, and this
+change does not add it to one either.
+
+## Deferred: per-app queue depth and SHM fill
+
+The original design (see git history) proposed `applications.<app>.queue`
+(depth/capacity/high-water) and a top-level `shared_memory` object. Both
+are **not implemented** on this branch. What was actually feasible turned
+out narrower than the design assumed, and the parts that are feasible
+were judged not worth the risk of touching shared code on a day the CODE
+stream is actively editing `nxt_router_prepare_msg` and the port/app-queue
+sources:
+
+- **App-queue depth is lock-free-readable, but per-*port*, not
+  per-*app*.** `nxt_app_queue_t` (`src/nxt_app_queue.h`) wraps
+  `nxt_app_nncq_t` (`src/nxt_app_nncq.h`), whose `head`/`tail` counters
+  already have public accessors (`nxt_app_nncq_head()`/`_tail()`) and can
+  be read with a plain (non-locking) load -- `tail - head` is a
+  reasonable approximate depth, the same class of read the queue's own
+  enqueue/dequeue paths already do. The problem is reaching a given app's
+  queue(s) at all: an app can have several ports (`nxt_app_t.ports`,
+  `src/nxt_router.h`), and that queue is explicitly protected by
+  `nxt_app_t.mutex` ("Protects ports queue"). Summing depth across an
+  app's ports from the `/status` path would mean taking that mutex from a
+  new call site on the router's status-request path -- exactly the "new
+  locking" this stream was told to avoid, and a lock also taken from
+  worker-engine code the CODE stream is editing today. Reading a single
+  queue's depth is cheap; enumerating which queues belong to which app
+  safely is not, without either that lock or a new lock-free index this
+  stream has no mandate to add mid-stream.
+- **SHM (mmap) fill** (`nxt_port_mmap_header_t.free_map[]` popcount,
+  `oosm` flag) needed no new synchronization by the original design's own
+  reasoning, but reaching it means walking `nxt_process_t`'s mmap handler
+  list, which is exactly the data structure the CODE stream owns today
+  (`nxt_port*.c`). Adding a `/status` read path into it mid-stream risks
+  a merge conflict or a subtle race with in-flight edits to the same
+  structures, for a feature this stream was told to skip rather than risk
+  when in doubt.
+
+Both remain sourceable without a shared-memory layout change and without
+new locking *for the depth read itself* -- the missing piece is safe
+enumeration, not safe reading. A follow-up stream, landing after the CODE
+stream's port/app-queue work and free to add either a lock-free per-app
+running total (updated at the existing enqueue/dequeue call sites, as the
+original design proposed) or to take `nxt_app_t.mutex` deliberately and
+measure the cost, can pick this up; nothing this stream shipped forecloses
+it.
+
+## Dashboard demo JSON shape
+
+There is no dashboard demo JSON fixture in this repository as of this
+branch (`docs/observability/` has this file plus `usdt.md` and
+`usdt-plan.md`, neither of which carries a `/status` JSON shape). If one
+is added later, it should use the field names in this document --
+`schedules.<name>.{runs,skipped,failed,timed_out,running,last_status,
+last_duration_ms,last_start}` -- not the earlier design draft's
+`schedules.{total,due,overdue,last_run_ms_ago}`, which never shipped.

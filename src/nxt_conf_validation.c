@@ -10,6 +10,8 @@
 #include <nxt_cert.h>
 #include <nxt_script.h>
 #include <nxt_router.h>
+#include <nxt_router_schedule.h>
+#include <nxt_checked.h>
 #include <nxt_http.h>
 #include <nxt_sockaddr.h>
 #include <nxt_http_route_addr.h>
@@ -240,6 +242,20 @@ static nxt_int_t nxt_conf_vldt_access_log_format(nxt_conf_validation_t *vldt,
 static nxt_int_t nxt_conf_vldt_access_log_format_field(
     nxt_conf_validation_t *vldt, const nxt_str_t *name,
     nxt_conf_value_t *value);
+static nxt_int_t nxt_conf_vldt_schedule(nxt_conf_validation_t *vldt,
+    nxt_str_t *name, nxt_conf_value_t *value);
+static nxt_int_t nxt_conf_vldt_schedule_pass(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_schedule_uri(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_schedule_seconds(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_schedule_overlap(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_schedule_headers(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_schedule_header(nxt_conf_validation_t *vldt,
+    nxt_str_t *name, nxt_conf_value_t *value);
 
 static nxt_int_t nxt_conf_vldt_isolation(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
@@ -319,6 +335,7 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_app_cgroup_members[];
 static nxt_conf_vldt_object_t  nxt_conf_vldt_app_automount_members[];
 #endif
 static nxt_conf_vldt_object_t  nxt_conf_vldt_access_log_members[];
+static nxt_conf_vldt_object_t  nxt_conf_vldt_schedule_members[];
 
 
 static nxt_conf_vldt_object_t  nxt_conf_vldt_root_members[] = {
@@ -341,6 +358,11 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_root_members[] = {
         .type       = NXT_CONF_VLDT_OBJECT,
         .validator  = nxt_conf_vldt_object_iterator,
         .u.object   = nxt_conf_vldt_app,
+    }, {
+        .name       = nxt_string("schedules"),
+        .type       = NXT_CONF_VLDT_OBJECT,
+        .validator  = nxt_conf_vldt_object_iterator,
+        .u.object   = nxt_conf_vldt_schedule,
     }, {
         .name       = nxt_string("upstreams"),
         .type       = NXT_CONF_VLDT_OBJECT,
@@ -1380,6 +1402,52 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_app_limits_members[] = {
     }, {
         .name       = nxt_string("shm"),
         .type       = NXT_CONF_VLDT_INTEGER,
+    },
+
+    NXT_CONF_VLDT_END
+};
+
+
+/* See docs/adr/0004-schedules.md, section 2. */
+
+static nxt_conf_vldt_object_t  nxt_conf_vldt_schedule_members[] = {
+    {
+        .name       = nxt_string("pass"),
+        .type       = NXT_CONF_VLDT_STRING,
+        .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_schedule_pass,
+    }, {
+        .name       = nxt_string("uri"),
+        .type       = NXT_CONF_VLDT_STRING,
+        .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_schedule_uri,
+    }, {
+        .name       = nxt_string("interval"),
+        .type       = NXT_CONF_VLDT_INTEGER,
+        .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_schedule_seconds,
+        .u.string   = "interval",
+    }, {
+        .name       = nxt_string("jitter"),
+        .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_schedule_seconds,
+        .u.string   = "jitter",
+    }, {
+        .name       = nxt_string("timeout"),
+        .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_schedule_seconds,
+        .u.string   = "timeout",
+    }, {
+        .name       = nxt_string("overlap"),
+        .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_schedule_overlap,
+    }, {
+        .name       = nxt_string("headers"),
+        .type       = NXT_CONF_VLDT_OBJECT,
+        .validator  = nxt_conf_vldt_schedule_headers,
+    }, {
+        .name       = nxt_string("run_on_start"),
+        .type       = NXT_CONF_VLDT_BOOLEAN,
     },
 
     NXT_CONF_VLDT_END
@@ -4928,4 +4996,356 @@ nxt_conf_vldt_access_log_format_field(nxt_conf_validation_t *vldt,
     }
 
     return NXT_OK;
+}
+
+
+/*
+ * "schedules": see docs/adr/0004-schedules.md, section 2.  The name ends up
+ * in a request header ("User-Agent: FreeUnit-Schedule/<name>") and in the
+ * log, so it is held to printable ASCII.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_schedule(nxt_conf_validation_t *vldt, nxt_str_t *name,
+    nxt_conf_value_t *value)
+{
+    double            interval, jitter;
+    nxt_int_t         ret;
+    nxt_uint_t        i;
+    nxt_conf_value_t  *member;
+
+    static const nxt_str_t  interval_str = nxt_string("interval");
+    static const nxt_str_t  jitter_str = nxt_string("jitter");
+
+    ret = nxt_conf_vldt_type(vldt, name, value, NXT_CONF_VLDT_OBJECT);
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
+    if (name->length == 0 || name->length > NXT_SCHEDULE_NAME_MAX) {
+        return nxt_conf_vldt_error(vldt, "A schedule name must be 1 to %d "
+                                   "bytes long.", NXT_SCHEDULE_NAME_MAX);
+    }
+
+    for (i = 0; i < name->length; i++) {
+        if (name->start[i] < 0x20 || name->start[i] > 0x7E) {
+            return nxt_conf_vldt_error(vldt, "The schedule name \"%V\" must "
+                                       "contain only printable ASCII "
+                                       "characters.", name);
+        }
+    }
+
+    ret = nxt_conf_vldt_object(vldt, value, nxt_conf_vldt_schedule_members);
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
+    member = nxt_conf_get_object_member(value, &jitter_str, NULL);
+    if (member == NULL) {
+        return NXT_OK;
+    }
+
+    jitter = nxt_conf_get_number(member);
+
+    member = nxt_conf_get_object_member(value, &interval_str, NULL);
+    interval = nxt_conf_get_number(member);
+
+    if (jitter > interval) {
+        return nxt_conf_vldt_member_error(vldt, &jitter_str, "The \"jitter\" "
+                                          "value must not exceed "
+                                          "\"interval\".");
+    }
+
+    if (interval + jitter > NXT_SCHEDULE_SECONDS_MAX) {
+        return nxt_conf_vldt_member_error(vldt, &jitter_str, "The sum of "
+                                          "\"interval\" and \"jitter\" must "
+                                          "not exceed %d.",
+                                          NXT_SCHEDULE_SECONDS_MAX);
+    }
+
+    return NXT_OK;
+}
+
+
+/*
+ * v1 runs a schedule on an application only: a route can lead to "proxy" or
+ * to an upstream, and the connection-less request has no peer protocol to
+ * offer them.  The first segment is compared after the same splitting and
+ * percent-decoding nxt_conf_vldt_pass() applies, so an encoded
+ * "applications" is recognised as such.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_schedule_pass(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    nxt_str_t  pass;
+    nxt_int_t  ret;
+    nxt_str_t  segments[3];
+
+    nxt_conf_get_string(value, &pass);
+
+    if (nxt_is_tstr(&pass)) {
+        return nxt_conf_vldt_error(vldt, "The schedule \"pass\" value must "
+                                   "not contain variables.");
+    }
+
+    ret = nxt_http_pass_segments(vldt->pool, &pass, segments, 3);
+    if (ret == NXT_ERROR) {
+        return NXT_ERROR;
+    }
+
+    if (ret != NXT_OK || !nxt_str_eq(&segments[0], "applications", 12)) {
+        return nxt_conf_vldt_error(vldt, "The schedule \"pass\" value \"%V\" "
+                                   "must be \"applications/<name>\" or "
+                                   "\"applications/<name>/<target>\".",
+                                   &pass);
+    }
+
+    return nxt_conf_vldt_pass(vldt, value, data);
+}
+
+
+/*
+ * A request target in origin form.  After the character checks it is run
+ * through the same request-line parser the router uses, so that a target the
+ * router would refuse fails here, not when the configuration is applied.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_schedule_uri(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    u_char                    *p;
+    size_t                    size;
+    nxt_str_t                 uri;
+    nxt_int_t                 ret;
+    nxt_uint_t                i;
+    nxt_buf_mem_t             mem;
+    nxt_http_request_parse_t  rp;
+
+    static const char  prefix[] = "GET ";
+    static const char  suffix[] = " HTTP/1.1\r\n\r\n";
+
+    nxt_conf_get_string(value, &uri);
+
+    if (uri.length == 0 || uri.length > NXT_SCHEDULE_URI_MAX) {
+        return nxt_conf_vldt_error(vldt, "The \"uri\" value must be 1 to %d "
+                                   "bytes long.", NXT_SCHEDULE_URI_MAX);
+    }
+
+    if (uri.start[0] != '/') {
+        return nxt_conf_vldt_error(vldt, "The \"uri\" value must start "
+                                   "with \"/\".");
+    }
+
+    for (i = 0; i < uri.length; i++) {
+        if (uri.start[i] <= 0x20 || uri.start[i] >= 0x7F
+            || uri.start[i] == '#')
+        {
+            return nxt_conf_vldt_error(vldt, "The \"uri\" value must not "
+                                       "contain whitespace, control "
+                                       "characters, non-ASCII bytes or "
+                                       "\"#\".");
+        }
+    }
+
+    /* Bounded by NXT_SCHEDULE_URI_MAX above: no overflow. */
+    size = nxt_length(prefix) + uri.length + nxt_length(suffix);
+
+    p = nxt_mp_nget(vldt->pool, size);
+    if (nxt_slow_path(p == NULL)) {
+        return NXT_ERROR;
+    }
+
+    mem.start = p;
+    mem.pos = p;
+
+    p = nxt_cpymem(p, prefix, nxt_length(prefix));
+    p = nxt_cpymem(p, uri.start, uri.length);
+    p = nxt_cpymem(p, suffix, nxt_length(suffix));
+
+    mem.free = p;
+    mem.end = p;
+
+    nxt_memzero(&rp, sizeof(nxt_http_request_parse_t));
+
+    ret = nxt_http_parse_request_init(&rp, vldt->pool);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return NXT_ERROR;
+    }
+
+    ret = nxt_http_parse_request(&rp, &mem);
+
+    if (ret != NXT_DONE) {
+        return nxt_conf_vldt_error(vldt, "The \"uri\" value \"%V\" is not a "
+                                   "valid request target.", &uri);
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_conf_vldt_schedule_seconds(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    int         min;
+    double      n;
+    const char  *name;
+
+    name = data;
+    n = nxt_conf_get_number(value);
+
+    min = (nxt_strcmp(name, "jitter") == 0) ? 0 : 1;
+
+    if (n < min || n > NXT_SCHEDULE_SECONDS_MAX) {
+        return nxt_conf_vldt_error(vldt, "The \"%s\" value must be between "
+                                   "%d and %d.", name, min,
+                                   NXT_SCHEDULE_SECONDS_MAX);
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_conf_vldt_schedule_overlap(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    nxt_str_t  overlap;
+
+    nxt_conf_get_string(value, &overlap);
+
+    if (nxt_str_eq(&overlap, "skip", 4) || nxt_str_eq(&overlap, "queue", 5)) {
+        return NXT_OK;
+    }
+
+    return nxt_conf_vldt_error(vldt, "The \"overlap\" value must be either "
+                               "\"skip\" or \"queue\".");
+}
+
+
+static nxt_int_t
+nxt_conf_vldt_schedule_headers(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    size_t            size, field;
+    uint32_t          index;
+    nxt_int_t         ret;
+    nxt_str_t         name, str;
+    nxt_conf_value_t  *member;
+
+    ret = nxt_conf_vldt_object_iterator(vldt, value,
+                                        &nxt_conf_vldt_schedule_header);
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
+    size = 0;
+    index = 0;
+
+    for ( ;; ) {
+        member = nxt_conf_next_object_member(value, &name, &index);
+        if (member == NULL) {
+            return NXT_OK;
+        }
+
+        nxt_conf_get_string(member, &str);
+
+        /* "name: value\r\n" */
+        if (nxt_size_add(name.length, str.length, &field)
+            || nxt_size_add(field, nxt_length(": \r\n"), &field)
+            || nxt_size_add(size, field, &size)
+            || size > NXT_SCHEDULE_HEADERS_MAX)
+        {
+            return nxt_conf_vldt_error(vldt, "The schedule \"headers\" must "
+                                       "not exceed %d bytes in total.",
+                                       NXT_SCHEDULE_HEADERS_MAX);
+        }
+    }
+}
+
+
+/*
+ * Framing and connection-level fields are refused: the request has no body
+ * and no connection, and their h1 handlers write into connection state the
+ * request does not have.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_schedule_header(nxt_conf_validation_t *vldt, nxt_str_t *name,
+    nxt_conf_value_t *value)
+{
+    u_char      c;
+    nxt_str_t   str;
+    nxt_uint_t  i;
+
+    static const nxt_str_t  reserved[] = {
+        nxt_string("Content-Length"),
+        nxt_string("Transfer-Encoding"),
+        nxt_string("Connection"),
+        nxt_string("Upgrade"),
+        nxt_string("Keep-Alive"),
+        nxt_string("TE"),
+        nxt_string("Expect"),
+    };
+
+    static const nxt_str_t  websocket = nxt_string("Sec-WebSocket-");
+
+    if (name->length == 0) {
+        return nxt_conf_vldt_error(vldt, "A schedule header name must not "
+                                   "be empty.");
+    }
+
+    for (i = 0; i < name->length; i++) {
+        c = name->start[i];
+
+        if (!nxt_isdigit(c) && !((c | 0x20) >= 'a' && (c | 0x20) <= 'z')
+            && strchr("!#$%&'*+-.^_`|~", c) == NULL)
+        {
+            return nxt_conf_vldt_error(vldt, "The schedule header name "
+                                       "\"%V\" is not a valid HTTP field "
+                                       "name.", name);
+        }
+    }
+
+    for (i = 0; i < nxt_nitems(reserved); i++) {
+        if (name->length == reserved[i].length
+            && nxt_strncasecmp(name->start, reserved[i].start,
+                               name->length) == 0)
+        {
+            goto reserved;
+        }
+    }
+
+    if (name->length >= websocket.length
+        && nxt_strncasecmp(name->start, websocket.start, websocket.length) == 0)
+    {
+        goto reserved;
+    }
+
+    if (nxt_conf_type(value) != NXT_CONF_STRING) {
+        return nxt_conf_vldt_error(vldt, "The schedule header \"%V\" value "
+                                   "must be a string.", name);
+    }
+
+    nxt_conf_get_string(value, &str);
+
+    for (i = 0; i < str.length; i++) {
+        c = str.start[i];
+
+        if ((c < 0x20 && c != '\t') || c == 0x7F) {
+            return nxt_conf_vldt_error(vldt, "The schedule header \"%V\" "
+                                       "value must not contain control "
+                                       "characters.", name);
+        }
+    }
+
+    return NXT_OK;
+
+reserved:
+
+    return nxt_conf_vldt_error(vldt, "The \"%V\" header cannot be set by a "
+                               "schedule.", name);
 }

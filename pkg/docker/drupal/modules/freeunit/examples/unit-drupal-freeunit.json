@@ -247,9 +247,8 @@
                 "file": "/usr/local/etc/php/php-freeunit-drupal.ini",
                 "admin": {
                     "memory_limit": "1G",
-                    "opcache.enable": "1",
                     "opcache.validate_timestamps": "1",
-                    "opcache.revalidate_freq": "0",
+                    "opcache.revalidate_freq": "2",
                     "realpath_cache_size": "4096K",
                     "realpath_cache_ttl": "600",
                     "upload_max_filesize": "64M",

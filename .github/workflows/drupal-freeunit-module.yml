@@ -243,8 +243,12 @@ jobs:
       - name: Measure under FreeUnit and nginx + php-fpm
         working-directory: ${{ env.SITE }}
         env:
-          # Experiment: every variant in .github/scripts/drupal-bench.py.
-          BENCH_VARIANTS: v0-run6,v1-same-ini,v2-revalidate2,v4-threads2,v6-jit-off
+          # The fair configuration: one ini file read at startup by both
+          # stacks (revalidate_freq=2, same OPcache/JIT/realpath), FreeUnit
+          # "processes": 8 and listen_threads 2 against pm=static 8 and 2
+          # nginx workers.  Other variants in .github/scripts/drupal-bench.py
+          # (comma separated, or "all") reproduce the experiment.
+          BENCH_VARIANTS: v4-threads2
         run: |
           # Reference stack: nginx + php-fpm on the same site and PHP.  The
           # script (re)starts php-fpm and reconfigures FreeUnit per variant.

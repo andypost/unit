@@ -103,3 +103,11 @@ configuration for every host in `static_cache.hosts`.
 - `options.file` (a php.ini) is where `opcache.preload` and the OPcache
   memory sizes go. `options.admin` values are applied after PHP module
   startup (`src/nxt_php_sapi.c:442-453`), which is too late for them.
+  `opcache.enable` there fails ("can't be temporary enabled"); OPcache is
+  on by default, so the example leaves it out.
+- The example sets `opcache.revalidate_freq=2` (PHP's default), not `0`.
+  With `0` every request stats each of the ~950 files Drupal includes;
+  in CI that cost FreeUnit ~18% on page_cache hits and was the whole gap
+  to nginx + php-fpm, which ran with the default. With the same ini on
+  both stacks they measure the same (`.github/scripts/drupal-bench.py`).
+  Use `validate_timestamps=0` in production if deploys restart the app.

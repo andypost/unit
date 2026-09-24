@@ -70,6 +70,7 @@ jobs:
 
       - name: Options smoke
         run: |
+          set +e
           SUDO=; [ "$(id -u)" = 0 ] || SUDO=sudo
           W=/tmp/pho; B=$PWD/build
           $SUDO rm -rf $W; mkdir -p $W/app $W/state $W/tmp; chmod -R 755 $W
@@ -86,7 +87,8 @@ jobs:
           $SUDO $B/sbin/unitd --control unix:$W/c.sock --pid $W/u.pid \
             --log $W/unit.log --statedir $W/state --tmpdir $W/tmp \
             --modulesdir $B/lib/unit/modules
-          for i in $(seq 50); do [ -S $W/c.sock ] && break; sleep 0.1; done
+          for i in $(seq 50); do $SUDO test -S $W/c.sock && break; sleep 0.1; done
+          $SUDO ls -la $W
 
           fail=0
           run() {
@@ -96,7 +98,8 @@ jobs:
               "processes":{"max":2,"spare":1}'$opt'}}}'
             $SUDO curl -s -X PUT --unix-socket $W/c.sock -d "$conf" \
               http://localhost/config > $W/put.out
-            body=$(curl -s -m 5 http://127.0.0.1:18471/)
+            sleep 0.5
+            body=$(curl -sS -m 5 http://127.0.0.1:18471/ 2>&1)
             if grep -q success $W/put.out && echo "$body" | grep -q -- "$want"; then
               echo "PASS $name: $body"
             else
@@ -114,7 +117,8 @@ jobs:
 
           $SUDO kill "$($SUDO cat $W/u.pid)"; sleep 1
           echo "---- unit.log (non-debug, notable) ----"
-          $SUDO grep -aE 'signal|alert|crit|error|failed' $W/unit.log | grep -v sendmsg || true
+          $SUDO grep -aE 'signal|alert|crit|error|failed|warn' $W/unit.log | grep -v sendmsg
+          [ $fail = 0 ] || $SUDO tail -40 $W/unit.log
           if $SUDO grep -aqE 'exited on signal|signal 11' $W/unit.log; then fail=1; fi
           exit $fail
 

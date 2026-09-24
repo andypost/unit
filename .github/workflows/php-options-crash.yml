@@ -72,7 +72,9 @@ jobs:
         run: |
           set +e
           SUDO=; [ "$(id -u)" = 0 ] || SUDO=sudo
-          W=/tmp/pho; B=$PWD/build
+          W=/tmp/pho; B=/tmp/pho-build
+          # discovery runs as nobody: /home/runner is not traversable.
+          $SUDO rm -rf $B; cp -a build $B; chmod -R a+rX $B
           $SUDO rm -rf $W; mkdir -p $W/app $W/state $W/tmp; chmod -R 755 $W
           cat > $W/app/index.php <<'EOF'
           <?php
@@ -123,6 +125,7 @@ jobs:
           exit $fail
 
       - name: pytest test_php_application.py
+        if: ${{ !cancelled() }}
         run: |
           SUDO=; [ "$(id -u)" = 0 ] || SUDO="sudo -E"
           $SUDO pytest-3 --print-log test/test_php_application.py

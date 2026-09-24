@@ -5384,8 +5384,9 @@ nxt_router_thread_exit_handler(nxt_task_t *task, void *obj, void *data)
  * Parses the nxt_unit_response_t an application handed back in "b": the
  * fixed header, the field array and the piggybacked body.  The buffer is
  * shared memory the application keeps mapped writable, so every value is
- * read once, into a local, and checked before use: fields_count against the
- * buffer size, each sptr and its length by nxt_unit_sptr_in_buf().
+ * read once, through volatile into a local, and checked before use:
+ * fields_count against the buffer size, each sptr and its length by
+ * nxt_unit_sptr_in_buf().
  *
  * Kept as its own function so a harness can drive it with a synthetic
  * buffer and a bare nxt_http_request_t, without a router or a live app
@@ -5414,7 +5415,7 @@ nxt_router_response_header_parse(nxt_task_t *task, nxt_http_request_t *r,
     }
 
     resp = (void *) b->mem.pos;
-    count = resp->fields_count;
+    count = *(volatile uint32_t *) &resp->fields_count;
 
     if (nxt_slow_path(count > (b_size - sizeof(nxt_unit_response_t))
                               / sizeof(nxt_unit_field_t)))
@@ -5425,7 +5426,7 @@ nxt_router_response_header_parse(nxt_task_t *task, nxt_http_request_t *r,
     }
 
     for (f = resp->fields; f < resp->fields + count; f++) {
-        uf = *f;
+        uf = *(volatile nxt_unit_field_t *) f;
 
         if (uf.skip) {
             continue;
@@ -5476,7 +5477,8 @@ nxt_router_response_header_parse(nxt_task_t *task, nxt_http_request_t *r,
 
     r->status = resp->status;
 
-    piggyback_length = resp->piggyback_content_length;
+    piggyback_length =
+        *(volatile uint32_t *) &resp->piggyback_content_length;
 
     if (piggyback_length != 0) {
         p = nxt_unit_sptr_in_buf(&resp->piggyback_content, piggyback_length,

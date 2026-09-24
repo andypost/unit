@@ -46,8 +46,8 @@ nxt_unit_sptr_get(nxt_unit_sptr_t *sptr)
  * sptr->base aliases the address of the sptr itself (the union encodes an
  * offset relative to that location), so this also implicitly checks that
  * the sptr is inside the buffer.  The offset is read once: the buffer may be
- * shared memory the peer keeps writing, so the caller uses the returned
- * pointer rather than resolving the sptr again.
+ * shared memory the peer keeps writing, so it is read through volatile and
+ * the caller uses the returned pointer rather than resolving the sptr again.
  */
 static inline void *
 nxt_unit_sptr_in_buf(nxt_unit_sptr_t *sptr, uint32_t length,
@@ -72,7 +72,7 @@ nxt_unit_sptr_in_buf(nxt_unit_sptr_t *sptr, uint32_t length,
         return NULL;
     }
 
-    offset = sptr->offset;
+    offset = *(volatile uint32_t *) &sptr->offset;
 
     if (offset > buf_size - sptr_off
         || length > buf_size - sptr_off - offset)

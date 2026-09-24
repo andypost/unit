@@ -1,0 +1,124 @@
+name: "PHP options smoke (admin/user/file)"
+
+# Investigation workflow: applies application "options" (admin, user, file)
+# to a php app across PHP versions, checks the prototype survives and the
+# request sees the value, then runs test/test_php_application.py.
+
+on:
+  push:
+    branches: [fix/php-options-crash]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  php:
+    name: php ${{ matrix.php }} (${{ matrix.source }})
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { php: '8.3', source: setup-php }
+          - { php: '8.4', source: setup-php }
+          - { php: '8.5', source: setup-php }
+          # Same packages as the local host: Ubuntu 24.04 php8.3-dev +
+          # libphp8.3-embed (8.3.6-0ubuntu0.24.04.x) with opcache enabled.
+          - { php: '8.3', source: distro, container: 'ubuntu:24.04' }
+
+    steps:
+      - name: Install distro PHP embed
+        if: matrix.source == 'distro'
+        run: |
+          apt-get -y update
+          DEBIAN_FRONTEND=noninteractive apt-get -y install git build-essential \
+            curl iproute2 python3-pytest libphp8.3-embed php8.3-dev \
+            php8.3-opcache php8.3-cli sudo
+          apt-cache policy libphp8.3-embed | head -3
+          ls -la /etc/php/8.3/embed /etc/php/8.3/embed/conf.d || true
+
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        if: matrix.source == 'setup-php'
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: none
+        env:
+          update: true
+
+      - name: Install pytest
+        if: matrix.source == 'setup-php'
+        run: sudo apt-get -y install python3-pytest
+
+      - name: PHP info
+        run: |
+          php-config --version --include-dir --prefix
+          php -v
+          php --ini || true
+          grep -E 'define (ZTS|ZEND_DEBUG) ' "$(php-config --include-dir)/main/php_config.h" || true
+
+      - name: Build unit + php module
+        run: |
+          ./configure --openssl
+          ./configure php
+          make -j2
+          make -j2 php
+          ldd build/lib/unit/modules/php.unit.so | grep -i php
+
+      - name: Options smoke
+        run: |
+          SUDO=; [ "$(id -u)" = 0 ] || SUDO=sudo
+          W=/tmp/pho; B=$PWD/build
+          $SUDO rm -rf $W; mkdir -p $W/app $W/state $W/tmp; chmod -R 755 $W
+          cat > $W/app/index.php <<'EOF'
+          <?php
+          echo "ml=", ini_get('memory_limit'),
+               " tz=", ini_get('date.timezone'),
+               " rf=", var_export(ini_get('opcache.revalidate_freq'), true),
+               " df=", ini_get('disable_functions'),
+               " php=", PHP_VERSION, "\n";
+          EOF
+          printf 'memory_limit=200M\n' > $W/app/php.ini
+          chmod 644 $W/app/*
+          $SUDO $B/sbin/unitd --control unix:$W/c.sock --pid $W/u.pid \
+            --log $W/unit.log --statedir $W/state --tmpdir $W/tmp \
+            --modulesdir $B/lib/unit/modules
+          for i in $(seq 50); do [ -S $W/c.sock ] && break; sleep 0.1; done
+
+          fail=0
+          run() {
+            name=$1; opt=$2; want=$3
+            conf='{"listeners":{"127.0.0.1:18471":{"pass":"applications/p"}},
+              "applications":{"p":{"type":"php","root":"'$W'/app",
+              "processes":{"max":2,"spare":1}'$opt'}}}'
+            $SUDO curl -s -X PUT --unix-socket $W/c.sock -d "$conf" \
+              http://localhost/config > $W/put.out
+            body=$(curl -s -m 5 http://127.0.0.1:18471/)
+            if grep -q success $W/put.out && echo "$body" | grep -q -- "$want"; then
+              echo "PASS $name: $body"
+            else
+              echo "FAIL $name: put=$(tr -d '\n\t' < $W/put.out) body=$body"
+              fail=1
+            fi
+          }
+          run none   ''                                                      'ml=128M'
+          run admin  ',"options":{"admin":{"memory_limit":"256M"}}'          'ml=256M'
+          run user   ',"options":{"user":{"memory_limit":"300M"}}'           'ml=300M'
+          run file   ',"options":{"file":"'$W'/app/php.ini"}'                'ml=200M'
+          run opc    ',"options":{"admin":{"opcache.revalidate_freq":"7"}}'  'ml=128M'
+          run dis    ',"options":{"admin":{"disable_functions":"exec"}}'     'df=exec'
+          run all    ',"options":{"file":"'$W'/app/php.ini","admin":{"memory_limit":"1G","opcache.validate_timestamps":"1","opcache.revalidate_freq":"0","realpath_cache_size":"4096K","upload_max_filesize":"64M","post_max_size":"64M"},"user":{"date.timezone":"UTC"}}' 'ml=1G'
+
+          $SUDO kill "$($SUDO cat $W/u.pid)"; sleep 1
+          echo "---- unit.log (non-debug, notable) ----"
+          $SUDO grep -aE 'signal|alert|crit|error|failed' $W/unit.log | grep -v sendmsg || true
+          if $SUDO grep -aqE 'exited on signal|signal 11' $W/unit.log; then fail=1; fi
+          exit $fail
+
+      - name: pytest test_php_application.py
+        run: |
+          SUDO=; [ "$(id -u)" = 0 ] || SUDO="sudo -E"
+          $SUDO pytest-3 --print-log test/test_php_application.py

@@ -71,6 +71,17 @@
             {
                 "match": {
                     "uri": [
+                        "/index.php",
+                        "/index.php/*"
+                    ]
+                },
+                "action": {
+                    "pass": "applications/drupal/index"
+                }
+            },
+            {
+                "match": {
+                    "uri": [
                         "!/index.php",
                         "!/index.php/*",
                         "*.php",

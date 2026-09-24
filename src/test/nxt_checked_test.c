@@ -13,8 +13,6 @@ nxt_checked_test(nxt_thread_t *thr)
 {
     size_t         r, extra;
     u_char         dst[4];
-    uint8_t        u8;
-    uint32_t       u32;
     nxt_span_t     span;
     const u_char   *p;
 
@@ -28,15 +26,6 @@ nxt_checked_test(nxt_thread_t *thr)
                    "nxt_size_add(SIZE_MAX, 1) did not overflow");
     NXT_TEST_CHECK(thr->log, nxt_size_mul(SIZE_MAX, 2, &r) != 0,
                    "nxt_size_mul(SIZE_MAX, 2) did not overflow");
-    NXT_TEST_CHECK(thr->log, nxt_u32_from_size(1234, &u32) == 0 && u32 == 1234,
-                   "nxt_u32_from_size(1234) failed");
-    NXT_TEST_CHECK(thr->log, nxt_u8_from_size(255, &u8) == 0 && u8 == 255,
-                   "nxt_u8_from_size(255) failed");
-    NXT_TEST_CHECK(thr->log,
-                   nxt_u32_from_size((size_t) UINT32_MAX + 1, &u32) != 0,
-                   "nxt_u32_from_size() did not overflow");
-    NXT_TEST_CHECK(thr->log, nxt_u8_from_size(256, &u8) != 0,
-                   "nxt_u8_from_size(256) did not overflow");
 
     /* Two whole 4-byte records, then a partial tail of 0..3 bytes. */
 

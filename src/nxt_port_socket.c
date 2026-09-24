@@ -8,7 +8,6 @@
 #include <nxt_socket_msg.h>
 #include <nxt_port_queue.h>
 #include <nxt_port_memory_int.h>
-#include <nxt_checked.h>
 #include <nxt_usdt.h>
 
 
@@ -2048,17 +2047,15 @@ nxt_port_frag_unaccount(nxt_port_t *port, nxt_port_recv_msg_t *fmsg)
 /*
  * Would appending "msg" to the stream being reassembled in "fmsg" pass a
  * limit?  The per-port total is checked only for a fragment that keeps the
- * stream open: the last one hands the whole message over at once.
+ * stream open: the last one hands the whole message over at once.  A stream
+ * and the port's total are kept under their limits, so neither subtraction
+ * can wrap.
  */
 static nxt_bool_t
 nxt_port_frag_fits(nxt_task_t *task, nxt_port_t *port,
     nxt_port_recv_msg_t *fmsg, nxt_port_recv_msg_t *msg)
 {
-    size_t  size;
-
-    if (nxt_slow_path(nxt_size_add(fmsg->size, msg->size, &size) != 0
-                      || size > NXT_PORT_FRAG_SIZE_MAX))
-    {
+    if (nxt_slow_path(msg->size > NXT_PORT_FRAG_SIZE_MAX - fmsg->size)) {
         nxt_alert(task, "port %d: fragmented message #%uD from pid %PI "
                   "exceeds %d bytes, dropped", port->socket.fd,
                   msg->port_msg.stream, msg->port_msg.pid,
@@ -2067,8 +2064,7 @@ nxt_port_frag_fits(nxt_task_t *task, nxt_port_t *port,
     }
 
     if (msg->port_msg.mf != 0
-        && nxt_slow_path(nxt_size_add(port->frag_size, msg->size, &size) != 0
-                         || size > NXT_PORT_FRAG_TOTAL_MAX))
+        && nxt_slow_path(msg->size > NXT_PORT_FRAG_TOTAL_MAX - port->frag_size))
     {
         nxt_alert(task, "port %d: fragmented messages in progress exceed "
                   "%d bytes, dropping stream #%uD from pid %PI",

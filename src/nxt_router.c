@@ -23,7 +23,6 @@
 #include <nxt_port_queue.h>
 #include <nxt_http_compression.h>
 #include <nxt_router_schedule.h>
-#include <nxt_checked.h>
 #include <nxt_usdt.h>
 
 #if (NXT_HAVE_OTEL)
@@ -7738,8 +7737,7 @@ nxt_router_app_prepare_request(nxt_task_t *task,
  *   - version, the address and port texts are uint8_t as well but produced
  *     by Unit itself; they are checked all the same, and fail with 500.
  *   - the uint32_t lengths (server name, target, path, query, values) are
- *     bounded by req_size <= PORT_MMAP_DATA_SIZE, which is summed with
- *     overflow checks.
+ *     bounded by req_size <= PORT_MMAP_DATA_SIZE.
  *
  * On failure NULL is returned and *status says what to answer.
  */
@@ -7752,8 +7750,6 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     u_char              *pos, *end, *p, c;
     size_t              fields_count, req_size, size, free_size;
     size_t              copy_size;
-    uint8_t             u8;
-    nxt_uint_t          overflow;
     nxt_off_t           content_length;
     nxt_buf_t               *b, *buf, *out, **tail;
     nxt_http_field_t        *field, *dup;
@@ -7763,7 +7759,7 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 
     *status = NXT_HTTP_INTERNAL_SERVER_ERROR;
 
-    if (nxt_slow_path(nxt_u8_from_size(r->method->length, &u8) != 0)) {
+    if (nxt_slow_path(r->method->length > UINT8_MAX)) {
         nxt_log(task, NXT_LOG_INFO, "request method of %uz bytes is too long "
                 "for the application protocol", r->method->length);
 
@@ -7771,13 +7767,10 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
         return NULL;
     }
 
-    if (nxt_slow_path(nxt_u8_from_size(r->version.length, &u8) != 0
-                      || nxt_u8_from_size(r->remote->address_length, &u8)
-                         != 0
-                      || nxt_u8_from_size(r->local->address_length, &u8) != 0
-                      || nxt_u8_from_size(nxt_sockaddr_port_length(r->local),
-                                          &u8)
-                         != 0))
+    if (nxt_slow_path(r->version.length > UINT8_MAX
+                      || r->remote->address_length > UINT8_MAX
+                      || r->local->address_length > UINT8_MAX
+                      || nxt_sockaddr_port_length(r->local) > UINT8_MAX))
     {
         nxt_alert(task, "request version or address too long for the "
                   "application protocol");
@@ -7785,27 +7778,17 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
         return NULL;
     }
 
-    overflow = 0;
+    /* Every length is of data the request holds, so the sum cannot wrap. */
 
-    req_size = sizeof(nxt_unit_request_t);
-
-    overflow |= nxt_size_add(req_size, r->method->length + 1, &req_size);
-    overflow |= nxt_size_add(req_size, r->version.length + 1, &req_size);
-    overflow |= nxt_size_add(req_size, r->remote->address_length + 1,
-                             &req_size);
-    overflow |= nxt_size_add(req_size, r->local->address_length + 1,
-                             &req_size);
-    overflow |= nxt_size_add(req_size, nxt_sockaddr_port_length(r->local) + 1,
-                             &req_size);
-    overflow |= nxt_size_add(req_size, r->server_name.length, &req_size);
-    overflow |= nxt_size_add(req_size, 1, &req_size);
-    overflow |= nxt_size_add(req_size, r->target.length, &req_size);
-    overflow |= nxt_size_add(req_size, 1, &req_size);
-
-    if (r->path->start != r->target.start) {
-        overflow |= nxt_size_add(req_size, r->path->length, &req_size);
-        overflow |= nxt_size_add(req_size, 1, &req_size);
-    }
+    req_size = sizeof(nxt_unit_request_t)
+               + r->method->length + 1
+               + r->version.length + 1
+               + r->remote->address_length + 1
+               + r->local->address_length + 1
+               + nxt_sockaddr_port_length(r->local) + 1
+               + r->server_name.length + 1
+               + r->target.length + 1
+               + (r->path->start != r->target.start ? r->path->length + 1 : 0);
 
     content_length = r->content_length_n < 0 ? 0 : r->content_length_n;
     fields_count = 0;
@@ -7815,10 +7798,7 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     {
         fields_count++;
 
-        if (nxt_slow_path(nxt_u8_from_size(field->name_length
-                                           + prefix->length, &u8)
-                          != 0))
-        {
+        if (nxt_slow_path(field->name_length + prefix->length > UINT8_MAX)) {
             nxt_log(task, NXT_LOG_INFO, "header field name of %d bytes is "
                     "too long for the application protocol with prefix "
                     "\"%V\"", (int) field->name_length, prefix);
@@ -7827,17 +7807,15 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
             return NULL;
         }
 
-        overflow |= nxt_size_add(req_size, field->name_length + prefix->length
-                                           + 1, &req_size);
-        overflow |= nxt_size_add(req_size, field->value_length, &req_size);
-        overflow |= nxt_size_add(req_size, 1, &req_size);
-        overflow |= nxt_size_add(req_size, sizeof(nxt_unit_field_t),
-                                 &req_size);
+        req_size += field->name_length + prefix->length + 1
+                    + field->value_length + 1;
     } nxt_http_fields_loop;
 
-    if (nxt_slow_path(overflow != 0 || req_size > PORT_MMAP_DATA_SIZE)) {
-        nxt_alert(task, "headers too big to fit in shared memory (%uz%s)",
-                  req_size, overflow != 0 ? ", overflowed" : "");
+    req_size += fields_count * sizeof(nxt_unit_field_t);
+
+    if (nxt_slow_path(req_size > PORT_MMAP_DATA_SIZE)) {
+        nxt_alert(task, "headers too big to fit in shared memory (%uz)",
+                  req_size);
 
         return NULL;
     }

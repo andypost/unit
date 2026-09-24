@@ -1,9 +1,4 @@
-"""The request deadline must not end an established WebSocket (#422).
-
-"limits": {"timeout"} bounds how long a worker may take to answer a request.
-A WebSocket upgrade answers it -- the 101 goes out -- and what follows is a
-session, not a request, so a quiet session must outlive the deadline.
-"""
+"""limits.timeout must not end a quiet, established WebSocket (#422)."""
 
 from packaging import version
 
@@ -30,8 +25,7 @@ def test_asgi_websockets_timeout_quiet_session(skip_alert):
     resp, sock, _ = ws.upgrade()
     assert resp['status'] == 101, 'upgrade'
 
-    # Read raw rather than through frame_read(): on a closed connection that
-    # would spin on EOF instead of failing.
+    # frame_read() would spin on EOF.
     sock.settimeout(3)
 
     try:

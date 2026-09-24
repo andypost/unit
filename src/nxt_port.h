@@ -252,6 +252,8 @@ struct nxt_port_recv_msg_s {
     nxt_port_t          *port;
     nxt_port_msg_t      port_msg;
     size_t              size;
+    /* Of a stream being reassembled: what it holds, nxt_port_frag_cost(). */
+    size_t              frag_held;
 #if (NXT_USE_CMSG_PID)
     nxt_pid_t           cmsg_pid;
 #endif

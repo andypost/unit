@@ -122,6 +122,9 @@ INVALID = (
        for n in ['', 'Bad Name', 'Bad:Name', 'X-é', 'X\r\nY', '(x)']]
     + [({"headers": {"X-Test": v}}, None, f'{C}/headers/X-Test')
        for v in ['a\rb', 'a\nb', 'a\x00b', 'a\x7fb', 1, None, ["x"]]]
+    + [({"headers": h}, 'do not make a request', f'{C}/headers')
+       for h in [{"Host": "a..b"}, {"Host": "x", "host": "y"},
+                 {'X-' + 'a' * 254: "x"}]]
     + [({"headers": {f'X-{i:02d}': 'v' * 2100 for i in range(4)}},
         'must not exceed 8192 bytes', f'{C}/headers'),
        ({"headers": ["Host: x"]}, None, f'{C}/headers'),

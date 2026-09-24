@@ -75,6 +75,8 @@ nxt_int_t nxt_router_schedule_request_build(nxt_mp_t *mp,
     nxt_router_schedule_t *sched, nxt_conf_value_t *headers);
 nxt_int_t nxt_router_schedule_parse(nxt_mp_t *mp, nxt_str_t *request,
     nxt_http_request_parse_t *rp);
+nxt_int_t nxt_router_schedule_request_check(nxt_mp_t *mp, nxt_str_t *name,
+    nxt_str_t *uri, nxt_conf_value_t *headers);
 
 size_t nxt_router_schedules_status_size(nxt_uint_t *n);
 void nxt_router_schedules_status(nxt_status_schedule_t *stat, u_char *p,

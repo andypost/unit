@@ -7,13 +7,15 @@
 # For local tests, install bats-core, bats-assert, bats-file, bats-support
 # And run this in the add-on root directory:
 #   bats ./tests/test.bats
+# To exclude release tests:
+#   bats ./tests/test.bats --filter-tags '!release'
 # For debugging:
 #   bats ./tests/test.bats --show-output-of-passing-tests --verbose-run --print-output-on-failure
 
 setup() {
   set -eu -o pipefail
 
-  # Override this variable once this add-on has its own repository:
+  # The release test can only pass once the add-on lives in this repository.
   export GITHUB_REPO=freeunitorg/ddev-freeunit
 
   TEST_BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
@@ -23,7 +25,7 @@ setup() {
   bats_load_library bats-support
 
   export DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")/.." >/dev/null 2>&1 && pwd)"
-  export PROJNAME="test-ddev-freeunit"
+  export PROJNAME="test-$(basename "${GITHUB_REPO}")"
   mkdir -p "${HOME}/tmp"
   export TESTDIR="$(mktemp -d "${HOME}/tmp/${PROJNAME}.XXXXXX")"
   export DDEV_NONINTERACTIVE=true
@@ -31,53 +33,89 @@ setup() {
   ddev delete -Oy "${PROJNAME}" >/dev/null 2>&1 || true
   cd "${TESTDIR}"
 
-  # A plain PHP project is enough to exercise the generic route (static +
-  # PHP + Xdebug); Drupal-specific routing is exercised by render-config.sh
-  # unit behavior, not re-tested here through a full Drupal install.
+  # A plain "php" project exercises the generic routing: front controller,
+  # a second PHP script, a static file, a dotfile, HTTPS detection, Xdebug.
   mkdir -p web
   cat <<'PHP' > web/index.php
 <?php
 echo "freeunit-test-ok\n";
+echo "HTTPS=" . ($_SERVER['HTTPS'] ?? 'off') . "\n";
+echo "xdebug=" . (extension_loaded('xdebug') ? 'on' : 'off') . "\n";
 PHP
+  echo '<?php echo "php-direct-ok\n";' > web/info.php
   echo "static-ok" > web/robots.txt
+  echo "SECRET=1" > web/.env
 
   run ddev config --project-name="${PROJNAME}" --project-type=php --docroot=web --project-tld=ddev.site
   assert_success
 }
 
+# Wait for FreeUnit to answer after a (re)start.
+wait_for_site() {
+  for _ in $(seq 1 30); do
+    curl -sf "https://${PROJNAME}.ddev.site/" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
 health_checks() {
-  # The PHP route responds and actually ran through PHP.
+  wait_for_site
+
+  # Front controller, through PHP, with HTTPS detected from X-Forwarded-Proto.
   run curl -sf "https://${PROJNAME}.ddev.site/"
   assert_success
   assert_output --partial "freeunit-test-ok"
+  assert_output --partial "HTTPS=on"
 
-  # Static files are served directly (not through the PHP application).
+  # Any other PHP script runs too instead of being served as a file.
+  run curl -sf "https://${PROJNAME}.ddev.site/info.php"
+  assert_success
+  assert_output "php-direct-ok"
+
+  # Static files are served directly.
   run curl -sf "https://${PROJNAME}.ddev.site/robots.txt"
   assert_success
-  assert_output --partial "static-ok"
+  assert_output "static-ok"
+
+  # Dotfiles are denied.
+  run curl -s -o /dev/null -w "%{http_code}" "https://${PROJNAME}.ddev.site/.env"
+  assert_output "404"
 
   # The response comes from FreeUnit, not nginx/apache.
   run curl -sfI "https://${PROJNAME}.ddev.site/"
   assert_success
   assert_output --regexp "^[Ss]erver: [Uu]nit"
 
-  # The control command works and reports the "app" application.
+  # The control command works.
   run ddev freeunit status
   assert_success
-  assert_output --partial "applications"
+  assert_output --partial "connections"
 
-  # Config re-apply works without disturbing the running site.
-  run ddev freeunit reload
+  # Xdebug: DDEV's stock `ddev xdebug` edits the php-fpm configuration,
+  # which the embed SAPI shares; a daemon restart loads it.
+  run ddev xdebug on
   assert_success
-
+  run ddev freeunit restart
+  assert_success
+  wait_for_site
   run curl -sf "https://${PROJNAME}.ddev.site/"
+  assert_output --partial "xdebug=on"
+
+  run ddev xdebug off
   assert_success
-  assert_output --partial "freeunit-test-ok"
+  run ddev freeunit restart
+  assert_success
+  wait_for_site
+  run curl -sf "https://${PROJNAME}.ddev.site/"
+  assert_output --partial "xdebug=off"
 }
 
 teardown() {
   set -eu -o pipefail
   ddev delete -Oy "${PROJNAME}" >/dev/null 2>&1
+  # Persist TESTDIR if running inside GitHub Actions. Useful for uploading test result artifacts
+  # See example at https://github.com/ddev/github-action-add-on-test#preserving-artifacts
   if [ -n "${GITHUB_ENV:-}" ]; then
     [ -e "${GITHUB_ENV:-}" ] && echo "TESTDIR=${HOME}/tmp/${PROJNAME}" >> "${GITHUB_ENV}"
   else
@@ -115,12 +153,16 @@ teardown() {
 
   run ddev add-on remove freeunit
   assert_success
+  assert_file_not_exists .ddev/config.freeunit.yaml
+  assert_file_not_exists .ddev/web-build/Dockerfile.freeunit
+  assert_file_not_exists .ddev/commands/web/freeunit
 
+  # Back on nginx-fpm, the page still works.
   run ddev restart -y
   assert_success
-
-  # Back on the default webserver, the plain PHP page still works.
   run curl -sf "https://${PROJNAME}.ddev.site/"
   assert_success
   assert_output --partial "freeunit-test-ok"
+  run curl -sfI "https://${PROJNAME}.ddev.site/"
+  refute_output --regexp "^[Ss]erver: [Uu]nit"
 }

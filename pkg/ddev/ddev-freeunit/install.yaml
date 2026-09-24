@@ -1,17 +1,7 @@
-# DDEV add-on: run the project's web container on FreeUnit instead of
-# nginx-fpm/apache-fpm. See https://ddev.readthedocs.io/en/stable/users/extend/additional-services/
-# for the format of this file.
+# DDEV add-on: serve the project with FreeUnit instead of nginx-fpm/apache-fpm.
+# Format: https://docs.ddev.com/en/stable/users/extend/creating-add-ons/
 
 name: freeunit
-
-pre_install_actions:
-  - |
-    #ddev-description:Check for a webserver_type collision
-    if [ -f "${DDEV_APPROOT}/.ddev/config.yaml" ] && grep -qE '^webserver_type:\s*(nginx-fpm|apache-fpm)\s*$' "${DDEV_APPROOT}/.ddev/config.yaml"; then
-      echo "Your .ddev/config.yaml pins webserver_type to nginx-fpm or apache-fpm."
-      echo "Remove that line (this add-on sets webserver_type: generic in config.freeunit.yaml) and re-run 'ddev add-on get'."
-      exit 2
-    fi
 
 project_files:
   - config.freeunit.yaml
@@ -19,23 +9,10 @@ project_files:
   - freeunit/render-config.sh
   - freeunit/start-freeunit.sh
   - commands/web/freeunit
-  - commands/web/xdebug
 
 post_install_actions:
-  - |
-    #ddev-description:Make FreeUnit scripts executable
-    chmod +x "${DDEV_APPROOT}/.ddev/freeunit/render-config.sh" \
-             "${DDEV_APPROOT}/.ddev/freeunit/start-freeunit.sh" \
-             "${DDEV_APPROOT}/.ddev/commands/web/freeunit" \
-             "${DDEV_APPROOT}/.ddev/commands/web/xdebug" 2>/dev/null || true
-  - |
-    #ddev-description:Explain the next step
-    echo "FreeUnit is configured. Run 'ddev restart' to build the FreeUnit web image and start it."
-    echo "Then 'ddev freeunit status' shows the running configuration."
+  - chmod +x "${DDEV_APPROOT}/.ddev/commands/web/freeunit"
 
-removal_actions:
-  - |
-    #ddev-description:Remind the user to restart
-    echo "Run 'ddev restart' to switch the project back to its previous webserver_type."
-
-ddev_version_constraint: '>= v1.24.0'
+# webserver_type: generic as the primary web server needs DDEV v1.24.3+;
+# the add-on template's floor is v1.24.10.
+ddev_version_constraint: '>= v1.24.10'

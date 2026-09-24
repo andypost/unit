@@ -4,7 +4,6 @@
             "pass": "routes/drupal"
         }
     },
-
     "routes": {
         "drupal": [
             {
@@ -93,6 +92,17 @@
                 }
             },
             {
+                "match": {
+                    "uri": [
+                        "/index.php",
+                        "/index.php/*"
+                    ]
+                },
+                "action": {
+                    "pass": "applications/drupal/index"
+                }
+            },
+            {
                 "action": {
                     "share": "/var/www/drupal/web$uri",
                     "fallback": {
@@ -101,13 +111,16 @@
                 }
             }
         ],
-
         "drupal_page": [
             {
                 "match": {
                     "cookies": [
-                        { "SESSbfabc37432958b063360d3ad6461c9c4": "*" },
-                        { "SSESSbfabc37432958b063360d3ad6461c9c4": "*" }
+                        {
+                            "SESSbfabc37432958b063360d3ad6461c9c4": "*"
+                        },
+                        {
+                            "SSESSbfabc37432958b063360d3ad6461c9c4": "*"
+                        }
                     ]
                 },
                 "action": {
@@ -126,7 +139,20 @@
             },
             {
                 "match": {
-                    "method": ["GET", "HEAD"],
+                    "headers": {
+                        "Authorization": "*"
+                    }
+                },
+                "action": {
+                    "pass": "applications/drupal/index"
+                }
+            },
+            {
+                "match": {
+                    "method": [
+                        "GET",
+                        "HEAD"
+                    ],
                     "host": "example.org",
                     "scheme": "http",
                     "query": "",
@@ -139,15 +165,15 @@
                     "chroot": "/var/lib/drupal-freeunit/page-cache/http/example.org/",
                     "follow_symlinks": false,
                     "response_headers": {
-                        "Content-Type": "text/html; charset=UTF-8",
-                        "Content-Encoding": "gzip",
-                        "Content-Language": "en",
+                        "X-Drupal-Cache": "HIT-FREEUNIT",
                         "Cache-Control": "max-age=300, public",
+                        "Content-Language": "en",
+                        "Content-Type": "text/html; charset=UTF-8",
                         "Expires": "Sun, 19 Nov 1978 05:00:00 GMT",
                         "Vary": "Cookie, Accept-Encoding",
                         "X-Content-Type-Options": "nosniff",
                         "X-Frame-Options": "SAMEORIGIN",
-                        "X-Drupal-Cache": "HIT-FREEUNIT"
+                        "Content-Encoding": "gzip"
                     },
                     "fallback": {
                         "pass": "applications/drupal/index"
@@ -156,7 +182,10 @@
             },
             {
                 "match": {
-                    "method": ["GET", "HEAD"],
+                    "method": [
+                        "GET",
+                        "HEAD"
+                    ],
                     "host": "example.org",
                     "scheme": "http",
                     "query": ""
@@ -165,16 +194,15 @@
                     "share": "/var/lib/drupal-freeunit/page-cache/http/example.org${uri}_.html",
                     "chroot": "/var/lib/drupal-freeunit/page-cache/http/example.org/",
                     "follow_symlinks": false,
-                    "types": ["text/html"],
                     "response_headers": {
-                        "Content-Type": "text/html; charset=UTF-8",
-                        "Content-Language": "en",
+                        "X-Drupal-Cache": "HIT-FREEUNIT",
                         "Cache-Control": "max-age=300, public",
+                        "Content-Language": "en",
+                        "Content-Type": "text/html; charset=UTF-8",
                         "Expires": "Sun, 19 Nov 1978 05:00:00 GMT",
                         "Vary": "Cookie, Accept-Encoding",
                         "X-Content-Type-Options": "nosniff",
-                        "X-Frame-Options": "SAMEORIGIN",
-                        "X-Drupal-Cache": "HIT-FREEUNIT"
+                        "X-Frame-Options": "SAMEORIGIN"
                     },
                     "fallback": {
                         "pass": "applications/drupal/index"
@@ -188,7 +216,6 @@
             }
         ]
     },
-
     "schedules": {
         "drupal-cron": {
             "pass": "applications/drupal/index",
@@ -203,7 +230,6 @@
             }
         }
     },
-
     "applications": {
         "drupal": {
             "type": "php",

@@ -1,8 +1,8 @@
 # UNVERIFIED PROTOTYPE: never installed on a Drupal site. See README.md.
+#
+# The class-name aliases let core autowire src/Hook/FreeUnitHooks and Drush
+# autowire src/Drush/Commands/FreeUnitCommands.
 services:
-  _defaults:
-    autowire: true
-
   logger.channel.freeunit:
     parent: logger.channel_base
     arguments: ['freeunit']
@@ -15,16 +15,13 @@ services:
   freeunit.static_cache.index:
     class: Drupal\freeunit\StaticCache\StaticCacheIndex
     arguments: ['@database']
-  Drupal\freeunit\StaticCache\StaticCacheIndex: '@freeunit.static_cache.index'
 
   freeunit.static_cache.files:
     class: Drupal\freeunit\StaticCache\StaticCacheFiles
     arguments: ['@freeunit.static_cache.path_mapper', '@logger.channel.freeunit']
-  Drupal\freeunit\StaticCache\StaticCacheFiles: '@freeunit.static_cache.files'
 
-  # Writes anonymous page-cache MISS responses to files after the response
-  # has been sent (kernel.terminate, which runs after fastcgi_finish_request()
-  # on FreeUnit).
+  # Writes anonymous page-cache responses to files after the response has
+  # been sent (kernel.terminate, after fastcgi_finish_request()).
   freeunit.static_cache.writer:
     class: Drupal\freeunit\EventSubscriber\StaticCacheWriter
     arguments:

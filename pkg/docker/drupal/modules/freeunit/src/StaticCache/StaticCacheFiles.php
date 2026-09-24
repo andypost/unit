@@ -63,23 +63,24 @@ final class StaticCacheFiles {
   }
 
   /**
-   * Removes everything: renames the root aside, then deletes it.
+   * Deletes every file under the root; the root itself stays.
    *
-   * The rename is atomic, so the router sees either the full old cache or an
-   * empty one, and a writer racing the purge writes into a fresh tree.
+   * Needs write permission on the root and its subdirectories only.  A
+   * writer racing the purge may re-create a page; if that happens after
+   * cache.page was emptied, the writer's own re-check drops it again.
    */
   public function purge(): void {
     $root = $this->mapper->root();
     if ($root === '' || $root === '/' || !is_dir($root)) {
       return;
     }
-    $trash = $root . '.purge-' . bin2hex(random_bytes(4));
-    if (!@rename($root, $trash)) {
-      $this->logger->warning('Cannot rename @root for a purge.', ['@root' => $root]);
-      return;
+    $it = new \RecursiveIteratorIterator(
+      new \RecursiveDirectoryIterator($root, \FilesystemIterator::SKIP_DOTS),
+      \RecursiveIteratorIterator::CHILD_FIRST,
+    );
+    foreach ($it as $entry) {
+      $entry->isDir() && !$entry->isLink() ? @rmdir($entry->getPathname()) : @unlink($entry->getPathname());
     }
-    @mkdir($root, 0755, TRUE);
-    $this->removeTree($trash);
   }
 
   private function atomicWrite(string $file, string $data): bool {
@@ -99,17 +100,6 @@ final class StaticCacheFiles {
   private function isUnderRoot(string $file): bool {
     $root = $this->mapper->root();
     return $root !== '' && str_starts_with($file, $root . '/') && !str_contains($file, '/../');
-  }
-
-  private function removeTree(string $dir): void {
-    $it = new \RecursiveIteratorIterator(
-      new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
-      \RecursiveIteratorIterator::CHILD_FIRST,
-    );
-    foreach ($it as $entry) {
-      $entry->isDir() && !$entry->isLink() ? @rmdir($entry->getPathname()) : @unlink($entry->getPathname());
-    }
-    @rmdir($dir);
   }
 
 }

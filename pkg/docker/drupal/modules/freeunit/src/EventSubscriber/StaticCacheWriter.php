@@ -20,23 +20,44 @@ use Symfony\Component\HttpKernel\Event\TerminateEvent;
 use Symfony\Component\HttpKernel\KernelEvents;
 
 /**
- * Writes page-cache MISS responses to files for the FreeUnit router.
+ * Writes anonymous page-cache responses to files for the FreeUnit router.
  *
  * UNVERIFIED PROTOTYPE: never run inside Drupal.
  *
- * Runs on kernel.terminate.  With Symfony Runtime's HttpKernelRunner (the
- * front controller in Drupal 11.x and 12.x: index.php returns a closure for
- * autoload_runtime.php), terminate runs after fastcgi_finish_request(), which
- * FreeUnit's PHP SAPI provides (src/nxt_php_sapi.c:228) and reports to the
+ * Runs on kernel.terminate.  Drupal's index.php calls $response->send() and
+ * then $kernel->terminate(); Symfony's Response::send() calls
+ * fastcgi_finish_request() when it exists, and FreeUnit's PHP SAPI provides
+ * it (src/nxt_php_sapi.c:228) and reports the rest of the script to the
  * router as detached work (src/nxt_php_sapi.c:279).  So the file write costs
  * the visitor nothing.
  *
- * The rule is "write exactly what page_cache just stored, and nothing else":
- * X-Drupal-Cache: MISS is only set by PageCache::fetch() after
- * storeResponse() succeeded, and the write is then cross-checked against the
- * cache.page item, so a tag invalidation that raced the render wins.
+ * The rule is "write exactly what page_cache holds, and nothing else":
+ * X-Drupal-Cache is MISS only after PageCache::storeResponse() succeeded and
+ * HIT only for a response PageCache just fetched, and the write is then
+ * cross-checked against the cache.page item, so a tag invalidation that
+ * raced the render wins.
  */
 final class StaticCacheWriter implements EventSubscriberInterface {
+
+  /**
+   * Response headers the router does not reproduce and that may be dropped.
+   *
+   * The router sends its own Date, ETag and Last-Modified; the others are
+   * Drupal debugging or informational headers.
+   */
+  private const DROPPED = [
+    'date',
+    'etag',
+    'last-modified',
+    'link',
+    'x-drupal-cache',
+    'x-drupal-cache-tags',
+    'x-drupal-cache-contexts',
+    'x-drupal-cache-max-age',
+    'x-drupal-dynamic-cache',
+    'x-generator',
+    'x-ua-compatible',
+  ];
 
   public function __construct(
     private readonly ConfigFactoryInterface $configFactory,
@@ -50,7 +71,7 @@ final class StaticCacheWriter implements EventSubscriberInterface {
   ) {}
 
   public static function getSubscribedEvents(): array {
-    // Late, after automated_cron (100) and before nothing in particular.
+    // After the invalidator's second pass (-50) and automated_cron (100).
     return [KernelEvents::TERMINATE => [['onTerminate', -100]]];
   }
 
@@ -62,11 +83,13 @@ final class StaticCacheWriter implements EventSubscriberInterface {
     $request = $event->getRequest();
     $response = $event->getResponse();
 
-    if (!$this->isWritable($request, $response, $settings->get('static_cache'))) {
+    $file = $this->mapper->fileFor($request);
+    if ($file === NULL || !$this->isWritable($request, $response, $settings->get('static_cache'))) {
       return;
     }
-    $file = $this->mapper->fileFor($request);
-    if ($file === NULL) {
+    // A HIT is written only when the file is missing (after a purge, an
+    // expiry, or enabling the module on a warm site); a MISS always.
+    if ($response->headers->get('X-Drupal-Cache') === 'HIT' && file_exists($file)) {
       return;
     }
     $cid = $this->findPageCacheItem($request);
@@ -115,21 +138,31 @@ final class StaticCacheWriter implements EventSubscriberInterface {
       // streamed parts; never write one.  Class name only: big_pipe may be
       // off.
       || is_a($response, 'Drupal\big_pipe\Render\BigPipeResponse')
-      || $response->headers->get('X-Drupal-Cache') !== 'MISS'
+      || !in_array($response->headers->get('X-Drupal-Cache'), ['MISS', 'HIT'], TRUE)
       || $response->headers->getCookies() !== []
-      || !str_starts_with((string) $response->headers->get('Content-Type'), 'text/html')) {
+      // Defence in depth on top of page_cache's own response policy.
+      || !$response->headers->hasCacheControlDirective('public')
+      || $response->headers->hasCacheControlDirective('private')
+      || $response->headers->hasCacheControlDirective('no-cache')
+      || $response->headers->hasCacheControlDirective('no-store')) {
       return FALSE;
     }
     $content = $response->getContent();
     if (!is_string($content) || $content === '' || strlen($content) > (int) $conf['max_bytes']) {
       return FALSE;
     }
-    // Every header must be one the route reproduces or one we may drop;
-    // otherwise the router would serve something Drupal did not send.
-    $known = array_merge($conf['reproduced_headers'] ?? [], $conf['dropped_headers'] ?? []);
-    foreach (array_keys($response->headers->allPreserveCaseWithoutCookies()) as $name) {
-      if (!in_array(strtolower((string) $name), $known, TRUE)) {
-        $this->logger->debug('Not writing @uri: header @h is not reproducible.', [
+    // Every header must either carry exactly the value the route reproduces
+    // for every page, or be one the route may drop; otherwise the router
+    // would serve something Drupal did not send (another Content-Language,
+    // another Cache-Control, a Vary the route does not know).
+    $fixed = array_change_key_case((array) $conf['headers'], CASE_LOWER);
+    foreach ($response->headers->allPreserveCaseWithoutCookies() as $name => $values) {
+      $name = strtolower((string) $name);
+      if (in_array($name, self::DROPPED, TRUE)) {
+        continue;
+      }
+      if (!isset($fixed[$name]) || $values !== [(string) $fixed[$name]]) {
+        $this->logger->debug('Not writing @uri: header @h is not what the route reproduces.', [
           '@uri' => $request->getRequestUri(),
           '@h' => $name,
         ]);

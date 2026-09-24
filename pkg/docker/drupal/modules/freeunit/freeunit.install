@@ -2,14 +2,13 @@
 
 /**
  * @file
- * Install, update and uninstall functions for freeunit.
+ * Install and uninstall functions for freeunit.
  *
- * UNVERIFIED PROTOTYPE: never installed on a Drupal site.
+ * UNVERIFIED PROTOTYPE: never installed on a Drupal site.  The status report
+ * rows are in src/Hook/FreeUnitHooks.php (hook_runtime_requirements).
  */
 
 declare(strict_types=1);
-
-use Drupal\Core\Url;
 
 /**
  * Implements hook_schema().
@@ -47,57 +46,11 @@ function freeunit_schema(): array {
 }
 
 /**
- * Implements hook_requirements().
+ * Implements hook_uninstall().
+ *
+ * Without this the router would keep serving the files, never invalidated,
+ * until someone deletes them by hand.
  */
-function freeunit_requirements(string $phase): array {
-  $requirements = [];
-  if ($phase !== 'runtime') {
-    return $requirements;
-  }
-
-  // FreeUnit's SAPI registers as "cli-server" (src/nxt_php_sapi.c:299) and
-  // reports itself in SERVER_SOFTWARE as "Unit/<version>"
-  // (src/nxt_php_sapi.c:1549, src/nxt_main.h:15).
-  $software = (string) ($_SERVER['SERVER_SOFTWARE'] ?? '');
-  $on_unit = str_starts_with($software, 'Unit/');
-  $requirements['freeunit_server'] = [
-    'title' => t('FreeUnit'),
-    'value' => $on_unit ? $software : t('Not running on FreeUnit'),
-    'severity' => $on_unit ? REQUIREMENT_OK : REQUIREMENT_WARNING,
-  ];
-
-  if ($on_unit) {
-    $requirements['freeunit_finish_request'] = [
-      'title' => t('FreeUnit post-response work'),
-      'value' => function_exists('fastcgi_finish_request')
-        ? t('fastcgi_finish_request() available: kernel.terminate runs after the response is sent')
-        : t('fastcgi_finish_request() missing'),
-      'severity' => function_exists('fastcgi_finish_request') ? REQUIREMENT_OK : REQUIREMENT_WARNING,
-    ];
-  }
-
-  $settings = \Drupal::config('freeunit.settings');
-  if ($settings->get('static_cache.enabled')) {
-    $dir = (string) $settings->get('static_cache.directory');
-    $ok = is_dir($dir) && is_writable($dir);
-    $requirements['freeunit_static_cache'] = [
-      'title' => t('FreeUnit static page cache'),
-      'value' => $ok ? $dir : t('@dir is missing or not writable by the PHP workers', ['@dir' => $dir]),
-      'severity' => $ok ? REQUIREMENT_OK : REQUIREMENT_ERROR,
-    ];
-  }
-
-  if (\Drupal::moduleHandler()->moduleExists('automated_cron')) {
-    $requirements['freeunit_cron'] = [
-      'title' => t('FreeUnit cron'),
-      'value' => t('automated_cron is enabled; with a FreeUnit schedule (drush freeunit:schedule --apply) it can be uninstalled.'),
-      'severity' => REQUIREMENT_INFO,
-    ];
-  }
-
-  // FreeUnit's /status (processes, detached workers) is read by Drush
-  // (drush freeunit:status), not here: the control socket is root-only and
-  // must stay so (docs/drupal/freeunit-module.md, "Required FreeUnit
-  // changes", F3).
-  return $requirements;
+function freeunit_uninstall(): void {
+  \Drupal::service('freeunit.static_cache.invalidator')->purge();
 }

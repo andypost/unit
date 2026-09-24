@@ -15,6 +15,10 @@ use Symfony\Component\HttpFoundation\Request;
  * of routes.drupal_page in examples/unit-drupal-freeunit.json, which was
  * PUT to a local unitd and exercised by examples/check-static-cache.py.
  *
+ * Everything comes from freeunit.settings, so the route and the writer
+ * (StaticCacheWriter) agree on hosts, scheme, and the headers a cached page
+ * carries.
+ *
  * Rule order matters, and was chosen from observed router behaviour:
  * 1. Session bypass by exact cookie name.  "cookies" parses every Cookie
  *    header line (src/nxt_http_route.c:2073), so it also catches a session
@@ -22,11 +26,13 @@ use Symfony\Component\HttpFoundation\Request;
  * 2. Session bypass by "headers": {"Cookie": "*SESS*"}, for session names
  *    this generator did not foresee.  On its own it is not enough: every
  *    Cookie line must match (src/nxt_http_route.c:1962-1990).
- * 3./4. The gzip and identity shares.  A negated match cannot express
+ * 3. Authorization bypass: page_cache's request policy ignores such
+ *    requests (basic_auth), so must the router.
+ * 4./5. The gzip and identity shares.  A negated match cannot express
  *    "no session cookie": a header or cookie that is absent never matches,
  *    even "!*" (same function), so bypasses must come first as positive
  *    rules.
- * 5. Everything else goes to PHP.
+ * 6. Everything else goes to PHP.
  */
 final class RouteConfigGenerator {
 
@@ -37,20 +43,17 @@ final class RouteConfigGenerator {
   ) {}
 
   /**
-   * @param string[] $hosts
-   *   Host names to serve from the cache.
-   * @param array<string, string> $reproducedHeaders
-   *   Header values the route adds (Cache-Control, Content-Language, ...),
-   *   as a front-page response of the site sends them.
-   *
    * @return list<array<string, mixed>>
    */
-  public function build(array $hosts, array $reproducedHeaders, string $scheme = 'http'): array {
+  public function build(): array {
     $settings = $this->configFactory->get('freeunit.settings');
     $app = 'applications/' . $settings->get('control.application');
     if ((string) $settings->get('control.target') !== '') {
       $app .= '/' . $settings->get('control.target');
     }
+    $hosts = (array) $settings->get('static_cache.hosts');
+    $scheme = (string) $settings->get('static_cache.scheme');
+    $gzip = (bool) $settings->get('static_cache.gzip');
 
     $cookies = [];
     foreach ($hosts as $host) {
@@ -69,13 +72,23 @@ final class RouteConfigGenerator {
         'match' => ['headers' => ['Cookie' => '*SESS*']],
         'action' => ['pass' => $app],
       ],
+      [
+        'match' => ['headers' => ['Authorization' => '*']],
+        'action' => ['pass' => $app],
+      ],
     ];
 
-    $headers = ['X-Drupal-Cache' => 'HIT-FREEUNIT'] + $reproducedHeaders;
-    $headers['Content-Type'] = 'text/html; charset=UTF-8';
+    $headers = ['X-Drupal-Cache' => 'HIT-FREEUNIT'];
+    foreach ((array) $settings->get('static_cache.headers') as $name => $value) {
+      $headers[ucwords((string) $name, '-')] = (string) $value;
+    }
+    if ($gzip) {
+      // The route picks the variant by Accept-Encoding, so say so.
+      $headers['Vary'] = trim(($headers['Vary'] ?? '') . ', Accept-Encoding', ', ');
+    }
 
     foreach ($hosts as $host) {
-      $dir = $this->mapper->hostDirectory($scheme, $host);
+      $dir = $this->mapper->hostDirectory($host);
       if ($dir === NULL) {
         continue;
       }
@@ -85,30 +98,23 @@ final class RouteConfigGenerator {
         'scheme' => $scheme,
         'query' => '',
       ];
-      if ($settings->get('static_cache.gzip')) {
+      $action = [
+        'share' => $dir . '${uri}' . StaticCachePathMapper::SUFFIX,
+        'chroot' => $dir . '/',
+        'follow_symlinks' => FALSE,
+        'response_headers' => $headers,
+        'fallback' => ['pass' => $app],
+      ];
+      if ($gzip) {
         $routes[] = [
           'match' => $match + ['headers' => ['Accept-Encoding' => '*gzip*']],
           'action' => [
-            // FreeUnit's MIME table has no .gz entry, so no "types" here.
-            'share' => $dir . '${uri}' . StaticCachePathMapper::SUFFIX . '.gz',
-            'chroot' => $dir . '/',
-            'follow_symlinks' => FALSE,
+            'share' => $action['share'] . '.gz',
             'response_headers' => $headers + ['Content-Encoding' => 'gzip'],
-            'fallback' => ['pass' => $app],
-          ],
+          ] + $action,
         ];
       }
-      $routes[] = [
-        'match' => $match,
-        'action' => [
-          'share' => $dir . '${uri}' . StaticCachePathMapper::SUFFIX,
-          'chroot' => $dir . '/',
-          'follow_symlinks' => FALSE,
-          'types' => ['text/html'],
-          'response_headers' => $headers,
-          'fallback' => ['pass' => $app],
-        ],
-      ];
+      $routes[] = ['match' => $match, 'action' => $action];
     }
 
     $routes[] = ['action' => ['pass' => $app]];

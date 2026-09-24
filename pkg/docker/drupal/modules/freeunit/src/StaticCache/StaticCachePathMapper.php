@@ -42,9 +42,15 @@ final class StaticCachePathMapper {
   }
 
   /**
-   * The directory for one scheme and host, or NULL if the host is unusable.
+   * The directory for one host, or NULL if the host is unusable.
+   *
+   * The scheme is the configured one (what the router sees), not the
+   * request's: behind a TLS-terminating proxy Drupal says "https" while the
+   * route matches "http", and both sides must agree on the tree.
    */
-  public function hostDirectory(string $scheme, string $host): ?string {
+  public function hostDirectory(string $host): ?string {
+    $settings = $this->configFactory->get('freeunit.settings');
+    $scheme = (string) $settings->get('static_cache.scheme');
     $host = strtolower($host);
     // Host names and IPv4 literals only; the port is not part of the key
     // because the route matches on "host", which excludes the port.
@@ -75,7 +81,7 @@ final class StaticCachePathMapper {
     if (!in_array($host, array_map('strtolower', $hosts), TRUE)) {
       return NULL;
     }
-    $dir = $this->hostDirectory($request->getScheme(), $host);
+    $dir = $this->hostDirectory($host);
     if ($dir === NULL) {
       return NULL;
     }
@@ -86,7 +92,8 @@ final class StaticCachePathMapper {
    * Whether FreeUnit's $uri for this raw path is the path itself.
    */
   public function isSafePath(string $path): bool {
-    if ($path === '' || $path[0] !== '/' || strlen($path) > 1024) {
+    // 512: the index stores the absolute file name in a 1024-byte column.
+    if ($path === '' || $path[0] !== '/' || strlen($path) > 512) {
       return FALSE;
     }
     // RFC 3986 pchar minus "%" (no decoding differences), plus "/".

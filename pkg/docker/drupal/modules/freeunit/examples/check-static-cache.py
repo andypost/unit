@@ -8,7 +8,9 @@ control socket, and then checks, with a stand-in PHP script, that
   - an anonymous GET is rendered by PHP once and then served by the router
     from the static cache (identity and precompressed gzip variants);
   - a session cookie (either the exact SESS/SSESS name or any *SESS* cookie
-    on a single Cookie line), a query string or a POST always reaches PHP;
+    on a single Cookie line), an Authorization header, a query string, a
+    POST and /index.php always reach PHP;
+  - a dot-segment traversal is refused by the router, never served;
   - /freeunit/cron is 404 for clients but is reached by the schedule.
 
 Usage:
@@ -149,6 +151,9 @@ def main():
     check('gzip variant served precompressed',
           h.get('content-encoding') == 'gzip'
           and gzip.decompress(b).startswith(b'<html><body>static'))
+    check('gzip variant has the HTML content type and Vary',
+          h.get('content-type') == 'text/html; charset=UTF-8'
+          and h.get('vary') == 'Cookie, Accept-Encoding')
     s, h, b = raw_get(port, [], method='HEAD')
     check('HEAD served by the router', h.get('x-drupal-cache') == 'HIT-FREEUNIT')
     for label, lines, method, path in [
@@ -156,11 +161,19 @@ def main():
         ('secure session cookie', [f'Cookie: S{SESS}=x'], 'GET', '/node/1'),
         ('exact session cookie on a 2nd Cookie line', ['Cookie: a=1', f'Cookie: {SESS}=x'], 'GET', '/node/1'),
         ('other host session (*SESS*)', ['Cookie: SESS0123=x'], 'GET', '/node/1'),
+        ('Authorization header', ['Authorization: Basic Zm9vOmJhcg=='], 'GET', '/node/1'),
         ('query string', [], 'GET', '/node/1?page=1'),
         ('POST', ['Content-Length: 0'], 'POST', '/node/1'),
+        ('/index.php', [], 'GET', '/index.php'),
+        ('/index.php/node/1', [], 'GET', '/index.php/node/1'),
     ]:
         s, h, b = raw_get(port, lines, method, path)
         check(f'{label} reaches PHP', h.get('x-drupal-cache') == 'MISS')
+    s, h, b = raw_get(port, [], path='/%2e%2e/%2e%2e/etc/passwd')
+    check('encoded dot-segment traversal is refused', s == 400)
+    s, h, b = raw_get(port, [], path='/node/1/../../../../etc/passwd')
+    check('dot-segment traversal never leaves the cache',
+          h.get('x-drupal-cache') != 'HIT-FREEUNIT' and b'root:' not in b)
     s, h, b = raw_get(port, [], path='/freeunit/cron')
     check('/freeunit/cron is 404 for clients', s == 404)
     time.sleep(2.5)

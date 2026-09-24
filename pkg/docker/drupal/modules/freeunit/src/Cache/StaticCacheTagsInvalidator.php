@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Drupal\freeunit\Cache;
 
 use Drupal\Core\Cache\CacheTagsInvalidatorInterface;
-use Drupal\Core\Cache\CacheTagsPurgeInterface;
 use Drupal\freeunit\StaticCache\StaticCacheFiles;
 use Drupal\freeunit\StaticCache\StaticCacheIndex;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
@@ -26,7 +25,7 @@ use Symfony\Component\HttpKernel\KernelEvents;
  * this request (kernel.terminate), after the transaction has committed.  The
  * writer's own re-check against cache.page closes the rest of the window.
  */
-final class StaticCacheTagsInvalidator implements CacheTagsInvalidatorInterface, CacheTagsPurgeInterface, EventSubscriberInterface {
+final class StaticCacheTagsInvalidator implements CacheTagsInvalidatorInterface, EventSubscriberInterface {
 
   /**
    * Tags invalidated during this request, for the second pass.
@@ -57,7 +56,7 @@ final class StaticCacheTagsInvalidator implements CacheTagsInvalidatorInterface,
   }
 
   /**
-   * {@inheritdoc}
+   * Deletes every file; called from hook_cache_flush and hook_uninstall.
    */
   public function purge(): void {
     $this->files->purge();

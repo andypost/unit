@@ -1,0 +1,181 @@
+# Review of the `freeunit` module prototype
+
+Adversarial review (Drupal core maintainer + security reviewer view) of
+`pkg/docker/drupal/modules/freeunit/` as of `db54ba59`. Claims about FreeUnit
+were checked against `src/`; claims about Drupal against the reviewer's
+knowledge of 11.x/12.x (Drupal core itself is not installable here).
+
+Severity: **blocking** (must not ship, security or data-integrity), **major**
+(wrong behaviour in a common case, or an API misuse that breaks on a supported
+core), **minor** (correctness edge, dead code, simplification).
+
+## Round 1 (against `db54ba59`)
+
+Counts: blocking 1, major 6, minor 12.
+
+### Blocking
+
+- **B1. Reproduced header values are never compared, so the router serves
+  headers Drupal did not send (cache poisoning of headers).**
+  `src/EventSubscriber/StaticCacheWriter.php:127-138`,
+  `config/install/freeunit.settings.yml:12-20`,
+  `src/Drush/Commands/FreeUnitCommands.php:72-77`.
+  The writer only checks header *names* against `reproduced_headers`. The
+  route (`RouteConfigGenerator`, `unit-drupal-freeunit.json:141-150`) sends
+  one fixed value per header for every file. A French page
+  (`Content-Language: fr`) is served as `en`; a page whose `Cache-Control`
+  differs (a module that sets `private`/`max-age=0` on a `CacheableResponse`,
+  or a site whose `cache.page.max_age` is not what the route was generated
+  with) is served as `max-age=300, public`; a page with a custom `Vary` loses
+  it. Fix: one config map `static_cache.headers` (name → exact value) that is
+  the *single source* for both the writer (require equality, case-insensitive
+  name, byte-exact value) and the route generator; hard-code the drop list;
+  additionally require `Cache-Control` to contain `public` and no
+  `private`/`no-cache`/`no-store` as defence in depth.
+
+### Major
+
+- **M1. Runtime requirements use `hook_requirements('runtime')` and the
+  `REQUIREMENT_*` constants, which are deprecated in 11.2 and gone in 12,
+  while `core_version_requirement` claims `^12`.** `freeunit.install:52-102`,
+  `freeunit.info.yml:7`. On 12 the status report silently loses every
+  FreeUnit row. Fix: `#[Hook('runtime_requirements')]` in `src/Hook` with
+  `RequirementSeverity`, and `core_version_requirement: ^11.2 || ^12`.
+- **M2. No `hook_uninstall`: the files stay on disk and the FreeUnit route
+  keeps serving them, forever stale, after the module (and its invalidator)
+  is gone.** `freeunit.install`. Fix: purge in `freeunit_uninstall()`.
+- **M3. `purge()` renames the cache root aside, which needs write permission
+  on the root's *parent* directory.** `src/StaticCache/StaticCacheFiles.php:71-83`.
+  The README only requires the cache directory itself to be writable, so on
+  the documented layout every full cache flush logs "Cannot rename" and
+  leaves every file in place: stale pages after `drush cr`. Fix: delete the
+  tree's contents, keep the root.
+- **M4. Pages are written only on `X-Drupal-Cache: MISS`.**
+  `src/EventSubscriber/StaticCacheWriter.php:118`. After a purge, an expiry
+  delete, or enabling the module on a warm site, every page is a page_cache
+  HIT and is never written again until page_cache is cleared, so the static
+  cache silently stays empty. Fix: also write on HIT when the file is
+  missing (the HIT response is the stored `CacheableResponse`, so tags and
+  the cid are available).
+- **M5. `GET /index.php` is served as a static file by the docroot `share`.**
+  `examples/unit-drupal-freeunit.json:83-102` (inherited from
+  `pkg/docker/drupal/unit-drupal.json`). The `*.php → 404` rule exempts
+  `/index.php`, and the next rule is `share: /var/www/drupal/web$uri` with
+  no `types`, so the file exists and the router sends `index.php` as a file
+  instead of running Drupal. Not a secret (core file), but every
+  `/index.php` URL (clean URLs off, some crawlers) is broken. Fix: pass
+  `/index.php` and `/index.php/*` to the application before the share.
+- **M6. Invalidator + `hook_cache_flush` purge twice, and one of them relies
+  on an interface the reviewer cannot pin to a core version.**
+  `src/Cache/StaticCacheTagsInvalidator.php:29,62-65`, `src/Hook/FreeUnitHooks.php:27-30`.
+  `drupal_flush_all_caches()` always invokes `hook_cache_flush`; whether it
+  also calls `CacheTagsPurgeInterface::purge()` on collected invalidators
+  depends on the core version. Two purges are a second full tree walk per
+  `drush cr`. Fix: keep the hook, drop the interface.
+
+### Minor
+
+- **m1.** Docblock claims Drupal's front controller uses Symfony Runtime;
+  it does not (index.php calls `$response->send(); $kernel->terminate()`).
+  The conclusion still holds because `Response::send()` itself calls
+  `fastcgi_finish_request()` (which FreeUnit implements,
+  `src/nxt_php_sapi.c:228-291`, and reports as detached work). Fix comment.
+  `src/EventSubscriber/StaticCacheWriter.php:27-32`.
+- **m2.** Mapper accepts 1024-byte paths but the index column `file` is 1024
+  for the *absolute* file name, so a long URL makes `record()` throw inside
+  `kernel.terminate`. `src/StaticCache/StaticCachePathMapper.php:89`,
+  `freeunit.install:22-27`. Fix: cap the request path at 512 bytes.
+- **m3.** Behind a TLS-terminating proxy Drupal writes under `https/<host>`
+  while the route reads `http/<host>` (`build()` has a `$scheme` parameter
+  that Drush never sets). `src/StaticCache/RouteConfigGenerator.php:48`,
+  `src/Drush/Commands/FreeUnitCommands.php:68-83`. Fix: `--scheme` option.
+- **m4.** A request with an `Authorization` header (basic_auth) is served the
+  anonymous page by the router, while page_cache's request policy would have
+  bypassed. Not a leak (anonymous content only) but wrong for basic_auth
+  clients. Fix: one more bypass rule `headers: {Authorization: "*"}`.
+- **m5.** `freeunit:routes` hard-codes `Vary`, `X-Frame-Options`, ... and
+  takes hosts from `--host` instead of `static_cache.hosts`; the two can
+  disagree with what the writer accepts. Fix: generate from config only.
+- **m6.** `\Drupal::config()` static calls in injectable classes
+  (`FreeUnitCommands.php:73,113`). Fix: inject `ConfigFactoryInterface`.
+- **m7.** `CronController` uses the `ContainerInjectionInterface::create()`
+  boilerplate; core's `AutowireTrait` (10.2+) does it. `src/Controller/CronController.php:24-33`.
+- **m8.** `services.yml` sets `_defaults: autowire: true` but every service
+  lists its arguments; the `cache.page` argument cannot be autowired anyway.
+  Fix: drop `_defaults`, keep explicit arguments and the class aliases
+  (needed by the Hook class and Drush's `AutowireTrait`).
+- **m9.** Identity route has `types: [text/html]`; the file name always ends
+  in `_.html` inside a `chroot`, so the rule can never fail. Fix: drop it.
+- **m10.** `reproduced_headers` includes `x-drupal-cache` although the route
+  sends a different value on purpose; handled by B1's redesign.
+- **m11.** Narrow stale-file window: `drupal_flush_all_caches()` invokes
+  `hook_cache_flush` *before* `cache.page->deleteAll()`; a writer that
+  records, writes and re-checks between the two keeps its file while
+  page_cache is emptied. Bounded by the next invalidation of the page's
+  tags, and no wider than the window for pages rendered right after the
+  flush. Documented, not fixed.
+- **m12.** README/design text describe the pre-review header handling and
+  the rename-based purge. Update.
+
+### Verified as correct (no finding)
+
+- Cron key: travels in `X-FreeUnit-Cron-Key`, compared with `hash_equals`,
+  never logged; `ScheduleConfigGenerator::check()` prints "headers differ"
+  only; unitd's schedule validators (`src/nxt_conf_validation.c:5277-5345`)
+  never echo header values in errors. The schedule request's `REMOTE_ADDR`
+  is `127.0.0.1` (`src/nxt_router_schedule.c:474`), and a schedule can only
+  `pass` to an application (`nxt_conf_vldt_schedule_pass`), so listener
+  routes answering 404 for `/freeunit/cron*` do keep clients out.
+- Control socket: used from Drush only; the client is a plain Unix-socket
+  HTTP/1.1 client; the socket path comes from config and stays root-only.
+- Path traversal: the mapper accepts only an ASCII pchar subset without `%`,
+  refuses empty and dot segments, and the file service refuses anything not
+  under the root; the route adds `chroot` + `follow_symlinks: false`, and
+  the router rejects `%2e%2e` targets and NUL bytes in `share`
+  (`src/nxt_http_static.c:455-470`).
+- Poisoning: only `GET`, status 200, `CacheableResponseInterface`, no
+  `Set-Cookie`, no session, anonymous, no query string, `text/html`, a
+  configured host, and page_cache has just stored it; redirects, 4xx, 5xx
+  and BigPipe responses are never written.
+- Writes: `tempnam` + `chmod 0644` + `rename` in the target directory; the
+  `.gz` is written first so the gzip route never serves a `.gz` older than
+  its `.html`.
+- Tag → file mapping: recorded *before* the file exists, deleted with the
+  file, truncated on purge, expired rows removed on cron; invalidations
+  run at once and again on `kernel.terminate` (priority −50, before the
+  writer's −100), and the writer re-checks the page_cache item after the
+  write.
+- Route matching (checked against `src/nxt_http_route.c:1962-2118`): a
+  `headers` rule must match *every* line of that header and never matches an
+  absent header, so bypasses must be positive rules placed first; the
+  `cookies` rule parses all Cookie lines. `query: ""` matches no query and a
+  bare `?`. `method: [GET, HEAD]` keeps every unsafe method in PHP.
+
+### Round 1 fixes
+
+- B1: `static_cache.headers` (name → exact value) replaces
+  `reproduced_headers`/`dropped_headers`; `StaticCacheWriter` requires
+  byte-exact values, keeps a hard-coded drop list (`DROPPED`), and refuses
+  any `Cache-Control` that is not `public` or that has `private`,
+  `no-cache` or `no-store`. `RouteConfigGenerator` emits the same map (plus
+  `X-Drupal-Cache: HIT-FREEUNIT`, and `Accept-Encoding` appended to `Vary`
+  when gzip is on). The example configuration and the check script were
+  updated (the check now also asserts the gzip variant's `Content-Type` and
+  `Vary`).
+- M1: `hook_runtime_requirements` with `RequirementSeverity` in
+  `src/Hook/FreeUnitHooks.php`; `freeunit.install` keeps `hook_schema` only;
+  `core_version_requirement: ^11.2 || ^12`.
+- M2: `freeunit_uninstall()` purges the files.
+- M3: `purge()` deletes the tree's contents and keeps the root.
+- M4: a `HIT` is written when its file is missing.
+- M5: `/index.php` and `/index.php/*` pass to the application before the
+  docroot share (example configuration); the check script asserts it.
+- M6: `CacheTagsPurgeInterface` dropped; `hook_cache_flush` purges.
+- m1, m2, m4, m5, m6, m7, m8, m9, m10, m12 fixed as proposed. m3 fixed more
+  thoroughly than proposed: `static_cache.scheme` keys the file tree on both
+  sides (`StaticCachePathMapper::hostDirectory()` no longer takes the
+  request's scheme), so a TLS-terminating proxy cannot split writer and
+  route. m11 stays documented.
+- Check script additions: `Authorization` header, `/index.php`,
+  `/index.php/node/1`, an encoded dot-segment traversal (400) and a plain
+  one (normalised, falls through to PHP).

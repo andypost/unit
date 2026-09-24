@@ -17,20 +17,18 @@ freeunit.settings:
           label: 'Host names served from the cache'
           sequence:
             type: string
+        scheme:
+          type: string
+          label: 'Scheme the router sees for those hosts (http or https)'
         gzip:
           type: boolean
           label: 'Also write a precompressed .gz variant'
         max_bytes:
           type: integer
           label: 'Largest page to write, in bytes'
-        reproduced_headers:
+        headers:
           type: sequence
-          label: 'Headers the route reproduces'
-          sequence:
-            type: string
-        dropped_headers:
-          type: sequence
-          label: 'Headers that may be dropped'
+          label: 'Response headers (lower-case name: exact value) the route reproduces'
           sequence:
             type: string
     control:

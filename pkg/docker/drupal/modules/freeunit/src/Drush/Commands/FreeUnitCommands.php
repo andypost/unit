@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Drupal\freeunit\Drush\Commands;
 
+use Consolidation\AnnotatedCommand\Hooks\HookManager;
+use Drupal\Core\Config\ConfigFactoryInterface;
 use Drupal\freeunit\Cache\StaticCacheTagsInvalidator;
 use Drupal\freeunit\Control\ControlApiClient;
 use Drupal\freeunit\Schedule\ScheduleConfigGenerator;
@@ -11,7 +13,6 @@ use Drupal\freeunit\StaticCache\RouteConfigGenerator;
 use Drush\Attributes as CLI;
 use Drush\Commands\AutowireTrait;
 use Drush\Commands\DrushCommands;
-use Consolidation\AnnotatedCommand\Hooks\HookManager;
 
 /**
  * Drush commands for FreeUnit.
@@ -27,6 +28,7 @@ final class FreeUnitCommands extends DrushCommands {
   use AutowireTrait;
 
   public function __construct(
+    private readonly ConfigFactoryInterface $configFactory,
     private readonly ControlApiClient $client,
     private readonly ScheduleConfigGenerator $schedules,
     private readonly RouteConfigGenerator $routes,
@@ -38,9 +40,8 @@ final class FreeUnitCommands extends DrushCommands {
   #[CLI\Command(name: 'freeunit:status')]
   #[CLI\Help(description: 'Show FreeUnit /status for the Drupal application.')]
   public function status(): void {
-    $app = $this->appName();
     $this->io()->writeln(json_encode(
-      $this->client->get('/status/applications/' . rawurlencode($app)),
+      $this->client->get('/status/applications/' . rawurlencode($this->appName())),
       JSON_PRETTY_PRINT,
     ));
   }
@@ -62,19 +63,10 @@ final class FreeUnitCommands extends DrushCommands {
   }
 
   #[CLI\Command(name: 'freeunit:routes')]
-  #[CLI\Help(description: 'Print the drupal_page route for the static cache (JSON), or PUT it with --apply.')]
-  #[CLI\Option(name: 'host', description: 'Comma-separated host names.')]
+  #[CLI\Help(description: 'Print the drupal_page route for the static cache (JSON, from freeunit.settings), or PUT it with --apply.')]
   #[CLI\Option(name: 'apply', description: 'PUT to /config/routes/drupal_page.')]
-  public function routes(array $options = ['host' => NULL, 'apply' => FALSE]): void {
-    $hosts = array_filter(explode(',', (string) $options['host']));
-    // A real implementation fetches the front page anonymously and takes
-    // the reproduced header values from that response.
-    $routes = $this->routes->build($hosts, [
-      'Cache-Control' => 'max-age=' . (int) \Drupal::config('system.performance')->get('cache.page.max_age') . ', public',
-      'Vary' => 'Cookie, Accept-Encoding',
-      'X-Content-Type-Options' => 'nosniff',
-      'X-Frame-Options' => 'SAMEORIGIN',
-    ]);
+  public function routes(array $options = ['apply' => FALSE]): void {
+    $routes = $this->routes->build();
     if ($options['apply']) {
       $this->client->putPath('/config/routes/drupal_page', $routes);
       return;
@@ -110,7 +102,7 @@ final class FreeUnitCommands extends DrushCommands {
   }
 
   private function appName(): string {
-    return (string) \Drupal::config('freeunit.settings')->get('control.application');
+    return (string) $this->configFactory->get('freeunit.settings')->get('control.application');
   }
 
 }

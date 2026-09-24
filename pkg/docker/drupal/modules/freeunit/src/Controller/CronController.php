@@ -5,9 +5,9 @@ declare(strict_types=1);
 namespace Drupal\freeunit\Controller;
 
 use Drupal\Core\CronInterface;
+use Drupal\Core\DependencyInjection\AutowireTrait;
 use Drupal\Core\DependencyInjection\ContainerInjectionInterface;
 use Drupal\Core\State\StateInterface;
-use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
@@ -19,18 +19,18 @@ use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
  *
  * Answers 404, not 403, to anything that is not a keyed loopback request, so
  * the route looks like it does not exist.  A schedule run comes from
- * 127.0.0.1 (ADR 0004 section 6.5, and observed on a local unitd).
+ * 127.0.0.1 (src/nxt_router_schedule.c:474).  REMOTE_ADDR is read raw, not
+ * through Request::getClientIp(), so a trusted reverse proxy setting cannot
+ * make a forwarded request look local.
  */
 final class CronController implements ContainerInjectionInterface {
+
+  use AutowireTrait;
 
   public function __construct(
     private readonly CronInterface $cron,
     private readonly StateInterface $state,
   ) {}
-
-  public static function create(ContainerInterface $container): static {
-    return new static($container->get('cron'), $container->get('state'));
-  }
 
   public function run(Request $request): Response {
     $key = (string) $this->state->get('system.cron_key');

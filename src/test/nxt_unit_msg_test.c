@@ -42,6 +42,8 @@
 
 
 static int             nxt_unit_msg_test_failures;
+static int             nxt_unit_msg_test_send_fails;
+static int             nxt_unit_msg_test_quit_called;
 static nxt_unit_ctx_t  *nxt_unit_msg_test_ctx;
 
 
@@ -70,7 +72,7 @@ static ssize_t
 nxt_unit_msg_test_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     const void *buf, size_t buf_size, const void *oob, size_t oob_size)
 {
-    return buf_size;
+    return nxt_unit_msg_test_send_fails ? -1 : (ssize_t) buf_size;
 }
 
 
@@ -269,6 +271,58 @@ nxt_unit_msg_test_segment_case(void *data)
 }
 
 
+static void
+nxt_unit_msg_test_quit(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_msg_test_quit_called = 1;
+}
+
+
+/*
+ * A record for a segment libunit does not have parks the read buffer on
+ * that segment's wait queue, counts it in wait_items, and asks the router
+ * for the segment.  When that request cannot be sent the message fails and
+ * the buffer goes back to the free list -- which it used to do while still
+ * linked into the wait queue and still counted, so a graceful quit, which
+ * waits for wait_items to drain, never happened.
+ */
+static int
+nxt_unit_msg_test_get_mmap_fail_case(void *data)
+{
+    int                  rc;
+    u_char               buf[sizeof(nxt_port_msg_t) + 1];
+    nxt_port_msg_t       msg;
+    nxt_port_mmap_msg_t  rec;
+
+    rec.mmap_id = 5;
+    rec.chunk_id = 0;
+    rec.size = 100;
+
+    nxt_unit_msg_test_send_fails = 1;
+    rc = nxt_unit_msg_test_send_records(&rec, 1, 0);
+    nxt_unit_msg_test_send_fails = 0;
+
+    if (rc != NXT_UNIT_ERROR) {
+        return 1;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+
+    msg.pid = getpid();
+    msg.type = _NXT_PORT_MSG_QUIT;
+    msg.last = 1;
+
+    memcpy(buf, &msg, sizeof(msg));
+    buf[sizeof(msg)] = NXT_PORT_QUIT_GRACEFUL;
+
+    (void) nxt_unit_test_process_msg(nxt_unit_msg_test_ctx, buf, sizeof(buf),
+                                     -1);
+
+    return nxt_unit_msg_test_quit_called ? NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK)
+                                         : 2;
+}
+
+
 int
 main(void)
 {
@@ -293,6 +347,7 @@ main(void)
     init.callbacks.request_handler = nxt_unit_msg_test_handler;
     init.callbacks.port_send = nxt_unit_msg_test_send;
     init.callbacks.port_recv = nxt_unit_msg_test_recv;
+    init.callbacks.quit = nxt_unit_msg_test_quit;
 
     init.ready_port.id.pid = getpid();
     init.ready_port.id.id = 1;
@@ -423,6 +478,11 @@ main(void)
         nxt_unit_msg_test_in_child(nxt_unit_msg_test_segment_case, &seg)
         == NXT_UNIT_MSG_TEST_RC(NXT_UNIT_ERROR),
         "segment longer than PORT_MMAP_SIZE is refused");
+
+    nxt_unit_msg_test_assert(
+        nxt_unit_msg_test_in_child(nxt_unit_msg_test_get_mmap_fail_case, NULL)
+        == NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK),
+        "failed get_mmap does not block a graceful quit");
 
     if (nxt_unit_msg_test_failures != 0) {
         printf("unit msg test: %d failure(s)\n", nxt_unit_msg_test_failures);

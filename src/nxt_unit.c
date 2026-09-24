@@ -4992,7 +4992,29 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
     if (need_rbuf) {
         res = nxt_unit_get_mmap(ctx, pid, id);
         if (nxt_slow_path(res == NXT_UNIT_ERROR)) {
-            return NXT_UNIT_ERROR;
+            /*
+             * The caller releases rbuf on ERROR, so take it back off the
+             * wait queue first -- unless the segment arrived meanwhile and
+             * nxt_unit_incoming_mmap() already took it, in which case it
+             * is pending and still ours to wait on.
+             */
+            pthread_mutex_lock(&mmaps->mutex);
+
+            if (mmaps->elts[id].hdr == NULL) {
+                nxt_queue_remove(&rbuf->link);
+                res = NXT_UNIT_ERROR;
+
+            } else {
+                res = NXT_UNIT_AGAIN;
+            }
+
+            pthread_mutex_unlock(&mmaps->mutex);
+
+            if (res == NXT_UNIT_ERROR) {
+                nxt_atomic_fetch_add(&ctx_impl->wait_items, -1);
+            }
+
+            return res;
         }
     }
 

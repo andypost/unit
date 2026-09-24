@@ -1491,6 +1491,7 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
      * co-located with arrival makes the trust boundary explicit.
      */
     {
+        void                *name, *value;
         uint32_t            i;
         nxt_unit_request_t  *vr = recv_msg->start;
         uint32_t            vsize = recv_msg->size;
@@ -1545,20 +1546,22 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
          * Field strings must also lie past fields[]: the router puts them
          * there, and nxt_unit_request_group_dup_fields() moves fields one
          * slot on by subtracting sizeof(nxt_unit_field_t) from their
-         * offsets, which a target inside fields[] would underflow.
+         * offsets, which a target inside fields[] would underflow.  The
+         * pointers the check returns are used, not the sptr read again:
+         * the peer can change the offset between two reads.
          */
         for (i = 0; i < vr->fields_count; i++) {
-            if (nxt_slow_path(
-                   !nxt_unit_sptr_in_buf(&vr->fields[i].name,
-                                         vr->fields[i].name_length,
-                                         recv_msg->start, vsize)
-                || !nxt_unit_sptr_in_buf(&vr->fields[i].value,
+            name = nxt_unit_sptr_in_buf(&vr->fields[i].name,
+                                        vr->fields[i].name_length,
+                                        recv_msg->start, vsize);
+            value = nxt_unit_sptr_in_buf(&vr->fields[i].value,
                                          vr->fields[i].value_length,
-                                         recv_msg->start, vsize)
-                || nxt_unit_sptr_get(&vr->fields[i].name)
-                   < (void *) &vr->fields[vr->fields_count]
-                || nxt_unit_sptr_get(&vr->fields[i].value)
-                   < (void *) &vr->fields[vr->fields_count]))
+                                         recv_msg->start, vsize);
+
+            if (nxt_slow_path(name == NULL || value == NULL
+                              || name < (void *) &vr->fields[vr->fields_count]
+                              || value < (void *) &vr->fields[vr->fields_count]
+               ))
             {
                 nxt_unit_warn(ctx, "#%"PRIu32": malformed request: field "
                               "%"PRIu32" sptr out of buffer",

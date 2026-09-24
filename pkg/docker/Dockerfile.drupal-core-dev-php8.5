@@ -1,22 +1,7 @@
-# FreeUnit Drupal core dev kit, PHP 8.5.
+# FreeUnit Drupal core dev kit, PHP 8.5: pkg/docker/drupal/README.md.
 #
-# Hand-written, like Dockerfile.builder-*: it is not generated from
-# template.Dockerfile, and the Makefile has an empty rule for it so that
-# `make` never overwrites it.  It layers on the published php-8.5 variant
-# rather than building FreeUnit again, so unitd, unitd-debug, the php module
-# and docker-entrypoint.sh are exactly the ones in that image.
-#
-# Build (context is pkg/docker, as for every other variant):
-#
-#   docker build -f Dockerfile.drupal-core-dev-php8.5 \
-#       -t freeunit:1.36.1-drupal-core-dev-php8.5 .
-#
-# or `make build-drupal-core-dev-php8.5`.  To layer on a locally built base
-# (`make build-php-8.5`, tag unit:<version>-php-8.5):
-#
-#   docker build --build-arg BASE_IMAGE=unit:1.36.1-php-8.5 ...
-#
-# Usage: pkg/docker/drupal/README.md.
+# Hand-written (the Makefile has an empty rule for it), and layered on the
+# published php-8.5 image rather than building FreeUnit again.
 
 ARG FREEUNIT_VERSION=1.36.1
 ARG BASE_IMAGE=ghcr.io/freeunitorg/freeunit:${FREEUNIT_VERSION}-php-8.5
@@ -38,15 +23,8 @@ LABEL org.opencontainers.image.documentation="https://github.com/freeunitorg/fre
 LABEL org.opencontainers.image.vendor="FreeUnit Community <team@freeunit.org>"
 LABEL org.opencontainers.image.version="${FREEUNIT_VERSION}"
 
-# PHP extensions.  php:8.5-cli already has pdo_sqlite, sqlite3, mbstring,
-# dom, xml, simplexml, curl, openssl, sodium, and OPcache, which PHP 8.5
-# always builds in; the opcache line below is a no-op there and only matters
-# if BASE_IMAGE is ever an older PHP.  Everything is built with the official
-# image's docker-php-ext-* helpers, so the ini files land in the conf.d that
-# both the CLI and the embed SAPI (FreeUnit's php module) read.
-#
-# The build dependencies are removed again the way the official php image
-# does it: keep only the runtime libraries the new .so files link against.
+# PHP extensions, with the official image's docker-php-ext-* helpers; the
+# build dependencies are removed again the way that image does it.
 RUN set -eux \
     && savedAptMark="$(apt-mark showmanual)" \
     && apt-get update \
@@ -72,18 +50,13 @@ RUN set -eux \
     && apt-get install -y --no-install-recommends \
          git unzip sqlite3 patch less procps openssh-client \
     && rm -rf /var/lib/apt/lists/* \
-    && php -m | grep -qx gd \
-    && php -m | grep -qx intl \
-    && php -m | grep -qx zip \
-    && php -m | grep -qx pdo_mysql \
-    && php -m | grep -qx pdo_pgsql \
-    && php -m | grep -qx pdo_sqlite \
+    && for m in gd intl zip pdo_mysql pdo_pgsql pdo_sqlite; do \
+         php -m | grep -qx "$m" || exit 1; done \
     && php -d zend_extension=xdebug -m | grep -qx xdebug \
     && ! php -m | grep -qx xdebug
 
 # Composer, checked against the checksum published next to it.
-# TODO: pin the SHA-256 in this file once it can be fetched from a network the
-# image is reviewed on; the same-origin checksum only proves the transfer.
+# TODO: pin the SHA-256 here; the same-origin checksum only proves the transfer.
 RUN set -eux \
     && curl -fsSL -o /usr/local/bin/composer \
          "https://getcomposer.org/download/${COMPOSER_VERSION}/composer.phar" \
@@ -92,9 +65,7 @@ RUN set -eux \
     && chmod 755 /usr/local/bin/composer \
     && composer --version
 
-# drupal/coder (phpcs with the Drupal and DrupalPractice standards) outside
-# any project, so `lint` works offline and on projects that do not require it.
-# A core clone brings its own through require-dev, and `lint` prefers that.
+# drupal/coder outside any project, so `lint` works offline.
 RUN set -eux \
     && mkdir -p /opt/drupal-tools \
     && cd /opt/drupal-tools \
@@ -119,8 +90,6 @@ ENV DRUPAL_BASE=/var/www/drupal \
     DRUPAL_DOCROOT=/var/www/drupal/web \
     SIMPLETEST_BASE_URL=http://localhost \
     SIMPLETEST_DB=sqlite://localhost//tmp/test.sqlite \
-    XDEBUG=0 \
-    UNITD=unitd \
     PATH=/var/www/drupal/vendor/bin:/var/www/drupal/web/vendor/bin:/opt/drupal-tools/vendor/bin:$PATH
 
 WORKDIR /var/www/drupal

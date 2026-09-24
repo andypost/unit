@@ -7,7 +7,7 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        another PHP application. Each schedule names a "pass"
        ("applications/<name>", not a route or an upstream in v1), a "uri"
        sent as a "GET", an "interval" in seconds, and optional "jitter",
-       "timeout", "overlap" ("skip", the default, or "queue"), extra
+       "timeout", "overlap" ("skip"), extra
        "headers" and "run_on_start". A run is an ordinary application
        request: it is counted in "/status" "requests.total", goes through
        "limits" and the application queue, and is recorded in the access

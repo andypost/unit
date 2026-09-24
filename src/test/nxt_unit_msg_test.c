@@ -323,6 +323,63 @@ nxt_unit_msg_test_get_mmap_fail_case(void *data)
 }
 
 
+static int
+nxt_unit_msg_test_count_maps(void)
+{
+    int   n;
+    char  line[512];
+    FILE  *f;
+
+    f = fopen("/proc/self/maps", "r");
+    if (f == NULL) {
+        return -1;
+    }
+
+    n = 0;
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        n += (strstr(line, "unit.msg.test") != NULL);
+    }
+
+    fclose(f);
+
+    return n;
+}
+
+
+/*
+ * A segment with an id libunit already has must not leak a mapping.  The
+ * first one stays: buffers may still point into it.
+ */
+static int
+nxt_unit_msg_test_dup_id_case(void *data)
+{
+    int                  i, before, after;
+    nxt_port_mmap_msg_t  rec;
+
+    before = nxt_unit_msg_test_count_maps();
+
+    for (i = 0; i < 3; i++) {
+        if (nxt_unit_msg_test_send_segment(PORT_MMAP_SIZE, 0) != NXT_UNIT_OK) {
+            return 1;
+        }
+    }
+
+    after = nxt_unit_msg_test_count_maps();
+
+    if (before < 0 || after != before) {
+        printf("unit msg test: %d segment mappings, was %d\n", after, before);
+        return 2;
+    }
+
+    rec.mmap_id = 0;
+    rec.chunk_id = 0;
+    rec.size = 100;
+
+    return NXT_UNIT_MSG_TEST_RC(nxt_unit_msg_test_send_records(&rec, 1, 0));
+}
+
+
 int
 main(void)
 {
@@ -483,6 +540,11 @@ main(void)
         nxt_unit_msg_test_in_child(nxt_unit_msg_test_get_mmap_fail_case, NULL)
         == NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK),
         "failed get_mmap does not block a graceful quit");
+
+    nxt_unit_msg_test_assert(
+        nxt_unit_msg_test_in_child(nxt_unit_msg_test_dup_id_case, NULL)
+        == NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK),
+        "duplicate segment id does not leak a mapping");
 
     if (nxt_unit_msg_test_failures != 0) {
         printf("unit msg test: %d failure(s)\n", nxt_unit_msg_test_failures);

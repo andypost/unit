@@ -4841,6 +4841,18 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
 
         rc = NXT_UNIT_ERROR;
 
+    } else if (nxt_slow_path(mm->hdr != NULL)) {
+        /*
+         * A duplicate id: buffers may point into the segment already
+         * there, so it stays and the new mapping goes.
+         */
+        nxt_unit_warn(ctx, "incoming_mmap: duplicate segment id %"PRIu32,
+                      id);
+
+        munmap(mem, PORT_MMAP_SIZE);
+
+        rc = NXT_UNIT_OK;
+
     } else {
         mm->hdr = hdr;
 

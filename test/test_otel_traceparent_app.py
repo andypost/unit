@@ -168,3 +168,20 @@ def test_traceparent_inherited_with_otel():
         'the app must see FreeUnit\'s own span id as parent-id, not the '
         'client-supplied parent-id it sent in'
     )
+
+
+def test_traceparent_malformed_replaced_with_otel():
+    """Telemetry configured, inbound traceparent malformed: the app must
+    see exactly one traceparent, the freshly generated one."""
+    client.load('traceparent')
+    _configure_telemetry_or_skip()
+
+    seen = _seen_traceparent(
+        headers={
+            'Host': 'localhost',
+            'traceparent': 'not-a-traceparent',
+            'Connection': 'close',
+        }
+    )
+
+    assert TRACEPARENT_RE.match(seen), f'not a single valid one: {seen!r}'

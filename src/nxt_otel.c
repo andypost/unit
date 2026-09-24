@@ -198,24 +198,20 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
      */
     nxt_otel_rs_copy_traceparent(traceval, r->otel->trace);
 
-    if (r->otel->trace_id != NULL) {
-        /*
-         * An inbound traceparent field is already queued for forwarding to
-         * the peer/app verbatim; skip it so only the rewritten value below
-         * goes out.
-         */
-        nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields,
-                             r->fields)
+    /*
+     * Any inbound traceparent, valid or not, is replaced by the value
+     * below, so the peer/app never sees two of them.
+     */
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields)
+    {
+        if (f->name_length == nxt_length("traceparent")
+            && nxt_memcasecmp(f->name, "traceparent",
+                              nxt_length("traceparent")) == 0)
         {
-            if (f->name_length == nxt_length("traceparent")
-                && nxt_memcasecmp(f->name, "traceparent",
-                                  nxt_length("traceparent")) == 0)
-            {
-                f->skip = 1;
-            }
+            f->skip = 1;
+        }
 
-        } nxt_http_fields_loop;
-    }
+    } nxt_http_fields_loop;
 
     /*
      * nxt_list_add() hands out non-zeroed memory: garbage skip/hopbyhop

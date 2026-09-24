@@ -6,8 +6,7 @@ process involved. The typical use is a cron trigger for a PHP application
 such as Drupal, in place of `automated_cron`, a host cron job running
 `curl`, or a worker loop inside the application.
 
-The design rationale is in [ADR 0004](adr/0004-schedules.md); this page is
-the operator-facing reference.
+Design: [ADR 0004](adr/0004-schedules.md).
 
 ## Configuration
 
@@ -54,31 +53,12 @@ run has no body and no connection, so these have nothing to act on. Header
 values may not contain control characters, and all headers together are
 limited to 8192 bytes.
 
-### Drupal example
+### Drupal
 
-Drupal's cron endpoint is `/cron/{cron_key}`, where `cron_key` comes from
-`state.get('system.cron_key')`. Drupal's `trusted_host_patterns` setting
-checks the `Host` header, and rejects requests whose `Host` it does not
-trust; a schedule run with no `headers.Host` set falls back to
-`server_name` `localhost`, which will usually fail that check. Set
-`headers.Host` to a host `trusted_host_patterns` accepts:
-
-```json
-"schedules": {
-    "drupal-cron": {
-        "pass": "applications/drupal/index",
-        "uri": "/cron/SECRET_KEY",
-        "interval": 300,
-        "jitter": 15,
-        "timeout": 240,
-        "overlap": "skip",
-        "headers": { "Host": "example.org" }
-    }
-}
-```
-
-Then remove `automated_cron` from Drupal's cron settings, since the
-schedule replaces it.
+The example above targets Drupal's `/cron/{cron_key}`, with the key from
+`state.get('system.cron_key')`. Set `headers.Host` to a host
+`trusted_host_patterns` accepts: without it `server_name` is `localhost`.
+Then uninstall `automated_cron`.
 
 ## Semantics
 
@@ -111,49 +91,29 @@ Each schedule has its own `timeout`, independent of the application's
 - the schedule then answers itself with a synthetic `503` for logging
   purposes and is free to run again at its next interval.
 
+## Status
+
+`/status/schedules` has, per schedule, `runs`, `skipped`, `failed`,
+`timed_out`, `running`, `last_start` (Unix time), `last_status` and
+`last_duration_ms`. It is absent when no schedule is configured. Runs also
+count in `requests.total`.
+
 ## Caveats
 
-- **A timeout does not stop the application.** `timeout` only frees the
-  *schedule* to run again; it never signals or kills the worker process
-  running the overdue request. A 10-minute cron job with a 4-minute
-  `timeout` keeps running in the background for the full 10 minutes, and
-  that worker still counts against the application's `processes` capacity
-  for as long as it runs and does not answer. Keep the schedule `timeout`
-  at or below the application's `limits.timeout`, and give the application
-  enough spare `processes` that a long-running schedule does not starve
-  ordinary visitor traffic.
+- **A timeout does not stop the application.** The worker keeps running the
+  overdue request and still counts against `processes`. Keep the schedule
+  `timeout` at or below the application's `limits.timeout`, and leave enough
+  `processes` for visitors.
 
-- **The access log contains the full URI, including any secret in it.** A
-  schedule run goes through the same access log as a client request, and
-  the default format logs the request line verbatim — so
-  `/cron/SECRET_KEY` appears in the log exactly as configured. If the log
-  is shared with other tooling or shipped off-host, either use a
-  restrictive `access_log` `format` that omits `$request_line`/`$uri`, or
-  give the schedule's application (or its listener/route) its own
-  route-level access log that a wider audience does not see. FreeUnit's own
-  `info`-level log line abbreviates the URI to everything up to the last
-  `/`, plus `…`; the full URI is only logged at `debug`.
+- **The access log contains the full URI, including any secret in it.** Use
+  an `access_log` `format` without `$request_line` and `$uri` if the log is
+  shared. The `info` log line shows the URI only up to its last `/`.
 
-- **`fastcgi_finish_request()` makes a run "finish" early.** If the
-  application sends its response and keeps running afterwards — which is
-  exactly what PHP's `fastcgi_finish_request()` does, and what Drupal's own
-  `automated_cron` relies on — the schedule considers the run complete as
-  soon as the response is sent, not when the application actually stops
-  working. This means `overlap: "skip"` does not protect against
-  overlapping with that trailing work: a second run can start, and be
-  counted as non-overlapping, while the first run's worker is still busy
-  behind the scenes. `/cron/{cron_key}` itself does not call
-  `fastcgi_finish_request()`, so this caveat matters most for schedules
-  that target endpoints modeled after `automated_cron`, not the dedicated
-  cron endpoint.
+- **`fastcgi_finish_request()` makes a run finish early.** The run is
+  complete once the response is sent, so `overlap: "skip"` does not cover
+  work the application does afterwards, as `automated_cron`-style endpoints
+  do. Drupal's `/cron/{cron_key}` does not.
 
-- **Schedule state does not survive a router restart.** Whether a run is in
-  flight is kept only in memory. After a router
-  restart, a `run_on_start` schedule fires again as if it were new, even if
-  a run from before the restart is still executing as an orphaned worker.
-
-- **Runs count in `/status` `requests.total`.** A schedule run is an
-  ordinary application request as far as accounting is concerned: it
-  increments the same request counter a client request would. Per-schedule
-  counters (runs, skipped, failed, timed out) are a separate, later
-  addition to `/status`.
+- **Schedule state does not survive a restart.** A `run_on_start` schedule
+  fires again, even if a run from before is still executing in an orphaned
+  worker.

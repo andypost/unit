@@ -1,7 +1,6 @@
 # USDT tracepoints (N3/N4 observability)
 
-Status: implemented. See `docs/observability/usdt-plan.md` for the original
-analysis this follows.
+Status: implemented.
 
 ## Building with USDT
 
@@ -92,8 +91,7 @@ request's lifetime and costs nothing extra to obtain.
 
 `queue-enqueue`/`queue-dequeue` are on the *app-level* SHM queue
 (`nxt_app_queue_t`, router-to-worker), not the lower-level `nxt_nncq_t`
-ring it is built on -- see the "Follow-ups" note in `usdt-plan.md` if a
-second pair on the raw ring is wanted later.
+ring it is built on.
 
 `process-spawn` only fires in the parent, once per `fork()`, right after
 the existing `nxt_debug(task, "fork(%s): %PI", ...)` line -- not
@@ -183,15 +181,3 @@ Each script's header comment repeats this caveat and gives its `-p`/`-c`
 usage. Re-check them against a real `--usdt` binary on a host with BPF
 access (e.g. `bpftrace -l` first to confirm probe names, then a short
 attach) before trusting their output.
-
-## Day-3 follow-ups
-
-- Wire `queue-enqueue`/`queue-dequeue` into the N4 `/status` design
-  (`docs/observability/status-extensions.md`) as the source of a live
-  queue-depth counter, if that design is picked up next.
-- Consider a second `process-spawn`-style probe at
-  `nxt_process_start()` (`src/nxt_process.c`, the boot-time sibling of
-  `nxt_process_create()`) if boot-time spawn needs to be distinguished
-  from steady-state respawn, per the original plan's note.
-- Run the three `.bt` scripts for real once a host with BPF access is
-  available, and record actual output/latency numbers here.

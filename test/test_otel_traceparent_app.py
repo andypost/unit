@@ -7,8 +7,7 @@ app process's request environment (`$_SERVER['HTTP_TRACEPARENT']` in PHP,
 `environ['HTTP_TRACEPARENT']` in a WSGI app) carries the same header --
 either the one the client sent, or a freshly generated one when telemetry
 is configured and the client sent none (src/nxt_otel.c,
-nxt_otel_propagate_header(); see docs/observability/usdt-plan.md and the
-traceparent parsing/forwarding described for src/nxt_otel.c:170 and :633).
+nxt_otel_propagate_header()).
 
 Without --otel (or with --otel but no "settings.telemetry" configured),
 r->otel stays NULL for every request (src/nxt_http_request.c) and

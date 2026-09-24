@@ -59,8 +59,7 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
      * OTel is built in and currently configured, and "schedules" when at
      * least one schedule is configured.  Both are omitted rather than
      * zeroed/emptied otherwise, so a build or a configuration without them
-     * reports exactly what it did before (docs/observability/
-     * status-extensions.md).
+     * reports exactly what it did before.
      */
     status = nxt_conf_create_object(mp, 4 + (report->otel_configured != 0)
                                         + (report->schedules_count != 0));

@@ -1062,7 +1062,7 @@ nxt_router_schedule_parse(nxt_mp_t *mp, nxt_str_t *request,
 
 
 /*
- * /status (docs/observability/status-extensions.md), on the main engine
+ * /status (docs/unit-openapi.yaml, statusSchedules), on the main engine
  * like the states themselves.  A removed schedule whose last run is still
  * in flight is included until that run ends.
  */

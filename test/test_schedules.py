@@ -767,7 +767,7 @@ def test_schedules_run_lifecycle():
     assert not live, f'configurations never destroyed: {live}'
 
 
-# /status "schedules" (docs/observability/status-extensions.md).
+# /status "schedules".
 
 
 def status_schedules():

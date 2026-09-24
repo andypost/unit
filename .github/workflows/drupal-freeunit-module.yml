@@ -86,6 +86,8 @@ jobs:
             "drush/drush:^13.8 || ^14@dev"
           composer require --dev --no-update "drupal/core-dev:${{ matrix.core }}"
           composer update --no-interaction --no-progress -W
+          # 12.x dists leave out core/tests (the test base classes).
+          [ -d web/core/tests ] || composer reinstall --prefer-install=source drupal/core
           composer show | grep -E '^(drupal/core|drush/drush) '
           mkdir -p web/modules/custom web/sites/simpletest/browser_output
           cp -r "$GITHUB_WORKSPACE/$MODULE" web/modules/custom/freeunit
@@ -200,13 +202,15 @@ jobs:
           # Response headers, lower-cased, one per line.
           hdr() { curl -s -o /dev/null -D - "$@" | tr -d '\r' | tr 'A-Z' 'a-z'; }
           has() { grep -x -- "$1" >/dev/null; }
+          hasnt() { ! grep -x -- "$1" >/dev/null; }
           hdr "$u" | has 'x-drupal-cache: miss'
           for i in $(seq 50); do [ -f "$file" ] && break; sleep 0.1; done
           hdr "$u" | has 'x-drupal-cache: hit-freeunit'
           hdr -H 'Accept-Encoding: gzip' "$u" | has 'content-encoding: gzip'
           cmp <(curl -s "$u") <(curl -s -H 'Accept-Encoding: gzip' "$u" | gunzip)
           cmp <(curl -s "$u") "$file"
-          hdr -H 'Cookie: SESSabc=1' "$u" | has 'x-drupal-cache: hit'
+          # A session cookie bypasses the router (and page_cache).
+          hdr -H 'Cookie: SESSabc=1' "$u" | hasnt 'x-drupal-cache: hit-freeunit'
           hdr "$u?x=1" | has 'x-drupal-cache: miss'
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/freeunit/cron)" = 404
           # Editing the node deletes the file; the next request is PHP again.
@@ -230,7 +234,9 @@ jobs:
       ##
 
       - name: Install hey
-        run: go install github.com/rakyll/hey@latest
+        run: |
+          command -v go >/dev/null || sudo apt-get install -y golang-go
+          go install github.com/rakyll/hey@latest
 
       - name: Measure under FreeUnit and nginx + php-fpm
         working-directory: ${{ env.SITE }}
@@ -271,7 +277,7 @@ jobs:
             }
           }
           EOF
-          nginx -c "$RUN/nginx.conf" -p "$RUN"
+          nginx -e "$RUN/nginx.log" -c "$RUN/nginx.conf" -p "$RUN"
           export HEY="$(go env GOPATH)/bin/hey"
           python3 - <<'EOF'
           import json, os, re, statistics, subprocess, time
@@ -338,7 +344,6 @@ jobs:
             ${{ env.SITE }}/drupal-freeunit-metrics.json
             ${{ env.SITE }}/web/sites/simpletest/browser_output
             ${{ runner.temp }}/unit/*.log
-            ${{ runner.temp }}/unit/*.json
           if-no-files-found: ignore
 
       - name: Logs

@@ -118,8 +118,11 @@ def main():
     conf = json.loads(raw)
     conf['listeners'] = {f'127.0.0.1:{port}': {'pass': 'routes/drupal'}}
     app = conf['applications']['drupal']
-    app['user'] = pwd.getpwuid(os.getuid()).pw_name
-    app['group'] = grp.getgrgid(os.getgid()).gr_name
+    del app['user'], app['group']
+    if os.geteuid() == 0:
+        # An unprivileged unitd refuses any "user", even its own.
+        app['user'] = pwd.getpwuid(os.getuid()).pw_name
+        app['group'] = grp.getgrgid(os.getgid()).gr_name
     app['environment'] = {'CACHE_DIR': cache}
     del app['options']['file']
     sched = conf['schedules']['drupal-cron']

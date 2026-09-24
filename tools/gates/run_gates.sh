@@ -17,7 +17,8 @@ set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit
 
 GATES=1,2,3,5,6
-SLICE="test_asgi_websockets.py test_java_websockets.py"
+# Tests that need no language module: G1 builds none.
+SLICE="test_static.py test_variables.py test_return.py"
 FUZZ_SECONDS=20
 PYTEST=/root/.local/bin/pytest
 FAILED=0
@@ -72,7 +73,12 @@ gate_1() {
 
 gate_2() {
     run 2 build make -j2 \
-        && run 2 pytest sh -c "cd test && $PYTEST $SLICE"
+        && run 2 pytest sh -c "cd test && $PYTEST $SLICE" \
+        || return 1
+
+    # A slice whose every test is skipped exits 0 too.
+    grep -qE '\b[1-9][0-9]* passed\b' /tmp/g2-pytest.log \
+        || fail 2 "no test ran, see /tmp/g2-pytest.log"
 }
 
 gate_3() {

@@ -667,8 +667,6 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
 
     nxt_debug(task, "fork(%s): %PI", process->name, pid);
 
-    NXT_USDT(process__spawn, pid);
-
 #if (NXT_HAVE_LINUX_NS)
     if (use_pidns) {
         pid = nxt_process_recv_pid(pid_pipe, gc_pipe);
@@ -677,6 +675,9 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
         }
     }
 #endif
+
+    /* After the pid namespace dance: this is the child's global pid. */
+    NXT_USDT(process__spawn, pid);
 
     process->pid = pid;
     process->isolated_pid = pid;

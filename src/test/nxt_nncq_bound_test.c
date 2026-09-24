@@ -54,12 +54,22 @@ nxt_nncq_bound_test_port_send_full(void *mem)
 }
 
 
+/* The refused message must give its slot back: all of them stay free. */
+
 static int
 nxt_nncq_bound_test_port_send_slot(void *mem)
 {
+    nxt_uint_t        n;
     nxt_port_queue_t  *q = mem;
 
-    return nxt_nncq_bound_test_port_send(q, &q->queue) == NXT_ERROR;
+    if (nxt_nncq_bound_test_port_send(q, &q->queue) != NXT_ERROR) {
+        return 0;
+    }
+
+    for (n = 0; nxt_nncq_dequeue(&q->free_items)
+                != nxt_nncq_empty(&q->free_items); n++);
+
+    return n == NXT_PORT_QUEUE_SIZE;
 }
 
 
@@ -88,9 +98,17 @@ nxt_nncq_bound_test_app_send_full(void *mem)
 static int
 nxt_nncq_bound_test_app_send_slot(void *mem)
 {
+    nxt_uint_t       n;
     nxt_app_queue_t  *q = mem;
 
-    return nxt_nncq_bound_test_app_send(q, &q->queue) == NXT_ERROR;
+    if (nxt_nncq_bound_test_app_send(q, &q->queue) != NXT_ERROR) {
+        return 0;
+    }
+
+    for (n = 0; nxt_app_nncq_dequeue(&q->free_items)
+                != nxt_app_nncq_empty(&q->free_items); n++);
+
+    return n == NXT_APP_QUEUE_SIZE;
 }
 
 

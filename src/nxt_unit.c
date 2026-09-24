@@ -143,6 +143,8 @@ static int nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx,
 static int nxt_unit_mmap_read(nxt_unit_ctx_t *ctx,
     nxt_unit_recv_msg_t *recv_msg, nxt_unit_read_buf_t *rbuf);
 static int nxt_unit_get_mmap(nxt_unit_ctx_t *ctx, pid_t pid, uint32_t id);
+static void nxt_unit_unpark_rbufs(nxt_unit_ctx_t *ctx,
+    nxt_queue_t *awaiting_rbuf);
 static void nxt_unit_mmap_release(nxt_unit_ctx_t *ctx,
     nxt_port_mmap_header_t *hdr, void *start, uint32_t size);
 static int nxt_unit_send_shm_ack(nxt_unit_ctx_t *ctx, pid_t pid);
@@ -1296,8 +1298,9 @@ done:
 
 /*
  * Feeds one message through nxt_unit_process_msg() as if it had just been
- * read from a port of "ctx", then runs whatever request it made ready
- * through callbacks.request_handler, the way the read loops do.  "fd", when
+ * read from a port of "ctx", then reads the buffers it made pending and
+ * runs whatever request it made ready through callbacks.request_handler,
+ * the way the read loops do.  "fd", when
  * not -1, arrives as the message's SCM_RIGHTS descriptor and is owned by
  * libunit from here on.  Used by src/test/nxt_unit_msg_test.c and
  * fuzzing/nxt_unit_msg_fuzz.c.
@@ -1345,6 +1348,10 @@ nxt_unit_test_process_msg(nxt_unit_ctx_t *ctx, const void *msg, size_t size,
     }
 
     rc = nxt_unit_process_msg(ctx, rbuf, NULL);
+
+    if (rc != NXT_UNIT_ERROR) {
+        rc = nxt_unit_process_pending_rbuf(ctx);
+    }
 
     nxt_unit_process_ready_req(ctx);
 
@@ -4784,8 +4791,6 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
     struct stat             mmap_stat;
     nxt_unit_mmap_t         *mm;
     nxt_unit_impl_t         *lib;
-    nxt_unit_ctx_impl_t     *ctx_impl;
-    nxt_unit_read_buf_t     *rbuf;
     nxt_port_mmap_header_t  *hdr;
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
@@ -4879,7 +4884,24 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
 
     pthread_mutex_unlock(&lib->incoming.mutex);
 
-    nxt_queue_each(rbuf, &awaiting_rbuf, nxt_unit_read_buf_t, link) {
+    nxt_unit_unpark_rbufs(ctx, &awaiting_rbuf);
+
+    return rc;
+}
+
+
+/*
+ * Hands the read buffers parked on a segment back to their contexts as
+ * pending, so each context reads its message again.
+ */
+
+static void
+nxt_unit_unpark_rbufs(nxt_unit_ctx_t *ctx, nxt_queue_t *awaiting_rbuf)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+    nxt_unit_read_buf_t  *rbuf;
+
+    nxt_queue_each(rbuf, awaiting_rbuf, nxt_unit_read_buf_t, link) {
 
         ctx_impl = rbuf->ctx_impl;
 
@@ -4894,8 +4916,6 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
         nxt_unit_awake_ctx(ctx, ctx_impl);
 
     } nxt_queue_loop;
-
-    return rc;
 }
 
 
@@ -4984,6 +5004,7 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
     nxt_unit_read_buf_t *rbuf)
 {
     int                  res, need_rbuf;
+    nxt_queue_t          awaiting_rbuf;
     nxt_unit_mmap_t      *mm;
     nxt_unit_ctx_impl_t  *ctx_impl;
 
@@ -5022,12 +5043,21 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
              * wait queue first -- unless the segment arrived meanwhile and
              * nxt_unit_incoming_mmap() already took it, in which case it
              * is pending and still ours to wait on.
+             *
+             * Buffers other contexts parked behind this one did not ask
+             * for the segment themselves and nobody will ask for it now,
+             * so they go back to their contexts: the next read asks again.
              */
+            nxt_queue_init(&awaiting_rbuf);
+
             pthread_mutex_lock(&mmaps->mutex);
 
             if (mmaps->elts[id].hdr == NULL) {
                 nxt_queue_remove(&rbuf->link);
                 res = NXT_UNIT_ERROR;
+
+                nxt_queue_add(&awaiting_rbuf, &mmaps->elts[id].awaiting_rbuf);
+                nxt_queue_init(&mmaps->elts[id].awaiting_rbuf);
 
             } else {
                 res = NXT_UNIT_AGAIN;
@@ -5037,6 +5067,8 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
 
             if (res == NXT_UNIT_ERROR) {
                 nxt_atomic_fetch_add(&ctx_impl->wait_items, -1);
+
+                nxt_unit_unpark_rbufs(ctx, &awaiting_rbuf);
             }
 
             return res;

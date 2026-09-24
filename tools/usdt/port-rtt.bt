@@ -2,21 +2,9 @@
 /*
  * Copyright (C) FreeUnit contributors.
  *
- * Port send -> recv round-trip latency histogram.
- *
- * Not run in the container this was written in (no BPF privileges /
- * no uprobe_events under /sys/kernel/tracing there -- bpftrace itself
- * confirmed this with "ERROR: Unknown error -1: couldn't set
- * RLIMIT_MEMLOCK" and "open(/sys/kernel/tracing/uprobe_events): No such
- * file or directory"), so treat this as reviewed-but-unverified and
- * check it against a real target before relying on it.
- *
- * Usage:
+ * Port send -> recv latency per pid; coarse, not per message.
  *   bpftrace tools/usdt/port-rtt.bt -p $(pgrep -f 'unit: router')
- *   # or against the binary directly:
- *   bpftrace -c /usr/sbin/unitd tools/usdt/port-rtt.bt
- *
- * Requires a --usdt build (see docs/observability/usdt.md).
+ * Needs a --usdt build: docs/observability/usdt.md.
  */
 
 BEGIN
@@ -26,24 +14,8 @@ BEGIN
 
 usdt:/usr/sbin/unitd:freeunit:port__send
 {
-    /*
-     * Neither probe's own args carry the firing process's pid (see
-     * docs/observability/usdt.md -- every USDT consumer already exposes
-     * it as a builtin, so the probes don't pass it), so key on
-     * bpftrace's own `pid` builtin instead. port__send's args are
-     * (stream, type); not used by this coarse histogram.
-     */
     @start[pid] = nsecs;
 }
-
-/*
- * Coarse by design: one in-flight send per pid at a time on that pid's
- * port-write path, so with a single router process this tracks
- * time-to-next-recv rather than a true per-message match. Good enough
- * for a rough distribution; add a stream/cookie key to port__send if
- * per-message pairing is needed later (port__recv's own arg is the
- * peer port's pid, not a message id, so it can't provide that key).
- */
 
 usdt:/usr/sbin/unitd:freeunit:port__recv
 /@start[pid]/

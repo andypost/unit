@@ -2,19 +2,9 @@
 /*
  * Copyright (C) FreeUnit contributors.
  *
- * Request count and latency by HTTP status, plus overall request rate,
- * using request__start / request__done (src/nxt_http_request.c).
- *
- * Not run in the container this was written in (no BPF privileges /
- * no uprobe_events -- see tools/usdt/port-rtt.bt for the exact error);
- * reviewed but unverified against a live target.
- *
- * Usage:
+ * Request count, latency by status, and in-flight requests.
  *   bpftrace tools/usdt/requests-by-status.bt -p $(pgrep -f 'unit: router')
- *
- * Requires a --usdt build (see docs/observability/usdt.md).
- * request__start args: (request pointer as a stable per-request id)
- * request__done  args: (request pointer, status)
+ * Needs a --usdt build: docs/observability/usdt.md.
  */
 
 BEGIN

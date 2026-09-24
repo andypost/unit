@@ -7,35 +7,14 @@
 
 
 /*
- * Static USDT tracepoints, provider "freeunit".
+ * Static USDT probes, provider "freeunit" (docs/observability/usdt.md).
  *
- * NXT_USDT(name, ...) takes 0-6 cheap arguments and expands to a
- * DTRACE_PROBEn()/STAP_PROBEn() call (sys/sdt.h defines the former in terms
- * of the latter, so one macro covers dtrace, bpftrace and SystemTap) when
- * built with --usdt (NXT_HAVE_USDT).  Per the SDT contract each probe
- * compiles to a single `nop` (plus an ELF note) when a tracer is not
- * attached, and to nothing at all -- not even the nop -- when the build does
- * not define NXT_HAVE_USDT.  Call sites therefore pay zero cost in a
- * default build; see docs/observability/usdt.md for the verification
- * method (disassembly diff of a probed function).
+ *     NXT_USDT(port__send, stream, type);    probe "freeunit:port-send"
  *
- * Usage, one line per call site so probe insertions stay a trivial diff
- * against unrelated changes to the same function:
- *
- *     NXT_USDT(port__send, stream, type);
- *
- * The probe name uses "__" the way the DTrace/SDT convention renders it as
- * "-" in the provider:probe form (e.g. "port__send" -> "port-send").
- *
- * Arguments must stay cheap: a plain local, at most one pointer
- * dereference (e.g. `port->pid`), never a function call. There is no
- * semaphore guard, so every argument expression is evaluated at the call
- * site whenever the build has NXT_HAVE_USDT, whether or not a tracer is
- * attached -- an expensive argument costs on every call, not just while
- * traced. Never pass the firing process's own pid: every USDT consumer
- * (bpftrace, SystemTap, dtrace) already exposes it as a builtin (`pid` in
- * bpftrace/dtrace, `%pid`/tapset in SystemTap), so it would be redundant
- * as well as an extra getpid() call at every site under --usdt.
+ * With --usdt a probe is a nop until traced; without, it is nothing.
+ * Arguments are evaluated whenever built with --usdt, so they must be cheap:
+ * a local or one dereference, never a call or the firing pid.  Cast a
+ * bit-field to a plain integer first.
  */
 
 #if (NXT_HAVE_USDT)

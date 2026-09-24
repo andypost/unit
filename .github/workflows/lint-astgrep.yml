@@ -72,7 +72,9 @@ jobs:
             exit 0
           fi
 
-          test_changed="$(echo "$changed" \
+          # Added, changed or renamed: a deleted test covers nothing.
+          test_changed="$(git diff --name-only --diff-filter=ACMR \
+              "$BASE_SHA...$HEAD_SHA" \
             | grep -E '^(test/|src/test/)' || true)"
 
           if [ -n "$test_changed" ]; then

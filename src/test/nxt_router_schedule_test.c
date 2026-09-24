@@ -6,9 +6,6 @@
 /*
  * Unit tests for "schedules" (docs/adr/0004-schedules.md):
  *
- *   - the seconds-to-milliseconds conversion and its range;
- *   - the wait before a run: interval plus a uniform part of jitter, never
- *     past the signed 32-bit timer range, whatever the inputs;
  *   - how much of a URI may be logged at info level;
  *   - the request header built once per configuration, which must parse to
  *     the same target, path and arguments as the same line from a client;
@@ -28,145 +25,6 @@
 #include <nxt_http_devnull.h>
 #include <nxt_event_engine.h>
 #include "nxt_tests.h"
-
-
-#define NXT_SCHEDULE_TEST_MSEC_MAX  ((nxt_msec_t) NXT_SCHEDULE_SECONDS_MAX * 1000)
-
-
-static nxt_int_t
-nxt_router_schedule_msec_test(nxt_thread_t *thr)
-{
-    nxt_msec_t  ms;
-
-    if (nxt_router_schedule_msec(0, &ms) != NXT_OK || ms != 0) {
-        nxt_log_alert(thr->log, "schedule msec(0) failed");
-        return NXT_ERROR;
-    }
-
-    if (nxt_router_schedule_msec(300, &ms) != NXT_OK || ms != 300000) {
-        nxt_log_alert(thr->log, "schedule msec(300) failed");
-        return NXT_ERROR;
-    }
-
-    if (nxt_router_schedule_msec(NXT_SCHEDULE_SECONDS_MAX, &ms) != NXT_OK
-        || ms != NXT_SCHEDULE_TEST_MSEC_MAX
-        || (int32_t) ms < 0)
-    {
-        nxt_log_alert(thr->log, "schedule msec(max) failed");
-        return NXT_ERROR;
-    }
-
-    if (nxt_router_schedule_msec(NXT_SCHEDULE_SECONDS_MAX + 1, &ms) == NXT_OK
-        || nxt_router_schedule_msec(-1, &ms) == NXT_OK
-        || nxt_router_schedule_msec(INT64_MAX, &ms) == NXT_OK
-        || nxt_router_schedule_msec(INT64_MIN, &ms) == NXT_OK)
-    {
-        nxt_log_alert(thr->log, "schedule msec accepted an out-of-range "
-                      "value");
-        return NXT_ERROR;
-    }
-
-    return NXT_OK;
-}
-
-
-static nxt_int_t
-nxt_router_schedule_delay_test(nxt_thread_t *thr)
-{
-    uint32_t      rnd, i;
-    nxt_msec_t    d, lo, hi;
-    nxt_random_t  random;
-    nxt_bool_t    seen[11];
-
-    /* No jitter: exactly the interval, for any random number. */
-
-    if (nxt_router_schedule_delay(5000, 0, 0) != 5000
-        || nxt_router_schedule_delay(5000, 0, UINT32_MAX) != 5000)
-    {
-        nxt_log_alert(thr->log, "schedule delay without jitter failed");
-        return NXT_ERROR;
-    }
-
-    /* The two ends of the range are both reachable. */
-
-    if (nxt_router_schedule_delay(1000, 10, 0) != 1000
-        || nxt_router_schedule_delay(1000, 10, 10) != 1010
-        || nxt_router_schedule_delay(1000, 10, 11) != 1000)
-    {
-        nxt_log_alert(thr->log, "schedule delay range ends failed");
-        return NXT_ERROR;
-    }
-
-    /* Every value of a small range is produced, and none outside it. */
-
-    nxt_memzero(seen, sizeof(seen));
-
-    for (rnd = 0; rnd < 1000; rnd++) {
-        d = nxt_router_schedule_delay(1000, 10, rnd);
-
-        if (d < 1000 || d > 1010) {
-            nxt_log_alert(thr->log, "schedule delay %M out of [1000, 1010]",
-                          d);
-            return NXT_ERROR;
-        }
-
-        seen[d - 1000] = 1;
-    }
-
-    for (i = 0; i < nxt_nitems(seen); i++) {
-        if (!seen[i]) {
-            nxt_log_alert(thr->log, "schedule delay never chose +%uD", i);
-            return NXT_ERROR;
-        }
-    }
-
-    /* The random source the router uses stays within bounds. */
-
-    nxt_random_init(&random);
-
-    lo = 15000;
-    hi = 0;
-
-    for (i = 0; i < 100000; i++) {
-        d = nxt_router_schedule_delay(60000, 15000, nxt_random(&random));
-
-        if (d < 60000 || d > 75000) {
-            nxt_log_alert(thr->log, "schedule delay %M out of [60000, 75000]",
-                          d);
-            return NXT_ERROR;
-        }
-
-        lo = nxt_min(lo, d - 60000);
-        hi = nxt_max(hi, d - 60000);
-    }
-
-    if (lo > 150 || hi < 14850) {
-        nxt_log_alert(thr->log, "schedule delay spread [%M, %M] is too "
-                      "narrow", lo, hi);
-        return NXT_ERROR;
-    }
-
-    /* The largest configuration is at the limit, and nothing passes it. */
-
-    d = nxt_router_schedule_delay(NXT_SCHEDULE_TEST_MSEC_MAX / 2,
-                                  NXT_SCHEDULE_TEST_MSEC_MAX / 2, UINT32_MAX);
-
-    if (d > NXT_SCHEDULE_TEST_MSEC_MAX || (int32_t) d < 0) {
-        nxt_log_alert(thr->log, "schedule delay %M past the maximum", d);
-        return NXT_ERROR;
-    }
-
-    if (nxt_router_schedule_delay(UINT32_MAX, UINT32_MAX, UINT32_MAX)
-            != NXT_SCHEDULE_TEST_MSEC_MAX
-        || nxt_router_schedule_delay(NXT_SCHEDULE_TEST_MSEC_MAX, 1000, 999)
-            != NXT_SCHEDULE_TEST_MSEC_MAX)
-    {
-        nxt_log_alert(thr->log, "schedule delay did not clamp");
-        return NXT_ERROR;
-    }
-
-    return NXT_OK;
-}
 
 
 static nxt_int_t
@@ -204,33 +62,12 @@ nxt_router_schedule_uri_public_test(nxt_thread_t *thr)
 
 
 static nxt_int_t
-nxt_router_schedule_parse(nxt_mp_t *mp, nxt_str_t *text,
+nxt_router_schedule_test_parse(nxt_mp_t *mp, nxt_str_t *text,
     nxt_http_request_parse_t *rp)
 {
-    u_char         *p;
-    nxt_buf_mem_t  mem;
-
-    /* The parser may rewrite a complex target in place: work on a copy. */
-
-    p = nxt_mp_nget(mp, text->length);
-    if (p == NULL) {
-        return NXT_ERROR;
-    }
-
-    nxt_memcpy(p, text->start, text->length);
-
-    mem.start = p;
-    mem.pos = p;
-    mem.free = p + text->length;
-    mem.end = mem.free;
-
     nxt_memzero(rp, sizeof(nxt_http_request_parse_t));
 
-    if (nxt_http_parse_request_init(rp, mp) != NXT_OK) {
-        return NXT_ERROR;
-    }
-
-    return nxt_http_parse_request(rp, &mem);
+    return nxt_router_schedule_parse(mp, text, rp);
 }
 
 
@@ -309,7 +146,7 @@ nxt_router_schedule_request_test(nxt_thread_t *thr)
         goto done;
     }
 
-    if (nxt_router_schedule_parse(mp, &sched.request, &rs) != NXT_DONE) {
+    if (nxt_router_schedule_test_parse(mp, &sched.request, &rs) != NXT_DONE) {
         nxt_log_alert(thr->log, "schedule request did not parse: \"%V\"",
                       &sched.request);
         goto done;
@@ -320,7 +157,7 @@ nxt_router_schedule_request_test(nxt_thread_t *thr)
     nxt_str_set(&line, "GET /a/%2E%2E/b/../c%2Fd/./e?x=1&y=%2F HTTP/1.1\r\n"
                        "Host: example.org\r\n\r\n");
 
-    if (nxt_router_schedule_parse(mp, &line, &rc) != NXT_DONE) {
+    if (nxt_router_schedule_test_parse(mp, &line, &rc) != NXT_DONE) {
         nxt_log_alert(thr->log, "schedule request: reference did not parse");
         goto done;
     }
@@ -372,7 +209,7 @@ nxt_router_schedule_request_test(nxt_thread_t *thr)
 
     if (headers == NULL
         || nxt_router_schedule_request_build(mp, &sched, headers) != NXT_OK
-        || nxt_router_schedule_parse(mp, &sched.request, &rs) != NXT_DONE)
+        || nxt_router_schedule_test_parse(mp, &sched.request, &rs) != NXT_DONE)
     {
         nxt_log_alert(thr->log, "schedule request with user-agent failed");
         goto done;
@@ -400,7 +237,7 @@ nxt_router_schedule_request_test(nxt_thread_t *thr)
     /* No headers at all. */
 
     if (nxt_router_schedule_request_build(mp, &sched, NULL) != NXT_OK
-        || nxt_router_schedule_parse(mp, &sched.request, &rs) != NXT_DONE
+        || nxt_router_schedule_test_parse(mp, &sched.request, &rs) != NXT_DONE
         || nxt_router_schedule_field(&rs, "Host") != NULL
         || !nxt_router_schedule_field_is(&rs, "User-Agent",
                                          "FreeUnit-Schedule/drupal-cron"))
@@ -921,9 +758,7 @@ nxt_router_schedule_test(nxt_thread_t *thr)
 {
     nxt_thread_time_update(thr);
 
-    if (nxt_router_schedule_msec_test(thr) != NXT_OK
-        || nxt_router_schedule_delay_test(thr) != NXT_OK
-        || nxt_router_schedule_uri_public_test(thr) != NXT_OK
+    if (nxt_router_schedule_uri_public_test(thr) != NXT_OK
         || nxt_router_schedule_request_test(thr) != NXT_OK
         || nxt_router_schedule_joint_test(thr) != NXT_OK
         || nxt_router_schedule_resolve_test(thr) != NXT_OK

@@ -5116,16 +5116,10 @@ static nxt_int_t
 nxt_conf_vldt_schedule_uri(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data)
 {
-    u_char                    *p;
-    size_t                    size;
-    nxt_str_t                 uri;
+    nxt_str_t                 uri, req;
     nxt_int_t                 ret;
     nxt_uint_t                i;
-    nxt_buf_mem_t             mem;
     nxt_http_request_parse_t  rp;
-
-    static const char  prefix[] = "GET ";
-    static const char  suffix[] = " HTTP/1.1\r\n\r\n";
 
     nxt_conf_get_string(value, &uri);
 
@@ -5150,32 +5144,18 @@ nxt_conf_vldt_schedule_uri(nxt_conf_validation_t *vldt,
         }
     }
 
-    /* Bounded by NXT_SCHEDULE_URI_MAX above: no overflow. */
-    size = nxt_length(prefix) + uri.length + nxt_length(suffix);
-
-    p = nxt_mp_nget(vldt->pool, size);
-    if (nxt_slow_path(p == NULL)) {
+    req.length = nxt_length("GET  HTTP/1.1\r\n\r\n") + uri.length;
+    req.start = nxt_mp_nget(vldt->pool, req.length);
+    if (nxt_slow_path(req.start == NULL)) {
         return NXT_ERROR;
     }
 
-    mem.start = p;
-    mem.pos = p;
-
-    p = nxt_cpymem(p, prefix, nxt_length(prefix));
-    p = nxt_cpymem(p, uri.start, uri.length);
-    p = nxt_cpymem(p, suffix, nxt_length(suffix));
-
-    mem.free = p;
-    mem.end = p;
+    (void) nxt_sprintf(req.start, req.start + req.length,
+                       "GET %V HTTP/1.1\r\n\r\n", &uri);
 
     nxt_memzero(&rp, sizeof(nxt_http_request_parse_t));
 
-    ret = nxt_http_parse_request_init(&rp, vldt->pool);
-    if (nxt_slow_path(ret != NXT_OK)) {
-        return NXT_ERROR;
-    }
-
-    ret = nxt_http_parse_request(&rp, &mem);
+    ret = nxt_router_schedule_parse(vldt->pool, &req, &rp);
 
     if (ret != NXT_DONE) {
         return nxt_conf_vldt_error(vldt, "The \"uri\" value \"%V\" is not a "

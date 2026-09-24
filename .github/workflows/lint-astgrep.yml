@@ -30,7 +30,9 @@ jobs:
           tool: ast-grep
 
       - name: Check for new violations
-        run: python3 tools/ast-grep/check_baseline.py
+        run: |
+          python3 tools/ast-grep/check_baseline_test.py
+          python3 tools/ast-grep/check_baseline.py
 
   require-tests:
     name: "require a test for a src/ change"

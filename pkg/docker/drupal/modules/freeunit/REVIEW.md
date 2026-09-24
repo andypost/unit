@@ -221,5 +221,40 @@ m13, m14, m15, m16 as above.
 
 ## Round 3 (against the round-2 commit)
 
-Counts: blocking 0, major 0, minor 0. The round-2 diff is four lines of
-code and a README paragraph; nothing new. Done.
+Counts: blocking 0, major 0, minor 1.
+
+- **m18.** Removing the pseudo-tag (m13) left a page without cache tags
+  with *no* index row, so a future `Expires` on such a page would never be
+  honoured by `expiredFiles()`. Fixed: one row per file is guaranteed again
+  (`freeunit:file`), with the reason stated in the code.
+
+No blocking or major findings remain; the cycle stops here.
+
+## Verification
+
+- `php -l`: 13 files (`src/**/*.php`, `freeunit.install`), PHP 8.4, all
+  clean; every `.yml` parses; the example JSON parses.
+- PHPStan 2.2 (phar from GitHub releases), level 6, on `src/` and
+  `freeunit.install`: 44 reports, every one either an unknown
+  Drupal/Drush/Symfony symbol (drupal.org and packagist dists are blocked
+  here, and reading a GitHub mirror clone of core was refused by the
+  session's policy) or a missing iterable value type in a docblock; no
+  logic finding. A run with Drupal stubs was therefore not possible.
+- `examples/check-static-cache.py` against a `unitd` built from this tree
+  (`./configure && ./configure php && make -j2 unitd php`, run under
+  `unshare -n` with `lo` up, control socket in a short `/tmp` path, port
+  18931+): 19/19 checks pass, including the new `Authorization`,
+  `/index.php`, traversal and gzip-header checks.
+- Stub harness (no Drupal runtime: stub `ConfigFactoryInterface`,
+  `SessionConfigurationInterface`, `Request`, `LoggerInterface`) against
+  the same `unitd`: 35/35 checks pass. `StaticCachePathMapper` refuses
+  `..`, `.`, `//`, `%xx`, backslash, non-ASCII, other hosts, query strings
+  and >512-byte paths; `StaticCacheFiles` writes 0644 through a temporary
+  file and leaves none behind, refuses paths outside the root, deletes
+  both variants, and `purge()` empties the tree but keeps the root;
+  `RouteConfigGenerator::build()` equals `routes.drupal_page` of the
+  example byte for byte (keys sorted); `ControlApiClient` PUTs it, reads
+  it back, creates a missing parent, maps 404 to `NULL` and errors to
+  `ControlApiException`; the applied route serves the files the classes
+  wrote (identity and gzip, fixed headers), and session cookie and
+  `Authorization` requests bypass it; a deleted file falls back to PHP.

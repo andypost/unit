@@ -33,7 +33,9 @@ final class StaticCacheIndex {
     $transaction = $this->database->startTransaction();
     $this->database->delete(self::TABLE)->condition('file', $file)->execute();
     $insert = $this->database->insert(self::TABLE)->fields(['file', 'tag', 'expire']);
-    foreach (array_unique($tags) as $tag) {
+    // At least one row per file, so a page without cache tags still has its
+    // expiry on record for expiredFiles().
+    foreach (array_unique([...$tags, 'freeunit:file']) as $tag) {
       $insert->values(['file' => $file, 'tag' => $tag, 'expire' => $expire]);
     }
     $insert->execute();

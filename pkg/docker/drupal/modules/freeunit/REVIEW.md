@@ -258,3 +258,48 @@ No blocking or major findings remain; the cycle stops here.
   `ControlApiException`; the applied route serves the files the classes
   wrote (identity and gzip, fixed headers), and session cookie and
   `Authorization` requests bypass it; a deleted file falls back to PHP.
+
+## Round 4 (CI)
+
+The module was installed and tested for the first time, on Drupal 11.4.7
+and 12.0.x-dev with PHP 8.5, under a FreeUnit built from this branch
+(workflow `drupal-freeunit-module.yml`). Tests added: unit (path mapper;
+header rules; generated route equals the example), kernel (writer, tag
+index rows, invalidation, cron expiry, purge on cache flush, uninstall,
+runtime requirements, cron controller: 404 unless keyed and loopback,
+`hash_equals`, key never logged) and functional (anonymous page to cache
+file with the exact route headers, served by FreeUnit).
+
+What CI caught (all fixed):
+
+- **C1 (blocking).** Drupal sends `Content-Type: text/html; charset=utf-8`
+  (lower case, `HtmlRenderer`); the default `static_cache.headers` and the
+  example route said `UTF-8`, so the byte-exact comparison refused every
+  page: the static cache never wrote anything.
+- **C2 (major).** The writer only checked that each response header was in
+  the fixed set; a page *missing* one the route adds (`Expires`, `Vary`)
+  was written, and the router would add a header Drupal did not send. The
+  header set must now match exactly.
+- **C3 (major).** Uninstall failed with "no such table": the module's table
+  is dropped while the invalidator is still in the container, and saving
+  `core.extension` invalidates tags. `hook_uninstall` now calls
+  `StaticCacheTagsInvalidator::uninstall()`, which purges and then ignores
+  invalidations for the rest of the request.
+- **C4 (minor).** `StaticCacheIndex::record()` committed by letting the
+  transaction go out of scope, deprecated in 11.5 and reported on 12; now
+  `commitOrRelease()`.
+- **C5 (minor).** phpstan level 6: `invalidateTags()` lacked `: void`; a
+  `@var` narrowing replaced by an `instanceof` check where it is used.
+- **C6 (tooling).** `check-static-cache.py` set an application `user`,
+  which an unprivileged `unitd` refuses even for its own user.
+
+Settled by CI (the items Round 2 could not verify):
+`RequirementSeverity::{OK,Warning,Error,Info}` exist; `hook_runtime_requirements`
+is the 11.2+ name and the OOP `#[Hook]` form runs; `AutowireTrait` resolves
+`CronInterface` and `StateInterface` through core's aliases;
+`core_version_requirement: ^11.2 || ^12` holds for 11.4 and 12.0.x-dev.
+The live site confirmed `fastcgi_finish_request()` under FreeUnit (status
+report), that the FreeUnit schedule runs cron through `/freeunit/cron`
+(`system.cron_last` advances) while clients get 404, and that the gzip
+variant, the session-cookie bypass, the query-string bypass and deletion
+on a node save behave as designed.

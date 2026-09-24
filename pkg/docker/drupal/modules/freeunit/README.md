@@ -1,15 +1,12 @@
 # freeunit: a Drupal module for FreeUnit (prototype)
 
-> **Unverified prototype.** This module has never been installed on a Drupal
-> site. Drupal core could not be installed where it was written (packagist
-> and drupal.org were unreachable). Every PHP file passes `php -l` (PHP 8.4).
-> The classes that do not need a Drupal runtime (`ControlApiClient`,
-> `ScheduleConfigGenerator`, `StaticCachePathMapper`, `StaticCacheFiles`)
-> were exercised against a locally built `unitd` with stub interfaces. The
-> FreeUnit side, `examples/unit-drupal-freeunit.json`, was PUT to a local
-> `unitd` and exercised with a stand-in PHP script
-> (`examples/check-static-cache.py`). The event subscriber, the invalidator,
-> the hooks, the Drush commands and the install file are untested.
+> **Prototype, tested in CI.** `.github/workflows/drupal-freeunit-module.yml`
+> installs it on Drupal 11.4 and 12.0.x-dev (PHP 8.5), runs phpcs, phpstan
+> and the PHPUnit unit, kernel and functional tests in `tests/`, then serves
+> a real site with a FreeUnit built from this branch and checks the
+> router-served static cache, invalidation and the cron schedule end to end.
+> Not covered by tests: the Drush commands other than `freeunit:routes` and
+> `freeunit:cache-purge`, and `ControlApiClient` inside Drupal.
 > Review findings and fixes are in `REVIEW.md`.
 
 The design, the measurements to make and the risks are in

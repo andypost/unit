@@ -39,7 +39,7 @@ final class HeaderRulesTest extends UnitTestCase {
   }
 
   private function session(): SessionConfigurationInterface {
-    $session = $this->createMock(SessionConfigurationInterface::class);
+    $session = $this->createStub(SessionConfigurationInterface::class);
     $session->method('hasSession')->willReturn(FALSE);
     $session->method('getOptions')->willReturnCallback(fn(Request $r) => [
       'name' => ($r->isSecure() ? 'SSESS' : 'SESS') . 'bfabc37432958b063360d3ad6461c9c4',
@@ -97,17 +97,17 @@ final class HeaderRulesTest extends UnitTestCase {
   public function testWriterHeaderRules(\Closure $alter, bool $writable): void {
     $settings = $this->settings();
     $config = $this->getConfigFactoryStub(['freeunit.settings' => $settings]);
-    $user = $this->createMock(AccountInterface::class);
+    $user = $this->createStub(AccountInterface::class);
     $user->method('isAnonymous')->willReturn(TRUE);
     $mapper = new StaticCachePathMapper($config);
     $writer = new StaticCacheWriter(
       $config,
       $user,
       $this->session(),
-      $this->createMock(CacheBackendInterface::class),
+      $this->createStub(CacheBackendInterface::class),
       $mapper,
       new StaticCacheFiles($mapper, new NullLogger()),
-      new StaticCacheIndex($this->createMock(Connection::class)),
+      new StaticCacheIndex($this->createStub(Connection::class)),
       new NullLogger(),
     );
     $response = self::drupalResponse();

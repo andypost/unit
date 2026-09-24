@@ -39,7 +39,7 @@ final class StaticCacheIndex {
       $insert->values(['file' => $file, 'tag' => $tag, 'expire' => $expire]);
     }
     $insert->execute();
-    unset($transaction);
+    $transaction->commitOrRelease();
   }
 
   /**

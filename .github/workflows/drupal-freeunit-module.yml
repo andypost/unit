@@ -171,7 +171,8 @@ jobs:
               ->set("static_cache.directory", getenv("SITE") . "/page-cache")
               ->set("static_cache.hosts", ["127.0.0.1"])
               ->save();
-            $n = \Drupal\node\Entity\Node::create(["type" => "article", "title" => "FreeUnit", "body" => str_repeat("Lorem ipsum dolor sit amet. ", 200)]);
+            \Drupal\node\Entity\NodeType::load("page") ?? \Drupal\node\Entity\NodeType::create(["type" => "page", "name" => "Page"])->save();
+            $n = \Drupal\node\Entity\Node::create(["type" => "page", "title" => "FreeUnit"]);
             $n->setPublished()->save();'
           mkdir -p "$SITE/page-cache"
           vendor/bin/drush freeunit:routes > "$RUN/drupal_page.json"

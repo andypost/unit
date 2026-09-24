@@ -8,7 +8,8 @@
 # Env: PROJECT_TYPE (drupal11), DRUPAL_CONSTRAINT (^11), DRUPAL_STABILITY,
 #      PHP_VERSION (8.5),
 #      DURATION (10s), CONCURRENCY (10), REPEAT (3),
-#      FREEUNIT_SRC_TARBALL (optional: build FreeUnit from this source).
+#      FREEUNIT_SRC_TARBALL (optional: build FreeUnit from this source),
+#      METRICS_DIR (raw outputs; default a temporary directory).
 # Every measurement runs REPEAT times; report.py takes the median.
 
 set -euo pipefail
@@ -17,7 +18,8 @@ ADDON=$(cd "$1" && pwd)
 OUT=$2
 PROJ=fu-bench
 BASE="http://${PROJ}.ddev.site"
-RAW=$(pwd)/.metrics
+# Raw outputs go outside the project: composer create-project needs it empty.
+RAW=${METRICS_DIR:-$(mktemp -d)}
 export PROJECT_TYPE=${PROJECT_TYPE:-drupal11} DRUPAL_CONSTRAINT=${DRUPAL_CONSTRAINT:-^11}
 export PHP_VERSION=${PHP_VERSION:-8.5}
 export DURATION=${DURATION:-10s} CONCURRENCY=${CONCURRENCY:-10} REPEAT=${REPEAT:-3}

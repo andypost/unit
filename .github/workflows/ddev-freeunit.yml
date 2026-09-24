@@ -84,6 +84,7 @@ jobs:
           PROJECT_TYPE: ${{ matrix.project_type }}
           DRUPAL_CONSTRAINT: ${{ matrix.drupal }}
           DRUPAL_STABILITY: ${{ matrix.stability }}
+          METRICS_DIR: ${{ runner.temp }}/metrics
         run: |
           mkdir -p "$RUNNER_TEMP/bench" && cd "$RUNNER_TEMP/bench"
           bash "$GITHUB_WORKSPACE/$ADDON/tests/metrics.sh" "$GITHUB_WORKSPACE/$ADDON" \
@@ -95,6 +96,5 @@ jobs:
           name: ddev-freeunit-metrics-${{ matrix.project_type }}
           path: |
             ddev-freeunit-metrics.json
-            ${{ runner.temp }}/bench/.metrics/
+            ${{ runner.temp }}/metrics/
           if-no-files-found: ignore
-          include-hidden-files: true

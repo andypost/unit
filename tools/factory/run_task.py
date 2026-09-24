@@ -37,7 +37,18 @@ need to be registered in src/test/nxt_tests.c, since apply_edit.py can
 only touch the one target function and registering a new suite entry
 would touch a second one. A .py test file is run with pytest from the
 worktree's test/ directory, against a build of the daemon (G2/G3 do
-this).
+this). See run_c_test()'s docstring below for the sanctioned method a
+test uses to call a `static` target function (TU-include, not removing
+`static`).
+
+`"edits": []` (an explicit no-op -- the templates allow "no change" as
+a valid answer, e.g. for a trap card) is a normal, accepted apply: it
+still requires fid/base_body_sha to match, still writes the edit's
+`tests` files, and still runs the card's gates exactly as a real edit
+would -- a "no change, plus a test" answer is evaluated in full, not
+short-circuited. Only apply_edit.py's own refusal path (a bad fid or a
+stale sha, whether or not "edits" is empty) short-circuits before the
+worktree's gates run.
 
 Usage:
     python3 tools/factory/run_task.py T01-l1-memcasecmp edit.json --model sonnet
@@ -169,6 +180,41 @@ def run_c_test(wt_path, rel_path, log_dir):
     self-contained (its own main()) -- it is NOT registered in
     src/test/nxt_tests.c, see the module docstring.
 
+    Testing a `static` function: the only sanctioned method (see
+    tools/factory/README.md's "harness v2" section and every executor
+    template) is for the test file to `#include "nxt_conf.c"` (or
+    whichever TU the target lives in) directly, e.g.:
+
+        #include "nxt_conf.c"
+        #include <stdio.h>
+
+        int main(void) { ... call the now-visible static function ... }
+
+    compiled here exactly as any other test -- with -I src (so the
+    quoted #include resolves) and linked against build/lib/libnxt.a.
+    This does NOT produce a duplicate-symbol link error: the test's own
+    object file already defines every symbol that TU provides, so the
+    linker never needs to pull the matching .o member out of the
+    archive (archive members are only extracted for symbols still
+    undefined after the objects named directly on the command line).
+    This was verified empirically for a static function in both
+    src/nxt_conf.c and src/nxt_http_parse.c while building this harness
+    (T09/T08/T11 and T06/T07/T10/T12's test_skeleton in tasks.jsonl).
+    Removing `static`, changing the target's signature, or copying its
+    body into the test file instead of including the TU are all out of
+    scope for an executor edit and are rejected at review, not handled
+    here.
+
+    If a future file's TU-include ever does hit a duplicate-symbol
+    error (e.g. because the test also needs to link a second .o that
+    itself defines a conflicting weak/static-adjacent symbol), the
+    fallback order is: (1) retry the link with the test's own .o listed
+    before libnxt.a on the command line (already the case below --
+    command-line object order already wins over archive extraction);
+    (2) pass -Wl,--allow-multiple-definition as a last resort. Neither
+    has been needed for any of the 12 cards in this batch; if one ever
+    is, add it here rather than in an individual test file.
+
     Requires gate_1_fast (or -g 1 via run_gates.sh) to have built the
     tree first; the include/lib paths below come from build/Makefile's
     own @EXTRA_LIBS@ substitution (-lm -lrt -lpthread -lssl -lcrypto
@@ -195,12 +241,29 @@ def run_c_test(wt_path, rel_path, log_dir):
     extra_libs = ["-lm", "-lrt", "-lpthread", "-lssl", "-lcrypto",
                   "-lpcre2-8", "-lz"]
 
+    # The test's own translation unit is always named ahead of libnxt.a
+    # on the command line, so the linker satisfies every symbol it can
+    # from that object first and only falls back to extracting an
+    # archive member for whatever is still undefined -- this is exactly
+    # what lets a TU-include test (see docstring above) link cleanly
+    # without a duplicate-symbol error against the matching .o already
+    # sitting in libnxt.a.
+    cmd = ["gcc", "-std=gnu11", "-g", "-O0", "-Wall",
+           *include_dirs, str(src_path), str(libnxt), *extra_libs,
+           "-o", str(bin_path)]
+
     rc, out = sh(
-        ["gcc", "-std=gnu11", "-g", "-O0", "-Wall",
-         *include_dirs, str(src_path), str(libnxt), *extra_libs,
-         "-o", str(bin_path)],
-        cwd=wt_path, log_path=log_dir / f"cc-{Path(rel_path).name}.log",
+        cmd, cwd=wt_path, log_path=log_dir / f"cc-{Path(rel_path).name}.log",
     )
+    if rc != 0 and "multiple definition" in out:
+        # Last-resort fallback (see docstring); not needed by any of the
+        # 12 cards in this batch, kept for a future TU this hasn't been
+        # exercised against yet.
+        rc, out = sh(
+            cmd[:-2] + ["-Wl,--allow-multiple-definition"] + cmd[-2:],
+            cwd=wt_path,
+            log_path=log_dir / f"cc-{Path(rel_path).name}-retry.log",
+        )
     if rc != 0:
         return False, f"compile failed:\n{out}"
 

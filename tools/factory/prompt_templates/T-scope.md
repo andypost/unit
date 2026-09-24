@@ -22,14 +22,51 @@ Rules for this task:
   particular order (e.g. a state update before a callee is invoked, or a
   break out of a loop before a log line).
 - If, after reading the function and its context, you conclude there is
-  nothing to fix (the trap case), say so in `rationale` and return the
-  function unchanged as your "edit" (same text, byte-for-byte
-  semantically, in `edits[0].text`) plus your explanation. Returning a
-  no-op edit is a valid, sometimes correct, answer.
+  nothing to fix (the trap case), say so in `rationale` and answer with
+  `"edits": []` -- an explicit empty list, not one entry. This is the
+  no-change answer this harness expects; it is still checked against
+  `fid`/`base_body_sha` exactly like a real edit, it just writes nothing.
+  Repeating the function byte-for-byte in a `replace_function` edit
+  (`edits[0].text` identical to what you were shown) is also accepted and
+  means the same thing, but `"edits": []` is the simpler, preferred way to
+  say "no change". Either way, still write your test(s) in `tests[]` --
+  the gates run against them regardless of whether the function changed.
 - Add or extend a test per the card's `acceptance` section. Put the whole
   new test file's content in `tests[]`; do not try to append to an
   existing test file (you cannot touch other functions, and existing test
   suites are registered by function, not by file).
+- **Testing a `static` function.** Most target functions in this batch
+  are declared `static` in their .c file, so a separate test translation
+  unit cannot link against them directly, and it must not be made to:
+  removing `static`, changing the function's signature, or copying its
+  body into the test file are all out of scope for this card and will be
+  rejected at review even if the gates pass. The one sanctioned method is
+  for your test file to `#include` the whole target `.c` file directly,
+  e.g.:
+
+  ```c
+  #include "nxt_conf.c"   /* the file the target function lives in */
+  #include <stdio.h>
+
+  int
+  main(void)
+  {
+      /* call the now-visible static function directly */
+      ...
+  }
+  ```
+
+  `run_task.py` compiles this with `-I src` (so the quoted `#include`
+  resolves) and links it against `build/lib/libnxt.a` exactly like any
+  other standalone C test; the archive will not pull in a duplicate
+  member for that `.c` file, since your test's own object already
+  defines every symbol it provides. If the card gave you a
+  `test_skeleton`, it already uses this pattern (or plain `nxt_main.h`,
+  for a target that is not `static`) and compiles and passes as-is --
+  start from it. Also do not write a test that re-implements the target
+  function's logic (a "reference copy" to compare against itself); that
+  proves nothing was broken, it only proves your copy agrees with itself.
+  Call the real function.
 
 ## Output format (return ONLY this JSON, nothing else)
 

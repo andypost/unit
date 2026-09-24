@@ -33,6 +33,45 @@ Rules for this task:
   this function does with it -- write nothing, write a fixed delimiter,
   etc. -- explicitly, since sizing/writing pairs are exactly where an
   empty case is where the two sides most often silently disagree.
+- If, after reading the function and its sizing counterpart, you
+  conclude there is nothing to fix, answer with `"edits": []` -- an
+  explicit empty list. Repeating the function byte-for-byte in a
+  `replace_function` edit is also accepted and means the same thing, but
+  `"edits": []` is the simpler, preferred way to say it. Either way,
+  still write your test(s) in `tests[]`; the gates run against them
+  regardless of whether the function changed.
+- **Testing a `static` function.** Most target functions in this batch
+  are declared `static` in their .c file (this includes most sizing
+  counterparts), so a separate test translation unit cannot link against
+  them directly, and it must not be made to: removing `static`, changing
+  the function's signature, or copying its body into the test file are
+  all out of scope for this card and will be rejected at review even if
+  the gates pass. The one sanctioned method is for your test file to
+  `#include` the whole target `.c` file directly, e.g.:
+
+  ```c
+  #include "nxt_conf.c"   /* the file both functions of the pair live in */
+  #include <stdio.h>
+
+  int
+  main(void)
+  {
+      /* call both the now-visible static sizing and writing functions */
+      ...
+  }
+  ```
+
+  `run_task.py` compiles this with `-I src` (so the quoted `#include`
+  resolves) and links it against `build/lib/libnxt.a` exactly like any
+  other standalone C test; the archive will not pull in a duplicate
+  member for that `.c` file, since your test's own object already
+  defines every symbol it provides. If the card gave you a
+  `test_skeleton`, it already uses this pattern and compiles and passes
+  as-is -- start from it. Also do not write a test that re-implements
+  either function's sizing or writing logic (a "reference copy" to
+  compare against itself); that proves nothing was broken, it only
+  proves your copy agrees with itself. Call the two real functions and
+  compare their answers.
 
 ## Output format (return ONLY this JSON, nothing else)
 

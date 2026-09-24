@@ -23,6 +23,17 @@ Input (stdin, or --edit-file): a JSON object
 Only a single "replace_function" edit is supported; anything else in
 "edits" is refused.
 
+`"edits": []` is also accepted, as an explicit "no change" answer (the
+templates allow this as a valid outcome, e.g. for a trap card where the
+function is already correct). It still requires "fid" and
+"base_body_sha", and those are still checked against the index and
+against the file's bytes on disk exactly as for a real edit -- an
+empty-edits answer against a stale or wrong fid/sha is refused just like
+a real one. On success it writes nothing (the file is already what the
+caller wants) and prints "no-op" to stderr; there is no diff to print
+and --dry-run behaves identically to a normal run since nothing is ever
+written either way.
+
 IMPORTANT: "text" replaces exactly functions.jsonl's [start_byte,
 end_byte) span for the fid, which for a function qualified with one of
 shim.h's blanked storage-class macros (nxt_inline, nxt_noinline,
@@ -130,25 +141,34 @@ def main():
 
     fid = edit.get("fid")
     base_body_sha = edit.get("base_body_sha")
-    edits = edit.get("edits") or []
+    # "edits" is required to be present in the JSON (even if empty), so a
+    # caller that forgot the field entirely is still refused; edit.get("edits")
+    # being [] (an explicit "no change") is deliberately NOT the same as it
+    # being absent -- both fall through to the same variable, but the
+    # no-op path below only runs for an *empty list*, not a missing key.
+    edits = edit.get("edits")
     new_symbols = set(edit.get("new_symbols") or [])
 
-    if not fid or not base_body_sha or len(edits) != 1:
+    if not fid or not base_body_sha or edits is None or len(edits) > 1:
         print(
-            "refused: edit must have 'fid', 'base_body_sha' and exactly "
-            "one entry in 'edits'",
+            "refused: edit must have 'fid', 'base_body_sha' and 'edits' "
+            "with either zero entries (an explicit no-op) or exactly one",
             file=sys.stderr,
         )
         return 2
 
-    op = edits[0]
-    if op.get("op") != "replace_function" or "text" not in op:
-        print(
-            "refused: the only supported edit is "
-            '{"op": "replace_function", "text": "..."}',
-            file=sys.stderr,
-        )
-        return 2
+    no_op = len(edits) == 0
+
+    if not no_op:
+        op = edits[0]
+        if op.get("op") != "replace_function" or "text" not in op:
+            print(
+                "refused: the only supported edit is "
+                '{"op": "replace_function", "text": "..."} or an empty '
+                '"edits": [] (no-op)',
+                file=sys.stderr,
+            )
+            return 2
 
     if not index_path.exists():
         print(
@@ -196,6 +216,16 @@ def main():
             file=sys.stderr,
         )
         return 1
+
+    if no_op:
+        # Both sha checks above already passed, so the on-disk function is
+        # exactly what the caller says they last saw; there is nothing to
+        # splice, re-parse or write. This is a valid, sometimes-correct
+        # answer (see the module docstring and the executor templates),
+        # not a degenerate case to route around.
+        print(f"no-op: {fid} left unchanged (base_body_sha verified)",
+              file=sys.stderr)
+        return 0
 
     new_text = op["text"]
     if not new_text.endswith("\n") and original_bytes[end - 1:end] == b"\n":

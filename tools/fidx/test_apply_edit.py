@@ -140,6 +140,42 @@ def main():
         "undeclared-new-function edit names the offending function",
     )
 
+    # --- Case 4: accepted -- an explicit no-op ("edits": []) --------------
+    noop_edit = {
+        "fid": FID,
+        "base_body_sha": record["body_sha"],
+        "edits": [],
+    }
+    proc = run(noop_edit)
+    ok &= check(
+        proc.returncode == 0,
+        f"no-op edit exits 0 (got {proc.returncode}); stderr: {proc.stderr.strip()}",
+    )
+    ok &= check(
+        "no-op" in proc.stderr,
+        "no-op edit says so on stderr",
+    )
+    ok &= check(
+        proc.stdout == "",
+        "no-op edit prints no diff",
+    )
+
+    # --- Case 5: rejected -- a no-op against a stale base_body_sha --------
+    noop_stale_edit = {
+        "fid": FID,
+        "base_body_sha": "0" * 64,
+        "edits": [],
+    }
+    proc = run(noop_stale_edit)
+    ok &= check(
+        proc.returncode == 1,
+        f"stale no-op edit exits 1 (got {proc.returncode})",
+    )
+    ok &= check(
+        "base_body_sha does not match" in proc.stderr,
+        "stale no-op edit is still checked against the index",
+    )
+
     if ok:
         print("\nall cases behaved as expected")
         return 0

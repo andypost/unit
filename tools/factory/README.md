@@ -164,3 +164,74 @@ The two traps sit at L1 and L2, not L3+, on purpose: if a model already
 "fixes" a correct 3-4-ccn helper, it has failed the cheapest, least
 ambiguous check this batch has, and there is no reason to spend L3/L4
 budget finding that out a second time.
+
+## Harness v2
+
+Run 1 (`REPORT.md`, 28 executor runs across Haiku/Sonnet/Fable) found
+that more than half of Haiku's failures, and some of Sonnet's, were the
+harness's own bugs, not the model's: an empty-`edits` no-op answer being
+rejected, no sanctioned way to test a `static` function, and no test
+skeleton to anchor the expected file shape. Three fixes, all in this
+pass:
+
+1. **`"edits": []` is now an accepted no-op.** `tools/fidx/apply_edit.py`
+   used to require exactly one entry in `edits`; it now also accepts an
+   empty list as an explicit "no change" answer (the templates always
+   allowed this in words, the tool just refused to take yes for an
+   answer). `fid` and `base_body_sha` are still required and still
+   checked against the index and the on-disk bytes exactly as for a real
+   edit -- a no-op against a stale or wrong fid/sha is refused just like
+   a real one would be. On success it writes nothing and prints "no-op"
+   to stderr. `run_task.py` treats this apply exactly like a real one
+   once it succeeds: it still writes the edit's `tests[]` files and
+   still runs the card's gates, so a "no change + test" answer gets a
+   full, real gate run, not a free pass. `tools/fidx/test_apply_edit.py`
+   has two new cases covering this (accepted no-op, and a no-op refused
+   for a stale `base_body_sha`). Repeating the function byte-for-byte in
+   a `replace_function` edit is still accepted too and means the same
+   thing; `"edits": []` is just the simpler way to say it, and all three
+   executor templates now say so.
+
+2. **A sanctioned way to test a `static` function.** Most target
+   functions in this batch are `static`, so a separate C test
+   translation unit cannot link against them -- and, in run 1, models
+   worked around that by removing `static` (out of scope), copying the
+   function into the test (T01: an empty test that "passes" against a
+   fork of itself, not the real code), or re-implementing its logic as a
+   "reference" to test against (T09: same problem, dressed up). The
+   sanctioned method, now documented with a short example in every
+   executor template (`T-bounds.md`, `T-scope.md`, `T-ownership.md`) and
+   in `run_task.py`'s `run_c_test()` docstring: the test file
+   `#include`s the whole target `.c` file directly (e.g.
+   `#include "nxt_conf.c"`), compiled with `-I src` and linked against
+   `build/lib/libnxt.a` exactly like any other standalone C test. This
+   does not produce a duplicate-symbol error: the test's own object file
+   already defines every symbol that `.c` file provides, so the linker
+   never needs to pull the matching `.o` out of the archive (archive
+   members are only extracted for symbols still undefined after the
+   objects named directly on the command line). Verified empirically for
+   a `static` function in both `src/nxt_conf.c`
+   (`nxt_conf_json_skip_space`) and `src/nxt_http_parse.c`
+   (`nxt_http_lookup_field_end`) while building this fix -- no
+   duplicate-symbol problem appeared for either file, so no fallback was
+   needed for this batch. `run_c_test()` still carries a fallback path
+   (retry with `-Wl,--allow-multiple-definition`) for a future TU this
+   hasn't been exercised against. Removing `static`, changing a target's
+   signature, or copying its body into the test file are explicitly
+   called out in every template as out of scope and rejected, as is a
+   test that re-implements the function under test instead of calling
+   it.
+
+3. **Each card now carries a `test_skeleton`.** Run 1's other failure
+   mode was format drift -- Haiku wrote tests in `src/test`'s harness
+   shape with no `main()`. Every card in `tasks.jsonl` now has a
+   `test_skeleton` field: a minimal, already-compiling standalone C test
+   file using the exact include style that works for that card's target
+   (plain `nxt_main.h` for a non-`static` target, the TU-include pattern
+   above for a `static` one), with one trivial placeholder check and a
+   `main()` returning 0/non-zero. `make_context.py` now prints it in the
+   executor prompt as the stated starting point for `tests[]`. All 12
+   skeletons were compiled and run through `run_task.py`'s C-test
+   machinery (via a no-op edit per card) and pass as-is; all 12 cards'
+   `base_body_sha` were also re-checked against a freshly built index --
+   none had changed since the cards were written.

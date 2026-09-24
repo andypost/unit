@@ -109,6 +109,20 @@ def build_prompt(card, index_path):
     parts.append("\n---\n## Context slice: target function\n")
     parts.append("```\n" + run_slice(card["fid"], index_path) + "\n```\n")
 
+    test_skeleton = card.get("test_skeleton")
+    if test_skeleton:
+        parts.append(
+            "\n---\n## Test skeleton (starting point for `tests[]`)\n\n"
+            "A minimal, already-compiling standalone C test file for this "
+            "card -- it builds and passes as-is (proven via run_task.py's "
+            "C-test step with a no-op edit). Start from this, keep its "
+            "include style and (for a `static` target) its TU-include "
+            "line exactly as given, and replace its placeholder check "
+            "with the real assertions the card's `known_issue` calls "
+            "for.\n"
+        )
+        parts.append("```c\n" + test_skeleton + "\n```\n")
+
     companion_fid = card.get("companion_fid")
     if companion_fid:
         parts.append(

@@ -1491,7 +1491,7 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
      * co-located with arrival makes the trust boundary explicit.
      */
     {
-        void                *name, *value;
+        void                *name, *value, *end;
         uint32_t            i;
         nxt_unit_request_t  *vr = recv_msg->start;
         uint32_t            vsize = recv_msg->size;
@@ -1550,6 +1550,8 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
          * pointers the check returns are used, not the sptr read again:
          * the peer can change the offset between two reads.
          */
+        end = &vr->fields[vr->fields_count];
+
         for (i = 0; i < vr->fields_count; i++) {
             name = nxt_unit_sptr_in_buf(&vr->fields[i].name,
                                         vr->fields[i].name_length,
@@ -1559,9 +1561,7 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
                                          recv_msg->start, vsize);
 
             if (nxt_slow_path(name == NULL || value == NULL
-                              || name < (void *) &vr->fields[vr->fields_count]
-                              || value < (void *) &vr->fields[vr->fields_count]
-               ))
+                              || name < end || value < end))
             {
                 nxt_unit_warn(ctx, "#%"PRIu32": malformed request: field "
                               "%"PRIu32" sptr out of buffer",

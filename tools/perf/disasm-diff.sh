@@ -91,7 +91,14 @@ while IFS= read -r func || [ -n "$func" ]; do
     extract "$func" > "$out"
 
     if [ ! -s "$out" ]; then
-        missing="$missing $func"
+        # A tracked function the baseline has must still be in the build:
+        # inlined or renamed, it is no longer checked.
+        if [ "$UPDATE" -eq 0 ] && [ -f "$base" ]; then
+            echo "MISSING (in the baseline, not in this build): $func"
+            status=1
+        else
+            missing="$missing $func"
+        fi
 
     elif [ "$UPDATE" -eq 1 ]; then
         cp "$out" "$base"

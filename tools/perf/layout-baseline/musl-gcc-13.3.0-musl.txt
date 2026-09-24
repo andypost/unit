@@ -233,5 +233,3 @@ struct nxt_unit_ctx_impl_s {
 	/* sum members: 17022, holes: 1, sum holes: 2 */
 	/* forced alignments: 1 */
 } __attribute__((__aligned__(8)));
-
-

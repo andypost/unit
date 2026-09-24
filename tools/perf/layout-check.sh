@@ -61,6 +61,10 @@ for entry in $STRUCTS; do
     echo >> "$dump"
 done
 
+# No trailing blank lines: git diff --check rejects them in the baseline.
+awk 'NF { while (n) { print ""; n-- } print; next } { n++ }' "$dump" > "$dump.t"
+mv "$dump.t" "$dump"
+
 if [ "$UPDATE" -eq 1 ]; then
     cp "$dump" "$BASELINE_FILE"
     echo "Baseline written to $BASELINE_FILE"

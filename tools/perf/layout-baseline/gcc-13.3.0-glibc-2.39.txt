@@ -185,9 +185,13 @@ struct nxt_port_s {
 	nxt_lvlhsh_t               rpc_streams;          /*   424     8 */
 	nxt_lvlhsh_t               rpc_peers;            /*   432     8 */
 	nxt_lvlhsh_t               frags;                /*   440     8 */
+	/* --- cacheline 7 boundary (448 bytes) --- */
+	uint32_t                   frag_streams;         /*   448     4 */
+	uint32_t                   frag_size;            /*   452     4 */
 
-	/* size: 448, cachelines: 7, members: 38 */
-	/* sum members: 444, holes: 2, sum holes: 4 */
+	/* size: 456, cachelines: 8, members: 40 */
+	/* sum members: 452, holes: 2, sum holes: 4 */
+	/* last cacheline: 8 bytes */
 };
 
 
@@ -229,5 +233,3 @@ struct nxt_unit_ctx_impl_s {
 	/* sum members: 17022, holes: 1, sum holes: 2 */
 	/* forced alignments: 1 */
 } __attribute__((__aligned__(8)));
-
-

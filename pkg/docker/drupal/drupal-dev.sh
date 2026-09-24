@@ -60,15 +60,21 @@ project_root()
 
 
 # Give the web user the owner of the bind-mounted checkout, so what Drupal,
-# Composer and PHPUnit write stays editable on the host.
+# Composer and PHPUnit write stays editable on the host.  The docroot is in
+# the mount either way (README.md); the base is the image's own for a core
+# clone.
 match_owner()
 {
-    local uid gid
+    local dir uid gid
 
-    [ "$(id -u)" = 0 ] && [ -d "$DRUPAL_BASE" ] || return 0
+    [ "$(id -u)" = 0 ] || return 0
 
-    uid=$(stat -c %u "$DRUPAL_BASE")
-    gid=$(stat -c %g "$DRUPAL_BASE")
+    dir=$DRUPAL_DOCROOT
+    [ -d "$dir" ] || dir=$DRUPAL_BASE
+    [ -d "$dir" ] || return 0
+
+    uid=$(stat -c %u "$dir")
+    gid=$(stat -c %g "$dir")
 
     [ "$uid" != 0 ] || return 0
     [ "$(id -u "$WEB_USER")" = "$uid" ] || usermod -o -u "$uid" "$WEB_USER"

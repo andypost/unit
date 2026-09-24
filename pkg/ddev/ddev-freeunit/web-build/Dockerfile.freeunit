@@ -7,9 +7,15 @@
 #
 # Change FREEUNIT_VERSION here (after removing the #ddev-generated line) to
 # build another release.
+#
+# The last two steps: unitd runs as the project user (supervisord does), so
+# /run/freeunit is handed to that user like DDEV does with /run/php; and
+# /etc/php/<version>/embed becomes a symlink to fpm, so the embedded PHP
+# uses the php.ini, .ddev/php/*.ini and module switches (enable_xdebug,
+# disable_xdebug, xhprof) DDEV manages for php-fpm.
 ARG FREEUNIT_VERSION=1.36.1
 
-RUN set -eu; \
+RUN set -eu -o pipefail; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         build-essential pkg-config libpcre2-dev \
@@ -34,10 +40,6 @@ RUN set -eu; \
     rm -rf /usr/src/freeunit; \
     apt-get purge -y --auto-remove build-essential pkg-config libpcre2-dev "php${DDEV_PHP_VERSION}-dev"; \
     rm -rf /var/lib/apt/lists/*; \
-    # unitd runs as the project user (supervisord does), like DDEV's own
-    # /run/php: give it its runtime directory.
     chown -R "$uid:$gid" /run/freeunit; \
-    # Let the embed SAPI use the php-fpm configuration DDEV manages
-    # (php.ini, .ddev/php/*.ini, enable_xdebug/disable_xdebug, xhprof).
     rm -rf "/etc/php/${DDEV_PHP_VERSION}/embed"; \
     ln -s fpm "/etc/php/${DDEV_PHP_VERSION}/embed"

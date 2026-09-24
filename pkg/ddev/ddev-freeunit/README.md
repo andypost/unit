@@ -80,8 +80,10 @@ ddev freeunit restart
   pays that compile again. `FREEUNIT_VERSION` in
   `web-build/Dockerfile.freeunit` pins the release.
 - One PHP version per image, `$DDEV_PHP_VERSION`; DDEV rebuilds the image
-  when it changes. `php<version>-embed` must exist on deb.sury.org for that
-  version (it does for the versions DDEV preinstalls).
+  when it changes. `php<version>-embed` and `-dev` must exist on
+  deb.sury.org for that version, or the image build fails.
+- FreeUnit logs to the container output (`ddev logs -s web`) by reopening
+  its stderr; that is a pipe supervisord creates as the same user.
 - `.ddev/nginx_full` and `.ddev/apache` configuration does not apply.
 
 ## Files

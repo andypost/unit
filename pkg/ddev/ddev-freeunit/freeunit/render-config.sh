@@ -62,6 +62,9 @@ JSON
         ;;
 esac
 
+# "forwarded": ddev-router terminates TLS and sends X-Forwarded-Proto/-For;
+# trusting them from any source is what DDEV's nginx configuration does too
+# (port 80 is only reachable through the Docker network anyway).
 cat <<JSON
 {
     "listeners": {
@@ -70,7 +73,7 @@ cat <<JSON
             "forwarded": {
                 "protocol": "X-Forwarded-Proto",
                 "client_ip": "X-Forwarded-For",
-                "source": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+                "source": ["0.0.0.0/0", "::/0"]
             }
         }
     },

@@ -11,4 +11,4 @@ set -euo pipefail
 
 mkdir -p /run/freeunit/state
 bash /mnt/ddev_config/freeunit/render-config.sh > /run/freeunit/state/conf.json
-exec unitd --no-daemon
+exec /usr/sbin/unitd --no-daemon

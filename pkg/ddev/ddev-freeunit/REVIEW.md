@@ -222,3 +222,55 @@ reject; **minor** = cleanup.
 All of 1-14, 16-21, 24. Result: `commands/web/xdebug` deleted, the cron and
 knob code deleted, `start-freeunit.sh` down to a render + `exec`, the
 Dockerfile to one `configure`/`make`, the README to what is needed.
+
+## Round 2 (review of the round-1 diff)
+
+1. **major** — `forwarded.source` listed RFC1918 ranges only
+   (`freeunit/render-config.sh:66`). Docker networks can be IPv6 ULA or a
+   non-default pool, in which case the header would be ignored and PHP
+   would see `HTTPS=off` again, silently. DDEV's nginx trusts the header
+   unconditionally. *Fixed:* `["0.0.0.0/0", "::/0"]` (accepted by
+   `nxt_http_route_addr_pattern_parse`, verified at runtime).
+2. **major** — the `curl | tar` pipeline in the Dockerfile ran under
+   `set -eu` only (`web-build/Dockerfile.freeunit:12`): a failed download
+   would leave an empty tree and a confusing `configure` error. *Fixed:*
+   `set -eu -o pipefail` (DDEV's generated Dockerfile sets
+   `SHELL ["/bin/bash", "-c"]`).
+3. **minor** — comment lines inside the `RUN` continuation
+   (`web-build/Dockerfile.freeunit:38-43`) rely on the Dockerfile parser
+   stripping them. *Fixed:* moved above the instruction.
+4. **minor** — `exec unitd` depended on `/usr/sbin` being in supervisord's
+   `PATH` (`freeunit/start-freeunit.sh:14`). *Fixed:* absolute path.
+5. **minor** — README claimed `php<version>-embed` exists on deb.sury.org
+   for every preinstalled version; packages.sury.org is unreachable from
+   here, so that is unverified. *Fixed:* stated as a requirement, not a
+   fact; also documented that the log goes to the container output by
+   reopening stderr.
+6. Checked and left as is: a stale `control.sock` is replaced by unitd
+   itself (`src/nxt_listen_socket.c:105-120` binds a `.tmp` path and
+   renames over it), so the start script needs no `rm -f`; `stopasgroup`
+   in DDEV's supervisord program delivers `TERM` straight to the `exec`'d
+   unitd; `--auto-remove` after purging the toolchain only removes
+   packages that were installed automatically and are no longer required,
+   and DDEV's base image already ran `apt-get autoremove`, so nothing the
+   image relied on before this step can go.
+7. Runtime verification extended: `PATH_INFO` (`/index.php/sub`), a missing
+   `*.php` (404 from the PHP module, not the source), a directory without
+   trailing slash (301).
+
+## Round 3 (review of the round-2 diff)
+
+Read through the final tree once more; nothing blocking or major left.
+Remaining, deliberately not changed:
+
+- `post_install_actions` keeps one `chmod +x` for `commands/web/freeunit`
+  because it is *unverified* whether `ddev add-on get` preserves the
+  executable bit of `project_files`; the other scripts are run via `bash`
+  and need no bit.
+- Whether DDEV's own `enable_xdebug` restarts `web_extra_daemons` on
+  `webserver_type: generic` (and from which version) is *unverified*;
+  `ddev freeunit restart` and the bats test cover both cases.
+- `limits.timeout: 3600` is generous on purpose (Xdebug); PHP's
+  `max_execution_time` still applies.
+- The `release` bats test cannot pass until the add-on has its own
+  repository.

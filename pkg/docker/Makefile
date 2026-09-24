@@ -132,6 +132,9 @@ DEVKIT_BASE_drupal-core-dev-php8.5 ?= ghcr.io/freeunitorg/freeunit:$(VERSION)-ph
 
 $(addprefix Dockerfile., $(DEVKITS)): ;
 
+# What the image copies in, beyond its Dockerfile.
+build-drupal-core-dev-php8.5: drupal/drupal-dev.sh drupal/unit-drupal.json
+
 $(addprefix build-, $(DEVKITS)): build-%: Dockerfile.%
 	docker build -t unit:$(VERSION)-$* \
 		--build-arg FREEUNIT_VERSION=$(VERSION) \

@@ -56,15 +56,7 @@ typedef struct {
     uint8_t           otel_configured;
 
     size_t            apps_count;
-    /*
-     * schedules_count entries of nxt_status_schedule_t follow the last
-     * nxt_status_app_t in "apps" (not a member here, since C allows only one
-     * flexible array member per struct): the whole report is one contiguous
-     * buffer copied across the router/controller port, so both sides must
-     * compute this second array's address the same way --
-     * (nxt_status_schedule_t *) (report->apps + report->apps_count), exactly
-     * as done in nxt_router.c and nxt_status.c.
-     */
+    /* Entries after apps[], see nxt_status_report_schedules(). */
     size_t            schedules_count;
     nxt_status_app_t  apps[];
 } nxt_status_report_t;
@@ -72,8 +64,6 @@ typedef struct {
 
 nxt_conf_value_t *nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp);
 
-
-/* See nxt_status_report_t.schedules_count above. */
 
 nxt_inline nxt_status_schedule_t *
 nxt_status_report_schedules(nxt_status_report_t *report)

@@ -95,10 +95,8 @@ comes back, matching how the router itself keeps that state alive.
   from `nxt_realtime()` when a run is dispatched.
 - `src/nxt_router.c`'s `nxt_router_status_handler()` builds the
   `schedules` part of the report the same two-pass way it already builds
-  `apps`: one pass to size the buffer (`nxt_router_schedules_status_count()`
-  plus a size-summing callback), one to fill it (a second callback that
-  copies each name into the same reverse-growing name area the app names
-  already use, then writes the offset-relocated `nxt_status_schedule_t`).
+  `apps`: one pass to size the buffer, one to fill it, copying each name
+  into the same reverse-growing name area the app names already use.
 - `src/nxt_status.c`'s `nxt_status_get()` turns that array into the
   `schedules` JSON object, one member per schedule, using
   `nxt_conf_set_member_dup` for the (possibly reconfiguration-surviving)

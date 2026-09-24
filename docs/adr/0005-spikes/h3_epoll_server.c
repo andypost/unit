@@ -189,8 +189,25 @@ conn_h3_events(h3_conn_t *c)
             n = snprintf(body, sizeof(body), "hello over h3, stream %ld\n",
                          (long) sid);
 
-            quiche_h3_send_response(c->h3, c->q, sid, hdrs, 3, false);
-            quiche_h3_send_body(c->h3, c->q, sid, (uint8_t *) body, n, true);
+            /*
+             * Both calls fail with QUICHE_ERR_STREAM_BLOCKED / DONE when the
+             * stream has no send capacity; FreeUnit would then park the
+             * response chain and resume it from the stream-writable event
+             * (quiche_conn_stream_writable / nghttp3 unblock), the same
+             * "deferred provider" shape as the h2 spike.  The spike only
+             * reports it.
+             */
+            if (quiche_h3_send_response(c->h3, c->q, sid, hdrs, 3, false) < 0) {
+                fprintf(stderr, "[h3] stream %ld send_response failed\n",
+                        (long) sid);
+                break;
+            }
+            if (quiche_h3_send_body(c->h3, c->q, sid, (uint8_t *) body, n, true)
+                != n)
+            {
+                fprintf(stderr, "[h3] stream %ld send_body short/blocked\n",
+                        (long) sid);
+            }
             break;
         }
 
@@ -255,7 +272,11 @@ listener_readable(void)
             /* No Retry in the spike; FreeUnit would add address validation. */
             c = calloc(1, sizeof(h3_conn_t));
             c->scid_len = LOCAL_CONN_ID_LEN;
-            getrandom(c->scid, c->scid_len, 0);
+            if (getrandom(c->scid, c->scid_len, 0) != (ssize_t) c->scid_len) {
+                perror("getrandom");
+                free(c);
+                continue;
+            }
             memcpy(c->odcid, dcid, dcid_len);
             c->odcid_len = dcid_len;
             memcpy(&c->peer, &peer, peer_len);

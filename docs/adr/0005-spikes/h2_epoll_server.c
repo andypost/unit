@@ -71,6 +71,9 @@ struct h2_stream_s {
     size_t           pending_len;
     int              deferred;      /* data provider returned DEFERRED */
     int              eof;
+    /* request DATA received but not yet "moved into r->body" (consumed
+     * on the next timer tick, which stands in for the router's copy) */
+    size_t           unconsumed;
     h2_stream_t      *next;
 };
 
@@ -251,12 +254,19 @@ on_data_chunk_recv(nghttp2_session *session, uint8_t flags, int32_t stream_id,
     }
 
     /*
-     * Flow control: with automatic window update disabled we would call
-     * nghttp2_session_consume() only once the router has actually consumed
-     * the bytes (moved them into r->body / the temp file).  Here we consume
-     * immediately, which is what nghttp2's default auto-update does anyway.
+     * Flow control, the ADR model: automatic window updates are off.  The
+     * connection-level window is released at once (the bytes are already in
+     * our memory), the stream-level window only when the router has moved
+     * the bytes into r->body, which the timer tick stands in for (see
+     * conn_tick).  A slow consumer therefore stalls the stream at
+     * INITIAL_WINDOW_SIZE without stalling the other streams.
      */
-    nghttp2_session_consume(session, stream_id, len);
+    if (nghttp2_session_consume_connection(session, len) != 0) {
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    if (s != NULL) {
+        s->unconsumed += len;
+    }
     (void) c;
     return 0;
 }
@@ -402,7 +412,11 @@ conn_flush(h2_conn_t *c)
             }
 
             if ((size_t) n > sizeof(c->outbuf)) {
-                n = sizeof(c->outbuf);   /* nghttp2 frames are <= 16K+9 */
+                /* One mem_send() result is one frame, at most 16K+9 bytes
+                 * with the default SETTINGS_MAX_FRAME_SIZE; a larger result
+                 * must never be truncated (it would corrupt the stream). */
+                fprintf(stderr, "mem_send: %zd bytes > outbuf\n", n);
+                return -1;
             }
             memcpy(c->outbuf, data, n);
             c->outlen = n;
@@ -462,11 +476,27 @@ conn_read(h2_conn_t *c)
     }
 }
 
+/*
+ * The values below are the ADR's acceptance criteria (docs/adr/0005,
+ * "Security requirements"), so the spike also proves the distro header has
+ * the symbols: Ubuntu 24.04 backports max_continuations and the reset rate
+ * limit into 1.59 without bumping NGHTTP2_VERSION_NUM.
+ */
+#define H2_MAX_CONCURRENT_STREAMS   128
+#define H2_STREAM_WINDOW            (256 * 1024)   /* body_buffer_size */
+#define H2_CONN_WINDOW              (2 * H2_STREAM_WINDOW)
+#define H2_MAX_HEADER_LIST_SIZE     (32 * 1024)    /* 4 x 8 KB large_header_buffers */
+#define H2_RST_BURST                1000
+#define H2_RST_RATE                 33
+#define H2_MAX_CONTINUATIONS        8
+#define H2_MAX_SETTINGS             32
+
 static int
 conn_h2_init(h2_conn_t *c)
 {
     nghttp2_session_callbacks *cbs;
-    nghttp2_settings_entry     iv[2];
+    nghttp2_option             *opt;
+    nghttp2_settings_entry     iv[3];
     int                        rv;
 
     nghttp2_session_callbacks_new(&cbs);
@@ -476,18 +506,38 @@ conn_h2_init(h2_conn_t *c)
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, on_data_chunk_recv);
     nghttp2_session_callbacks_set_on_stream_close_callback(cbs, on_stream_close);
 
-    rv = nghttp2_session_server_new(&c->session, cbs, c);
+    nghttp2_option_new(&opt);
+    nghttp2_option_set_no_auto_window_update(opt, 1);
+    nghttp2_option_set_stream_reset_rate_limit(opt, H2_RST_BURST, H2_RST_RATE);
+    nghttp2_option_set_max_continuations(opt, H2_MAX_CONTINUATIONS);
+    nghttp2_option_set_max_settings(opt, H2_MAX_SETTINGS);
+    /* HPACK: our encoder's dynamic table; the decoder's is what the peer
+     * asks for in SETTINGS_HEADER_TABLE_SIZE, capped by nghttp2 at 4 KB
+     * unless we raise it (we do not). */
+    nghttp2_option_set_max_deflate_dynamic_table_size(opt, 4096);
+
+    rv = nghttp2_session_server_new2(&c->session, cbs, c, opt);
+    nghttp2_option_del(opt);
     nghttp2_session_callbacks_del(cbs);
     if (rv != 0) {
         return -1;
     }
 
     iv[0].settings_id = NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS;
-    iv[0].value = 100;
+    iv[0].value = H2_MAX_CONCURRENT_STREAMS;
     iv[1].settings_id = NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE;
-    iv[1].value = 64 * 1024;   /* would follow body_buffer_size */
+    iv[1].value = H2_STREAM_WINDOW;
+    iv[2].settings_id = NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE;
+    iv[2].value = H2_MAX_HEADER_LIST_SIZE;
 
-    return nghttp2_submit_settings(c->session, NGHTTP2_FLAG_NONE, iv, 2);
+    rv = nghttp2_submit_settings(c->session, NGHTTP2_FLAG_NONE, iv, 3);
+    if (rv != 0) {
+        return -1;
+    }
+
+    /* connection-level window (a WINDOW_UPDATE on stream 0) */
+    return nghttp2_session_set_local_window_size(c->session, NGHTTP2_FLAG_NONE,
+                                                 0, H2_CONN_WINDOW);
 }
 
 static int
@@ -582,6 +632,17 @@ conn_tick(h2_conn_t *c)
     int          produced = 0;
 
     for (s = c->streams; s != NULL; s = s->next) {
+        /* "the router moved the request bytes into r->body": release the
+         * stream window (nxt_h2p_request_body_read / on_data_chunk_recv) */
+        if (s->unconsumed > 0) {
+            if (nghttp2_session_consume_stream(c->session, s->stream_id,
+                                               s->unconsumed) == 0)
+            {
+                produced = 1;
+            }
+            s->unconsumed = 0;
+        }
+
         if (s->chunks_left > 0 && s->pending_len == 0) {
             s->pending_len = snprintf(s->pending, sizeof(s->pending),
                                       "stream %d chunk %d for %s\n",
@@ -698,7 +759,12 @@ main(int argc, char **argv)
                         conns[cfd] = c;
                     }
                     fprintf(stderr, "[conn %d] accepted\n", cfd);
-                    conn_handshake(c);
+                    if (conn_handshake(c) < 0) {
+                        conn_close(c);
+                        if (cfd < FD_SETSIZE) {
+                            conns[cfd] = NULL;
+                        }
+                    }
                 }
                 continue;
             }

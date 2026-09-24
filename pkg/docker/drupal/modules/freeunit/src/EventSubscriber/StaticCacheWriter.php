@@ -85,7 +85,9 @@ final class StaticCacheWriter implements EventSubscriberInterface {
     $response = $event->getResponse();
 
     $file = $this->mapper->fileFor($request);
-    if ($file === NULL || !$this->isWritable($request, $response, $settings->get('static_cache'))) {
+    if ($file === NULL
+      || !$response instanceof CacheableResponseInterface
+      || !$this->isWritable($request, $response, $settings->get('static_cache'))) {
       return;
     }
     // A HIT is written only when the file is missing (after a purge, an
@@ -99,7 +101,6 @@ final class StaticCacheWriter implements EventSubscriberInterface {
       return;
     }
 
-    /** @var \Drupal\Core\Cache\CacheableResponseInterface $response */
     $tags = $response->getCacheableMetadata()->getCacheTags();
     $expire = 0;
     if (($expires = $response->getExpires()) !== NULL && $expires->getTimestamp() > time()) {
@@ -134,7 +135,6 @@ final class StaticCacheWriter implements EventSubscriberInterface {
       || !$this->currentUser->isAnonymous()
       || $this->sessionConfiguration->hasSession($request)
       || $response->getStatusCode() !== 200
-      || !$response instanceof CacheableResponseInterface
       // A BigPipe response's getContent() holds placeholders, not the
       // streamed parts; never write one.  Class name only: big_pipe may be
       // off.
@@ -152,23 +152,27 @@ final class StaticCacheWriter implements EventSubscriberInterface {
     if (!is_string($content) || $content === '' || strlen($content) > (int) $conf['max_bytes']) {
       return FALSE;
     }
-    // Every header must either carry exactly the value the route reproduces
-    // for every page, or be one the route may drop; otherwise the router
-    // would serve something Drupal did not send (another Content-Language,
-    // another Cache-Control, a Vary the route does not know).
+    // The headers, minus the ones the route may drop, must be exactly the
+    // ones the route reproduces for every page, with the same values;
+    // otherwise the router would serve something Drupal did not send
+    // (another Content-Language, a Vary the route does not know, or an
+    // Expires the page did not have).
     $fixed = array_change_key_case((array) $conf['headers'], CASE_LOWER);
+    $sent = [];
     foreach ($response->headers->allPreserveCaseWithoutCookies() as $name => $values) {
       $name = strtolower((string) $name);
-      if (in_array($name, self::DROPPED, TRUE)) {
-        continue;
+      if (!in_array($name, self::DROPPED, TRUE)) {
+        $sent[$name] = implode("\n", $values);
       }
-      if (!isset($fixed[$name]) || $values !== [(string) $fixed[$name]]) {
-        $this->logger->debug('Not writing @uri: header @h is not what the route reproduces.', [
-          '@uri' => $request->getRequestUri(),
-          '@h' => $name,
-        ]);
-        return FALSE;
-      }
+    }
+    ksort($sent);
+    ksort($fixed);
+    if ($sent !== array_map('strval', $fixed)) {
+      $this->logger->debug('Not writing @uri: headers @h differ from what the route reproduces.', [
+        '@uri' => $request->getRequestUri(),
+        '@h' => implode(', ', array_keys(array_diff_assoc($sent, $fixed) + array_diff_assoc($fixed, $sent))),
+      ]);
+      return FALSE;
     }
     return TRUE;
   }

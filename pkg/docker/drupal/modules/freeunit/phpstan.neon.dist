@@ -1,0 +1,8 @@
+parameters:
+  level: 6
+  paths:
+    - .
+  fileExtensions: [php, module, install, inc]
+  treatPhpDocTypesAsCertain: false
+  ignoreErrors:
+    - identifier: missingType.iterableValue

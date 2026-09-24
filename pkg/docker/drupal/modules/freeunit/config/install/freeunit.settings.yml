@@ -18,7 +18,7 @@ static_cache:
   headers:
     cache-control: 'max-age=300, public'
     content-language: en
-    content-type: 'text/html; charset=UTF-8'
+    content-type: 'text/html; charset=utf-8'
     expires: 'Sun, 19 Nov 1978 05:00:00 GMT'
     vary: Cookie
     x-content-type-options: nosniff

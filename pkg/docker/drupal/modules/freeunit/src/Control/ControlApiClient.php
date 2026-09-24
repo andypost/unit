@@ -75,7 +75,7 @@ final class ControlApiClient {
   /**
    * Graceful restart: a new prototype and workers; running requests finish.
    *
-   * src/nxt_controller.c:2470 (GET only), src/nxt_router.c:1602.  A new
+   * See src/nxt_controller.c:2470 (GET only), src/nxt_router.c:1602.  A new
    * prototype re-runs PHP module startup, so OPcache starts empty and
    * opcache.preload runs again.
    */

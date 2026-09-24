@@ -52,5 +52,5 @@ function freeunit_schema(): array {
  * until someone deletes them by hand.
  */
 function freeunit_uninstall(): void {
-  \Drupal::service('freeunit.static_cache.invalidator')->purge();
+  \Drupal::service('freeunit.static_cache.invalidator')->uninstall();
 }

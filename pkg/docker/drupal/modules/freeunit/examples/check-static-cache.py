@@ -46,7 +46,7 @@ if ($uri === '/freeunit/cron') {
     http_response_code($ok ? 204 : 403);
     return;
 }
-header('Content-Type: text/html; charset=UTF-8');
+header('Content-Type: text/html; charset=utf-8');
 header('X-Drupal-Cache: MISS');
 echo "<html><body>php $uri</body></html>\n";
 fastcgi_finish_request();
@@ -152,7 +152,7 @@ def main():
           h.get('content-encoding') == 'gzip'
           and gzip.decompress(b).startswith(b'<html><body>static'))
     check('gzip variant has the HTML content type and Vary',
-          h.get('content-type') == 'text/html; charset=UTF-8'
+          h.get('content-type') == 'text/html; charset=utf-8'
           and h.get('vary') == 'Cookie, Accept-Encoding')
     s, h, b = raw_get(port, [], method='HEAD')
     check('HEAD served by the router', h.get('x-drupal-cache') == 'HIT-FREEUNIT')

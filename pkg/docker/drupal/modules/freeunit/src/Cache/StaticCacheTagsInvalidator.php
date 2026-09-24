@@ -34,6 +34,11 @@ final class StaticCacheTagsInvalidator implements CacheTagsInvalidatorInterface,
    */
   private array $pending = [];
 
+  /**
+   * Set by uninstall(): the index table is about to be dropped.
+   */
+  private bool $uninstalled = FALSE;
+
   public function __construct(
     private readonly StaticCacheIndex $index,
     private readonly StaticCacheFiles $files,
@@ -48,7 +53,10 @@ final class StaticCacheTagsInvalidator implements CacheTagsInvalidatorInterface,
   /**
    * {@inheritdoc}
    */
-  public function invalidateTags(array $tags) {
+  public function invalidateTags(array $tags): void {
+    if ($this->uninstalled) {
+      return;
+    }
     $this->deleteFor($tags);
     foreach ($tags as $tag) {
       $this->pending[$tag] = TRUE;
@@ -56,15 +64,27 @@ final class StaticCacheTagsInvalidator implements CacheTagsInvalidatorInterface,
   }
 
   /**
-   * Deletes every file; called from hook_cache_flush and hook_uninstall.
+   * Deletes every file; called from hook_cache_flush.
    */
   public function purge(): void {
     $this->files->purge();
     $this->index->forgetAll();
   }
 
+  /**
+   * Purges, then ignores invalidations for the rest of this request.
+   *
+   * Called from hook_uninstall.  The module's table is dropped right after
+   * it, while this service stays in the container until the uninstall saves
+   * core.extension, which invalidates tags.
+   */
+  public function uninstall(): void {
+    $this->purge();
+    $this->uninstalled = TRUE;
+  }
+
   public function onTerminate(): void {
-    if ($this->pending !== []) {
+    if ($this->pending !== [] && !$this->uninstalled) {
       $tags = array_keys($this->pending);
       $this->pending = [];
       $this->deleteFor($tags);

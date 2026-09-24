@@ -30,8 +30,11 @@ final class FreeUnitHooks {
   ) {}
 
   /**
-   * drupal_flush_all_caches() deletes cache.page with deleteAll(), which no
-   * tag invalidation reports; it does invoke hook_cache_flush first.
+   * Purges on a full flush.
+   *
+   * The function drupal_flush_all_caches() deletes cache.page with
+   * deleteAll(), which no tag invalidation reports; it does invoke
+   * hook_cache_flush first.
    */
   #[Hook('cache_flush')]
   public function cacheFlush(): void {

@@ -418,3 +418,60 @@ the seeds once with the Python `h2` package (preface + SETTINGS, GET, POST
 with DATA, CONTINUATION split, RST_STREAM). **Status: fixed.**
 
 No spike change in round 2; the round-1 binaries and results stand.
+
+---
+
+## Round 3 (final pass over the round-2 text)
+
+**R3-01 · M · Header-list-size enforcement was attributed to nghttp2.**
+The security row said a total over `SETTINGS_MAX_HEADER_LIST_SIZE` "is a
+431", implying nghttp2 enforces the advertised value on receipt. The
+advertised value is advisory to the peer; what the spike observed for the
+70 KB header was nghttp2's separate 64 KiB inbound header block cap.
+*Fix:* count name + value + 32 per field in `on_header` ourselves, answer
+431, keep consuming the block so HPACK state stays in sync; nghttp2's cap
+is the outer bound. **Status: fixed.**
+
+**R3-02 · L (simplicity) · Three listener options had crept back in.**
+`http2.stream_window`, `http2.max_concurrent_streams` and the open
+question about them contradicted "one knob". *Fix:* the first release has
+exactly `"tls": {"http2": true}`; windows, stream cap and request cap are
+constants in `nxt_h2proto.h`, promoted to options only on demand.
+**Status: fixed (Option 1, security table, 1.2, open questions).**
+
+**R3-03 · L · The body paragraph narrated the ADR's own drafting** ("the
+review's first draft had…"). *Fix:* stated as a considered-and-rejected
+alternative. **Status: fixed.**
+
+**R3-04 · L · Evidence for the manual-mode claim was qualitative.**
+*Fix:* timed run added to §8.1 and the README: the 5 MB POST takes 2.10 s
+(20 releases of 256 KiB at 100 ms), the 1 KB POST 0.29 s, and a GET on a
+second stream of the same connection completes while the upload stream
+is at its window (`timing.sh`, `unshare -n`). **Status: fixed.**
+
+Checked and left as is: the two-lifetime rule and the connection-error
+walk are consistent (streams live in `c->mem_pool`, so a connection that
+cannot send its GOAWAY still frees them); the effort figures agree between
+the plan and the comparison table (12–18 days); every remaining `file:line`
+was spot-checked once more against the tree.
+
+### Summary of the three rounds
+
+| Round | H | M | L | Main outcome |
+|---|---|---|---|---|
+| 1 | 5 | 11 | 9 | lifetimes, body path, error propagation, GOAWAY, security criteria, phase cut, spike fixes |
+| 2 | 1 | 2 | 5 | automatic window updates, `:authority`/`host` rule, claims turned into tests |
+| 3 | 0 | 1 | 3 | header-list counting ours, one knob, evidence |
+
+Open after round 3 (not resolvable by review alone):
+
+1. Whether nghttp2 sends `RST_STREAM(NO_ERROR)` when the server ends its
+   side first is a phase-1 test with a fallback, not a verified fact here.
+2. Whether Ubuntu 22.04's nghttp2 1.43 passes the symbol probe depends on
+   Canonical's backports; a CI leg answers it.
+3. h2spec was not run: the tool could not be built or downloaded in this
+   container; phase 1.6 owns the first run and the allow-list.
+4. The `header_read_timeout`-as-progress-timer proposal has not been
+   exercised; the 1.4 review decides against the h1 timer code.
+5. h3 remains deferred with a requirements list; no spike of the preferred
+   stack (ngtcp2 + `ngtcp2_crypto_ossl`) was possible without OpenSSL 3.5.

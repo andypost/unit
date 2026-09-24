@@ -38,7 +38,9 @@ curl -sk --http2 -H "X-Big: $(head -c 70000 /dev/zero | tr '\0' a)" https://127.
 
 Observed (2026-09-24 re-run, in `unshare -n` on a high port): `HTTP 2 code
 200`; four streams on one connection; `up=100000` and `up=5000000` with the
-stream window released 256 KiB per tick; nghttp shows SETTINGS, the
+stream window released 256 KiB per tick (the 5 MB upload takes 2.1 s: 20
+releases, not the link; a GET on another stream of the same connection is
+answered meanwhile); nghttp shows SETTINGS, the
 stream-0 WINDOW_UPDATE for the connection window, HEADERS and three DATA
 frames (the body is produced by a 100 ms timer through a deferred
 `nghttp2_data_provider`, the shape of a future `nxt_h2p_request_send()`);

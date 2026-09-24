@@ -426,15 +426,16 @@ path are the parts that were wrong in the first draft).
   (memory up to `body_buffer_size`, then the temp file, exactly h1's
   bound). Since the bytes never wait in our memory, nghttp2's **automatic
   window update stays on**: the windows are throughput knobs, not memory
-  bounds. `SETTINGS_INITIAL_WINDOW_SIZE` = 256 KiB (listener option
-  `http2.stream_window`) and the connection window 1 MiB
-  (`nghttp2_session_set_local_window_size()` on stream 0) give an upload
-  a sane bandwidth-delay product; memory per connection is bounded by
+  bounds. `SETTINGS_INITIAL_WINDOW_SIZE` = 256 KiB and the connection
+  window 1 MiB (`nghttp2_session_set_local_window_size()` on stream 0),
+  both compile-time constants in the first release, give an upload a sane
+  bandwidth-delay product; memory per connection is bounded by
   `MAX_CONCURRENT_STREAMS × body_buffer_size` plus the engine read buffer,
-  disk by `max_body_size` per stream as for h1. The review's first draft
-  had manual window updates with two consume points; they add code and
-  bound nothing extra, so they are out (the spike still exercises that
-  mode, §8.1, should a temp-file write ever need pacing). `body_read`
+  disk by `max_body_size` per stream as for h1. Manual window updates
+  (`no_auto_window_update` with consume calls at connection and stream
+  level) were considered and rejected: they add two code paths and bound
+  nothing more; the spike exercises that mode (§8.1) should a temp-file
+  write ever need pacing. `body_read`
   (`nxt_h2p_request_body_read`) only registers interest: if `END_STREAM`
   already arrived it queues `r->state->ready_handler`, else it sets a flag
   that `on_frame_recv(END_STREAM)` acts on. The whole body is buffered
@@ -724,8 +725,11 @@ R1-24), on Ubuntu 24.04 in `unshare -n`.
   streams on one connection; a 100 KB and a 5 MB `--data-binary` POST
   arrived complete (`up=5000000`) with the stream window released only
   from the 100 ms timer tick (the router's "moved into `r->body`"
-  moment), i.e. manual flow control; `nghttp -nv` showed SETTINGS, the
-  stream-0 WINDOW_UPDATE, HEADERS and DATA with END_STREAM.
+  moment), i.e. manual flow control: the 5 MB upload took 2.10 s, which is
+  the 20 window releases of 256 KiB and not the link, and a GET on a
+  second stream of the same connection was answered while the upload
+  stream sat at its window; `nghttp -nv` showed SETTINGS, the stream-0
+  WINDOW_UPDATE, HEADERS and DATA with END_STREAM.
 - The body is produced asynchronously by the timer through
   `NGHTTP2_ERR_DEFERRED` + `nghttp2_session_resume_data()`, which is the
   `nxt_h2p_request_send()` model. `h2load -n 2000 -c 8 -m 16` completed
@@ -809,9 +813,9 @@ value in `src/nxt_h2proto.c` (listener options only where marked).
 | Threat | Requirement | Where it is enforced |
 |---|---|---|
 | Rapid Reset (CVE-2023-44487): open+RST streams faster than the server can cancel work | `nghttp2_option_set_stream_reset_rate_limit(opt, 1000, 33)` (burst, per second; nghttp2 answers exhaustion with GOAWAY). Configure floor: the symbol must link. Plus `requests_total` per connection ≤ `H2_MAX_REQUESTS` (1000) → GOAWAY; the counter includes streams that were reset. | nghttp2 (≥ 1.57 semantics); `on_begin_headers` |
-| Concurrency: many open streams each holding a router request and a body buffer | `SETTINGS_MAX_CONCURRENT_STREAMS` = 128 (listener option `http2.max_concurrent_streams`, 1..1024); nghttp2 refuses excess streams before the SETTINGS ACK too (`pending_local_max_concurrent_stream`). In-flight body memory per connection ≤ 128 × `body_buffer_size`; temp files only after that per stream. | nghttp2; body allocator |
+| Concurrency: many open streams each holding a router request and a body buffer | `SETTINGS_MAX_CONCURRENT_STREAMS` = 128 (a constant in the first release; a listener option only if a user asks); nghttp2 refuses excess streams before the SETTINGS ACK too (`pending_local_max_concurrent_stream`). In-flight body memory per connection ≤ 128 × `body_buffer_size`; temp files only after that per stream. | nghttp2; body allocator |
 | CONTINUATION flood (CVE-2024-28182): endless header block without END_HEADERS | `nghttp2_option_set_max_continuations(opt, 8)`; symbol must link. | nghttp2 |
-| HPACK bomb / oversized header lists | Advertise `SETTINGS_MAX_HEADER_LIST_SIZE` = `large_header_buffer_size × large_header_buffers` (32 KiB default); nghttp2's 64 KiB inbound header block cap stays; `SETTINGS_HEADER_TABLE_SIZE` left at 4096 and `nghttp2_option_set_max_deflate_dynamic_table_size(opt, 4096)` for our encoder. A name longer than `NXT_HTTP_MAX_FIELD_NAME` (255) or a total over the list size is a 431 on the stream. `prepare_msg` still refuses the prefixed-name and method overflows (431/501). | `on_header`; nghttp2; router |
+| HPACK bomb / oversized header lists | Advertise `SETTINGS_MAX_HEADER_LIST_SIZE` = `large_header_buffer_size × large_header_buffers` (32 KiB default) and **count it ourselves** in `on_header` (name + value + 32 per field, RFC 9113 §6.5.2), since the advertised value is advisory to the peer and nghttp2 is not relied on to enforce it on receipt; nghttp2's 64 KiB inbound header block cap stays as the outer bound. `SETTINGS_HEADER_TABLE_SIZE` left at 4096 and `nghttp2_option_set_max_deflate_dynamic_table_size(opt, 4096)` for our encoder. A name longer than `NXT_HTTP_MAX_FIELD_NAME` (255) or a total over the list size is a 431 on the stream (headers are still consumed so HPACK state stays in sync). `prepare_msg` still refuses the prefixed-name and method overflows (431/501). | `on_header`; nghttp2; router |
 | SETTINGS / PING floods (unbounded ACK queue) | `nghttp2_option_set_max_settings(opt, 32)` and the default `nghttp2_option_set_max_outbound_ack` (1000): nghttp2 closes the session beyond them; we never disable them. | nghttp2 |
 | Empty DATA / WINDOW_UPDATE / PRIORITY floods | nghttp2 allocates nothing per such frame and our callbacks do no work for them (`on_frame_recv` ignores PRIORITY and empty DATA); the progress timer (`header_read_timeout`) closes a connection whose requests do not advance. No stronger claim is made; the h2load/fuzz runs in 1.6 watch CPU per connection. | nghttp2; timers |
 | Slow read / stalled body | Automatic window updates; stream window 256 KiB, connection window 1 MiB; bytes are copied out of nghttp2 at once so memory per connection ≤ streams × `body_buffer_size`; `header_read_timeout` as a progress timer while a request is incomplete; `send_timeout` on the connection write; `idle_timeout` with no streams. | `nxt_h2proto.c` timers, body allocator |
@@ -849,7 +853,7 @@ status-text tables, the ALPN dispatcher (that is phase 1 code).
 | # | Task | Where | Test |
 |---|---|---|---|
 | 1.1 | `--nghttp2` option, `auto/nghttp2` probe (link tests for `nghttp2_session_server_new2`, `nghttp2_option_set_stream_reset_rate_limit`, `nghttp2_option_set_max_continuations`), `NXT_HAVE_NGHTTP2`, `src/nxt_h2proto.c` in sources, summary/help lines. | `auto/options`, `auto/nghttp2`, `auto/sources`, `auto/summary`, `auto/help` | configure with and without the library; the probe result on Ubuntu 22.04's 1.43 (its security backports may or may not carry the two symbols) is recorded by a CI leg, and either outcome is acceptable as long as it is clean |
-| 1.2 | Listener option `"tls": {"http2": true}` (+ optional `max_concurrent_streams`), validation, OpenAPI. | `src/nxt_conf_validation.c:640`, `src/nxt_router.c:3128,3274`, `docs/unit-openapi.yaml` | `test/test_http2.py::test_config_*` (rejects without `tls`) |
+| 1.2 | Listener option `"tls": {"http2": true}`, the only new knob; validation, OpenAPI. Windows, stream and request caps are constants in `nxt_h2proto.h`. | `src/nxt_conf_validation.c:640`, `src/nxt_router.c:3128,3274`, `docs/unit-openapi.yaml` | `test/test_http2.py::test_config_*` (rejects a non-boolean, and `http2` outside `tls`) |
 | 1.3 | `nxt_tls_conf_t::alpn_h2` bit; `SSL_CTX_set_alpn_select_cb()` on every bundle context; selection after the handshake in `nxt_h1p_conn_proto_init()` under `#if (NXT_HAVE_NGHTTP2)`. | `src/nxt_tls.h:64-82`, `src/nxt_openssl.c:217-370`, `src/nxt_h1proto.c:465-484` | `curl --http1.1` and `--http2` on the same listener; SNI bundles both negotiate h2 (`test_tls_sni.py` parametrised) |
 | 1.4 | `src/nxt_h2proto.c` / `.h`: connection init with the §Security options and settings, read state, flush with back-pressure, the nghttp2 callbacks, the seven request hooks, stream/request lifetimes, timers, GOAWAY, error matrix. | new files; table entry `src/nxt_h1proto.c:136-167` | below |
 | 1.5 | `$request_line` for h2; `body_bytes_sent`; `$response_header_*` untouched. | `src/nxt_h2proto.c`, `src/nxt_http_variables.c:431-454` | `test_access_log.py` parametrised over h2 |
@@ -947,10 +951,10 @@ Effort when taken up: 25–40 engineer-days.
   h2spec is in CI and one release has shipped with it optional.
 - Do we want plaintext h2c for internal proxies (`nxt_http_proxy.c` peers)?
   Not in this plan; the peer protocol field makes it possible later.
-- `http2.stream_window` (256 KiB) and the connection window (1 MiB) are
-  proposed defaults from the spike; the h2load upload numbers in 1.6
-  decide whether they need to be listener options at all in the first
-  release.
+- The stream window (256 KiB), connection window (1 MiB), stream cap
+  (128) and request cap (1000) are constants taken from the spike and from
+  nginx's defaults; they become listener options only when a user needs
+  to change them, not pre-emptively.
 - h3 listener JSON shape (`"listeners": {"*:443": {"http3": true}}`
   creating a TCP and a UDP socket) and the two-fd socket RPC: decide when
   h3 is taken up.

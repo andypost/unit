@@ -298,6 +298,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_router_response_parse_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_port_frag_test(thr) != NXT_OK) {
         return 1;
     }

@@ -92,6 +92,7 @@ nxt_int_t nxt_port_ctrunc_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_rpc_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_queued_fd_test(nxt_thread_t *thr);
+nxt_int_t nxt_nncq_bound_test(nxt_thread_t *thr);
 nxt_int_t nxt_checked_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_schedule_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_prepare_msg_test(nxt_thread_t *thr);

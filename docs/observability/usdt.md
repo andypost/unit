@@ -16,7 +16,7 @@ it, each probe is a `nop` until a tracer attaches.
 | Probe | Call site | Arguments |
 |---|---|---|
 | `freeunit:port-send` | `nxt_port_socket_write2()` | `stream, type` |
-| `freeunit:port-recv` | `nxt_port_read_handler()` | `port->pid` |
+| `freeunit:port-recv` | `nxt_port_read_handler()`, once per message read | `port->pid` |
 | `freeunit:mmap-chunk-alloc` | `nxt_port_incoming_port_mmap()` | `process->pid, PORT_MMAP_SIZE` |
 | `freeunit:mmap-chunk-get` | `nxt_router_prepare_msg()` | `req_size + content_length` |
 | `freeunit:queue-enqueue` | `nxt_app_queue_send()` | `slot index, tracking id` |

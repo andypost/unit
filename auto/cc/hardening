@@ -1,0 +1,126 @@
+
+# Copyright (C) FreeUnit contributors.
+
+
+# --hardening=[off|default|strict] (auto/options).  "off" is the default
+# and leaves NXT_CFLAGS/NXT_LD_OPT exactly as auto/cc/test left them, so
+# an existing build that never passes the option is unaffected.
+#
+# Every flag below is probed by actually compiling (and, for the linker
+# flags, linking) a trivial program with it under -Werror before it is
+# added: an older compiler, a different target, or a libc without a given
+# protection just does not get that one flag instead of failing the
+# build.  This mirrors auto/feature's "try it and see" approach without
+# dragging in its value/run reporting, which none of these flags need.
+
+case "$NXT_HARDENING" in
+    off | default | strict)
+    ;;
+
+    *)
+        $echo
+        $echo $0: error: invalid value \"$NXT_HARDENING\" for --hardening.
+        $echo Valid values are: off, default, strict.
+        $echo
+        exit 1
+    ;;
+esac
+
+
+if [ $NXT_HARDENING != off ]; then
+
+nxt_hardening_try_cflag()
+{
+    nxt_flag=$1
+
+    $echo -n "checking for $nxt_flag ..."
+
+    cat << END > $NXT_AUTOTEST.c
+int main(void) { return 0; }
+END
+
+    if /bin/sh -c "($CC $CFLAGS $NXT_CFLAGS $NXT_CC_OPT $nxt_flag -Werror \
+                    -o $NXT_AUTOTEST $NXT_AUTOTEST.c)" \
+        >> $NXT_AUTOCONF_ERR 2>&1
+    then
+        $echo " found"
+        NXT_CFLAGS="$NXT_CFLAGS $nxt_flag"
+    else
+        $echo " not found"
+    fi
+
+    rm -rf $NXT_AUTOTEST $NXT_AUTOTEST.c
+}
+
+
+nxt_hardening_try_ldflag()
+{
+    nxt_flag=$1
+
+    $echo -n "checking for $nxt_flag ..."
+
+    cat << END > $NXT_AUTOTEST.c
+int main(void) { return 0; }
+END
+
+    if /bin/sh -c "($CC $CFLAGS $NXT_CFLAGS $NXT_CC_OPT \
+                    -o $NXT_AUTOTEST $NXT_AUTOTEST.c \
+                    $NXT_LD_OPT $nxt_flag)" \
+        >> $NXT_AUTOCONF_ERR 2>&1
+    then
+        $echo " found"
+        NXT_LD_OPT="$NXT_LD_OPT $nxt_flag"
+    else
+        $echo " not found"
+    fi
+
+    rm -rf $NXT_AUTOTEST $NXT_AUTOTEST.c
+}
+
+
+# Stop on error exit status again once the probes below are done, same as
+# auto/cc/test: a probe failing to compile is expected and handled, it
+# must not abort the whole configure run.
+set +e
+
+nxt_hardening_try_cflag -fstack-protector-strong
+nxt_hardening_try_cflag -fstack-clash-protection
+
+case "$NXT_SYSTEM_PLATFORM" in
+    amd64 | x86_64)
+        nxt_hardening_try_cflag -fcf-protection
+    ;;
+
+    arm64 | aarch64)
+        nxt_hardening_try_cflag -mbranch-protection=standard
+    ;;
+esac
+
+# _FORTIFY_SOURCE needs an optimizing build to do anything, and glibc
+# turns that into a hard "requires optimization" warning under -O0 --
+# which -Werror in the probe above (and in the real build) would then
+# fail on, so an explicit -O0 in NXT_CC_OPT skips the probe outright
+# rather than rely on that warning alone.
+case " $NXT_CC_OPT " in
+    *" -O0 "*)
+    ;;
+
+    *)
+        nxt_hardening_try_cflag -D_FORTIFY_SOURCE=3
+    ;;
+esac
+
+nxt_hardening_try_ldflag -Wl,-z,relro
+nxt_hardening_try_ldflag -Wl,-z,now
+nxt_hardening_try_ldflag -Wl,-z,noexecstack
+
+if [ $NXT_HARDENING = strict ]; then
+    nxt_hardening_try_cflag -Wformat=2
+    nxt_hardening_try_cflag -Wvla
+    nxt_hardening_try_cflag -Wimplicit-fallthrough
+    nxt_hardening_try_cflag -ftrivial-auto-var-init=pattern
+fi
+
+set -e
+
+fi

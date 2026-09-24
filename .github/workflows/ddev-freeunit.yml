@@ -59,8 +59,10 @@ jobs:
         include:
           - project_type: drupal11
             drupal: '^11'
+            stability: ''
           - project_type: drupal12
             drupal: '^12'
+            stability: alpha
     steps:
       - uses: actions/checkout@v5
 
@@ -81,6 +83,7 @@ jobs:
           FREEUNIT_SRC_TARBALL: ${{ runner.temp }}/freeunit-src.tar.gz
           PROJECT_TYPE: ${{ matrix.project_type }}
           DRUPAL_CONSTRAINT: ${{ matrix.drupal }}
+          DRUPAL_STABILITY: ${{ matrix.stability }}
         run: |
           mkdir -p "$RUNNER_TEMP/bench" && cd "$RUNNER_TEMP/bench"
           bash "$GITHUB_WORKSPACE/$ADDON/tests/metrics.sh" "$GITHUB_WORKSPACE/$ADDON" \

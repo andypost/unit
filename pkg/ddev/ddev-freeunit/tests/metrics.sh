@@ -5,7 +5,8 @@
 #
 #   metrics.sh <add-on dir> <out.json>
 #
-# Env: PROJECT_TYPE (drupal11), DRUPAL_CONSTRAINT (^11), PHP_VERSION (8.5),
+# Env: PROJECT_TYPE (drupal11), DRUPAL_CONSTRAINT (^11), DRUPAL_STABILITY,
+#      PHP_VERSION (8.5),
 #      DURATION (10s), CONCURRENCY (10), REPEAT (3),
 #      FREEUNIT_SRC_TARBALL (optional: build FreeUnit from this source).
 # Every measurement runs REPEAT times; report.py takes the median.
@@ -35,8 +36,14 @@ if ! ddev config --project-name="$PROJ" --project-type="$PROJECT_TYPE" \
         --docroot=web --php-version="$PHP_VERSION"
 fi
 ddev start -y
-ddev composer create-project "drupal/recommended-project:$DRUPAL_CONSTRAINT"
-ddev composer require drush/drush
+# Drupal 12 has pre-releases only so far: DRUPAL_STABILITY=alpha.
+ddev composer create-project ${DRUPAL_STABILITY:+--stability="$DRUPAL_STABILITY"} \
+    "drupal/recommended-project:$DRUPAL_CONSTRAINT"
+if [ -n "${DRUPAL_STABILITY:-}" ]; then
+    ddev composer config minimum-stability "$DRUPAL_STABILITY"
+    ddev composer config prefer-stable true
+fi
+ddev composer require -W drush/drush
 ddev drush site:install standard -y --account-pass=admin --site-name=bench
 ddev drush php:eval '\Drupal\node\Entity\Node::create(["type" => "article", "title" => "Bench", "body" => str_repeat("Lorem ipsum dolor sit amet. ", 200), "status" => 1])->save();'
 ddev drush status --fields=drupal-version,php-version | tee "$RAW/versions.txt"

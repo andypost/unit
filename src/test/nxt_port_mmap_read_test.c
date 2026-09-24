@@ -396,6 +396,55 @@ nxt_port_mmap_read_test(nxt_thread_t *thr)
         goto done;
     }
 
+    /*
+     * nxt_port_mmap_increase_buf() grows a buffer over the free chunks
+     * after it.  The peer maps the segment writable, so the busy sentinel
+     * past the last chunk -- and the bits after it -- may read as free: the
+     * buffer must still not grow past the data area.
+     */
+    seg = nxt_port_mmap_get_buf(task, &process->incoming,
+                                (PORT_MMAP_CHUNK_COUNT - c - 2)
+                                * PORT_MMAP_CHUNK_SIZE);
+    if (nxt_slow_path(seg == NULL || seg->parent != mmap_handler)) {
+        goto done;
+    }
+
+    for (i = 0; i < 4; i++) {
+        nxt_port_mmap_set_chunk_free(mmap_handler->hdr->free_map,
+                                     PORT_MMAP_CHUNK_COUNT + i);
+    }
+
+    (void) nxt_port_mmap_increase_buf(task, seg,
+                                      nxt_buf_mem_free_size(&seg->mem)
+                                      + 4 * PORT_MMAP_CHUNK_SIZE, 1);
+
+    if (seg->mem.end > nxt_port_mmap_chunk_start(mmap_handler->hdr,
+                                                 PORT_MMAP_CHUNK_COUNT))
+    {
+        nxt_log_alert(thr->log, "port mmap read test: increase_buf grew "
+                      "past the data area");
+        goto done;
+    }
+
+    /*
+     * The same for a new multi-chunk buffer whose first chunk is the last
+     * one: nxt_port_mmap_get() must not continue it past the data area.
+     */
+    nxt_port_mmap_set_chunk_free(mmap_handler->hdr->free_map,
+                                 PORT_MMAP_CHUNK_COUNT - 1);
+
+    seg = nxt_port_mmap_get_buf(task, &process->incoming,
+                                2 * PORT_MMAP_CHUNK_SIZE);
+
+    if (seg != NULL && seg->parent == mmap_handler
+        && seg->mem.end > nxt_port_mmap_chunk_start(mmap_handler->hdr,
+                                                    PORT_MMAP_CHUNK_COUNT))
+    {
+        nxt_log_alert(thr->log, "port mmap read test: get_buf ran past "
+                      "the data area");
+        goto done;
+    }
+
     ret = NXT_OK;
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "port mmap read test passed");

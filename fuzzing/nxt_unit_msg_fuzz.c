@@ -93,6 +93,9 @@ nxt_unit_msg_fuzz_handler(nxt_unit_request_info_t *req)
     nxt_unit_field_t    *f;
     nxt_unit_request_t  *r;
 
+    /* As the Python and Java modules do before reading the fields. */
+    nxt_unit_request_group_dup_fields(req);
+
     r = req->request;
     sum = 0;
 

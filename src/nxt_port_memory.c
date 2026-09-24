@@ -585,7 +585,10 @@ nxt_port_mmap_get(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_chunk_id_t *c,
             nchunks = 1;
 
             while (nchunks < n) {
-                res = nxt_port_mmap_chk_set_chunk_busy(free_map, *c + nchunks);
+                /* Not up to the sentinel: see nxt_port_mmap_increase_buf(). */
+                res = *c + nchunks < PORT_MMAP_CHUNK_COUNT
+                      && nxt_port_mmap_chk_set_chunk_busy(free_map,
+                                                          *c + nchunks);
 
                 if (res == 0) {
                     for (i = 0; i < nchunks; i++) {
@@ -768,8 +771,11 @@ nxt_port_mmap_increase_buf(nxt_task_t *task, nxt_buf_t *b, size_t size,
 
     c = start;
 
-    /* Try to acquire as much chunks as required. */
-    while (nchunks > 0) {
+    /*
+     * Try to acquire as much chunks as required.  Not up to the busy
+     * sentinel: the peer maps the segment writable and can clear it.
+     */
+    while (nchunks > 0 && c < PORT_MMAP_CHUNK_COUNT) {
 
         if (nxt_port_mmap_chk_set_chunk_busy(hdr->free_map, c) == 0) {
             break;

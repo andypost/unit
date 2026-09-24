@@ -1541,6 +1541,12 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
             return NXT_UNIT_ERROR;
         }
 
+        /*
+         * Field strings must also lie past fields[]: the router puts them
+         * there, and nxt_unit_request_group_dup_fields() moves fields one
+         * slot on by subtracting sizeof(nxt_unit_field_t) from their
+         * offsets, which a target inside fields[] would underflow.
+         */
         for (i = 0; i < vr->fields_count; i++) {
             if (nxt_slow_path(
                    !nxt_unit_sptr_in_buf(&vr->fields[i].name,
@@ -1548,7 +1554,11 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
                                          recv_msg->start, vsize)
                 || !nxt_unit_sptr_in_buf(&vr->fields[i].value,
                                          vr->fields[i].value_length,
-                                         recv_msg->start, vsize)))
+                                         recv_msg->start, vsize)
+                || nxt_unit_sptr_get(&vr->fields[i].name)
+                   < (void *) &vr->fields[vr->fields_count]
+                || nxt_unit_sptr_get(&vr->fields[i].value)
+                   < (void *) &vr->fields[vr->fields_count]))
             {
                 nxt_unit_warn(ctx, "#%"PRIu32": malformed request: field "
                               "%"PRIu32" sptr out of buffer",
@@ -4841,6 +4851,18 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
 
         rc = NXT_UNIT_ERROR;
 
+    } else if (nxt_slow_path(mm->hdr != NULL)) {
+        /*
+         * A duplicate id: buffers may point into the segment already
+         * there, so it stays and the new mapping goes.
+         */
+        nxt_unit_warn(ctx, "incoming_mmap: duplicate segment id %"PRIu32,
+                      id);
+
+        munmap(mem, PORT_MMAP_SIZE);
+
+        rc = NXT_UNIT_OK;
+
     } else {
         mm->hdr = hdr;
 
@@ -4992,7 +5014,29 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
     if (need_rbuf) {
         res = nxt_unit_get_mmap(ctx, pid, id);
         if (nxt_slow_path(res == NXT_UNIT_ERROR)) {
-            return NXT_UNIT_ERROR;
+            /*
+             * The caller releases rbuf on ERROR, so take it back off the
+             * wait queue first -- unless the segment arrived meanwhile and
+             * nxt_unit_incoming_mmap() already took it, in which case it
+             * is pending and still ours to wait on.
+             */
+            pthread_mutex_lock(&mmaps->mutex);
+
+            if (mmaps->elts[id].hdr == NULL) {
+                nxt_queue_remove(&rbuf->link);
+                res = NXT_UNIT_ERROR;
+
+            } else {
+                res = NXT_UNIT_AGAIN;
+            }
+
+            pthread_mutex_unlock(&mmaps->mutex);
+
+            if (res == NXT_UNIT_ERROR) {
+                nxt_atomic_fetch_add(&ctx_impl->wait_items, -1);
+            }
+
+            return res;
         }
     }
 

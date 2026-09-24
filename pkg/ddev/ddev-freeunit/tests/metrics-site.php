@@ -8,6 +8,10 @@
  */
 
 use Drupal\Core\DrupalKernel;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\node\Entity\NodeType;
+use Drupal\user\Entity\Role;
 use Symfony\Component\HttpFoundation\Request;
 
 $host = getenv('DDEV_HOSTNAME') ?: 'localhost';
@@ -58,17 +62,38 @@ $kernel->getContainer()->get('request_stack')->push($request);
 
 switch ($cmd) {
   case 'node':
-    $node = \Drupal::entityTypeManager()->getStorage('node')->create([
-      'type' => 'article',
-      'title' => 'Bench',
-      'uid' => 1,
-      'status' => 1,
-      'body' => [
+    // Standard in Drupal 11.4 and 12 ships no "article" type, and Drupal 12
+    // does not grant "access content" to anonymous users: set up both.
+    if (!NodeType::load('bench')) {
+      NodeType::create(['type' => 'bench', 'name' => 'Bench'])->save();
+    }
+    if (!NodeType::load('bench')) {
+      fwrite(STDERR, "node type 'bench' was not created\n");
+      exit(1);
+    }
+    if (FieldStorageConfig::loadByName('node', 'body') && !FieldConfig::loadByName('node', 'bench', 'body')) {
+      FieldConfig::create(['entity_type' => 'node', 'bundle' => 'bench', 'field_name' => 'body', 'label' => 'Body'])->save();
+      \Drupal::service('entity_display.repository')->getViewDisplay('node', 'bench')
+        ->setComponent('body', ['type' => 'text_default', 'label' => 'hidden'])->save();
+    }
+    foreach (['anonymous', 'authenticated'] as $rid) {
+      Role::load($rid)->grantPermission('access content')->save();
+    }
+    $values = ['type' => 'bench', 'title' => 'Bench', 'uid' => 1, 'status' => 1, 'promote' => 1];
+    $node = \Drupal::entityTypeManager()->getStorage('node')->create($values);
+    if ($node->hasField('body')) {
+      $node->set('body', [
         'value' => str_repeat('<p>Lorem ipsum dolor sit amet.</p>', 50),
-        'format' => 'basic_html',
-      ],
-    ]);
+        'format' => 'plain_text',
+      ]);
+    }
     $node->save();
+    // Without the frontpage view, "/" would have nothing to show.
+    $views = \Drupal::entityTypeManager()->hasDefinition('view')
+      ? \Drupal::entityTypeManager()->getStorage('view')->load('frontpage') : NULL;
+    if (!$views || !$views->status()) {
+      \Drupal::configFactory()->getEditable('system.site')->set('page.front', '/node/' . $node->id())->save();
+    }
     echo $node->id(), "\n";
     break;
 

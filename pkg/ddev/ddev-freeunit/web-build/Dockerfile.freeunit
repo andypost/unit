@@ -6,7 +6,11 @@
 # build steps, so DDEV_PHP_VERSION, uid and gid are already declared.
 #
 # Change FREEUNIT_VERSION here (after removing the #ddev-generated line) to
-# build another release.
+# build another release. To build unreleased source instead (CI does this),
+# put a tarball with one top-level directory at
+# .ddev/web-build/freeunit-src.tar.gz, e.g.
+#   git archive --prefix=freeunit/ -o .ddev/web-build/freeunit-src.tar.gz HEAD
+# The build context is bind-mounted, so it need not be copied into a layer.
 #
 # The last two steps: unitd runs as the project user (supervisord does), so
 # /run/freeunit is handed to that user like DDEV does with /run/php; and
@@ -15,14 +19,19 @@
 # disable_xdebug, xhprof) DDEV manages for php-fpm.
 ARG FREEUNIT_VERSION=1.36.1
 
-RUN set -eu -o pipefail; \
+RUN --mount=type=bind,source=.,target=/mnt/freeunit-ctx \
+    set -eu -o pipefail; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         build-essential pkg-config libpcre2-dev \
         "php${DDEV_PHP_VERSION}-embed" "php${DDEV_PHP_VERSION}-dev"; \
     mkdir -p /usr/src/freeunit; \
-    curl -fsSL "https://github.com/freeunitorg/freeunit/archive/refs/tags/${FREEUNIT_VERSION}.tar.gz" \
-        | tar -xz -C /usr/src/freeunit --strip-components=1; \
+    if [ -f /mnt/freeunit-ctx/freeunit-src.tar.gz ]; then \
+        tar -xzf /mnt/freeunit-ctx/freeunit-src.tar.gz -C /usr/src/freeunit --strip-components=1; \
+    else \
+        curl -fsSL "https://github.com/freeunitorg/freeunit/archive/refs/tags/${FREEUNIT_VERSION}.tar.gz" \
+            | tar -xz -C /usr/src/freeunit --strip-components=1; \
+    fi; \
     cd /usr/src/freeunit; \
     ./configure \
         --prefix=/usr \

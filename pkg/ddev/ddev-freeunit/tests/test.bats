@@ -46,8 +46,19 @@ PHP
   echo "static-ok" > web/robots.txt
   echo "SECRET=1" > web/.env
 
-  run ddev config --project-name="${PROJNAME}" --project-type=php --docroot=web --project-tld=ddev.site
+  run ddev config --project-name="${PROJNAME}" --project-type=php --docroot=web --project-tld=ddev.site \
+    ${FREEUNIT_TEST_PHP_VERSION:+--php-version="${FREEUNIT_TEST_PHP_VERSION}"}
   assert_success
+}
+
+# Install the add-on from ${1}; with FREEUNIT_SRC_TARBALL set (CI), build
+# FreeUnit from that source tarball instead of the pinned release.
+install_addon() {
+  run ddev add-on get "$1"
+  assert_success
+  if [ -n "${FREEUNIT_SRC_TARBALL:-}" ]; then
+    cp "${FREEUNIT_SRC_TARBALL}" .ddev/web-build/freeunit-src.tar.gz
+  fi
 }
 
 # Wait for FreeUnit to answer after a (re)start.
@@ -126,8 +137,7 @@ teardown() {
 @test "install from directory" {
   set -eu -o pipefail
   echo "# ddev add-on get ${DIR} with project ${PROJNAME} in $(pwd)" >&3
-  run ddev add-on get "${DIR}"
-  assert_success
+  install_addon "${DIR}"
   run ddev restart -y
   assert_success
   health_checks
@@ -137,8 +147,7 @@ teardown() {
 @test "install from release" {
   set -eu -o pipefail
   echo "# ddev add-on get ${GITHUB_REPO} with project ${PROJNAME} in $(pwd)" >&3
-  run ddev add-on get "${GITHUB_REPO}"
-  assert_success
+  install_addon "${GITHUB_REPO}"
   run ddev restart -y
   assert_success
   health_checks
@@ -146,8 +155,7 @@ teardown() {
 
 @test "remove the add-on" {
   set -eu -o pipefail
-  run ddev add-on get "${DIR}"
-  assert_success
+  install_addon "${DIR}"
   run ddev restart -y
   assert_success
 

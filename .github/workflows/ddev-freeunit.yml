@@ -1,0 +1,97 @@
+name: ddev-freeunit
+
+# Tests the DDEV add-on in pkg/ddev/ddev-freeunit (its own .github/ is not
+# run from a subdirectory) with FreeUnit built from this commit's source,
+# then compares nginx-fpm with the add-on on a Drupal site.
+
+on:
+  pull_request:
+    paths:
+      - 'pkg/ddev/**'
+      - '.github/workflows/ddev-freeunit.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ADDON: pkg/ddev/ddev-freeunit
+  PHP_VERSION: '8.5'
+  DDEV_NONINTERACTIVE: 'true'
+  DDEV_NO_INSTRUMENTATION: 'true'
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ddev/github-action-setup-ddev@v1
+        with:
+          autostart: false
+
+      - name: Install bats
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bats bats-assert bats-file bats-support
+
+      - name: Source tarball of this commit
+        run: git archive --format=tar.gz --prefix=freeunit/ -o "$RUNNER_TEMP/freeunit-src.tar.gz" HEAD
+
+      - name: bats
+        env:
+          FREEUNIT_SRC_TARBALL: ${{ runner.temp }}/freeunit-src.tar.gz
+          FREEUNIT_TEST_PHP_VERSION: ${{ env.PHP_VERSION }}
+        run: bats "$ADDON/tests/test.bats" --filter-tags '!release' --print-output-on-failure --timing
+
+  metrics:
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project_type: drupal11
+            drupal: '^11'
+          - project_type: drupal12
+            drupal: '^12'
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ddev/github-action-setup-ddev@v1
+        with:
+          autostart: false
+
+      - name: Install hey
+        run: |
+          go install github.com/rakyll/hey@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Source tarball of this commit
+        run: git archive --format=tar.gz --prefix=freeunit/ -o "$RUNNER_TEMP/freeunit-src.tar.gz" HEAD
+
+      - name: Measure nginx-fpm vs freeunit
+        env:
+          FREEUNIT_SRC_TARBALL: ${{ runner.temp }}/freeunit-src.tar.gz
+          PROJECT_TYPE: ${{ matrix.project_type }}
+          DRUPAL_CONSTRAINT: ${{ matrix.drupal }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/bench" && cd "$RUNNER_TEMP/bench"
+          bash "$GITHUB_WORKSPACE/$ADDON/tests/metrics.sh" "$GITHUB_WORKSPACE/$ADDON" \
+            "$GITHUB_WORKSPACE/ddev-freeunit-metrics.json"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ddev-freeunit-metrics-${{ matrix.project_type }}
+          path: |
+            ddev-freeunit-metrics.json
+            ${{ runner.temp }}/bench/.metrics/
+          if-no-files-found: ignore
+          include-hidden-files: true

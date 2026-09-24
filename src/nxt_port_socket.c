@@ -1917,10 +1917,23 @@ static const nxt_lvlhsh_proto_t  lvlhsh_frag_proto  nxt_aligned(64) = {
 };
 
 
+/*
+ * What a fragment kept for reassembly costs the receiver: the whole buffer
+ * it came in, port->max_size, however little of it carries.  Counting the
+ * payload alone let a stream of empty fragments hold buffers without limit.
+ */
+nxt_inline size_t
+nxt_port_frag_cost(nxt_port_t *port, nxt_port_recv_msg_t *msg)
+{
+    return nxt_max(msg->size, port->max_size);
+}
+
+
 static nxt_port_recv_msg_t *
 nxt_port_frag_start(nxt_task_t *task, nxt_port_t *port,
     nxt_port_recv_msg_t *msg)
 {
+    size_t               cost;
     nxt_int_t            res;
     nxt_lvlhsh_query_t   lhq;
     nxt_port_recv_msg_t  *fmsg;
@@ -1936,8 +1949,10 @@ nxt_port_frag_start(nxt_task_t *task, nxt_port_t *port,
         return NULL;
     }
 
+    cost = nxt_port_frag_cost(port, msg);
+
     if (nxt_slow_path(msg->size > NXT_PORT_FRAG_SIZE_MAX
-                      || msg->size > NXT_PORT_FRAG_TOTAL_MAX - port->frag_size))
+                      || cost > NXT_PORT_FRAG_TOTAL_MAX - port->frag_size))
     {
         nxt_alert(task, "port %d: fragmented message #%uD from pid %PI "
                   "exceeds the reassembly limit, dropped", port->socket.fd,
@@ -1969,8 +1984,10 @@ nxt_port_frag_start(nxt_task_t *task, nxt_port_t *port,
     switch (res) {
 
     case NXT_OK:
+        fmsg->frag_held = cost;
+
         port->frag_streams++;
-        port->frag_size += fmsg->size;
+        port->frag_size += cost;
 
         return fmsg;
 
@@ -2040,7 +2057,7 @@ static void
 nxt_port_frag_unaccount(nxt_port_t *port, nxt_port_recv_msg_t *fmsg)
 {
     port->frag_streams--;
-    port->frag_size -= fmsg->size;
+    port->frag_size -= fmsg->frag_held;
 }
 
 
@@ -2064,7 +2081,8 @@ nxt_port_frag_fits(nxt_task_t *task, nxt_port_t *port,
     }
 
     if (msg->port_msg.mf != 0
-        && nxt_slow_path(msg->size > NXT_PORT_FRAG_TOTAL_MAX - port->frag_size))
+        && nxt_slow_path(nxt_port_frag_cost(port, msg)
+                         > NXT_PORT_FRAG_TOTAL_MAX - port->frag_size))
     {
         nxt_alert(task, "port %d: fragmented messages in progress exceed "
                   "%d bytes, dropping stream #%uD from pid %PI",
@@ -2179,7 +2197,8 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
             fmsg->size += msg->size;
 
             if (msg->port_msg.mf != 0) {
-                port->frag_size += msg->size;
+                fmsg->frag_held += nxt_port_frag_cost(port, msg);
+                port->frag_size += nxt_port_frag_cost(port, msg);
             }
 
             msg->buf = NULL;

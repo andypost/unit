@@ -1,17 +1,8 @@
 name: "Lint (ast-grep)"
 
-# Two independent gates on a pull request's diff:
-#
-# - ast-grep: re-scans src/ with tools/ast-grep's rules and fails only on
-#   violations not already in tools/ast-grep/baseline.json (see
-#   tools/ast-grep/check_baseline.py). The existing violations do not block
-#   a PR that doesn't touch them; a new one does.
-#
-# - require-tests: a diff that touches src/**/*.c or src/**/*.h without
-#   touching test/ or src/test/ fails, on the theory that a behavior change
-#   with no test anywhere in the tree is very likely untested. Opt out with
-#   the "no-test-needed" PR label, or a `No-Test-Reason: ...` trailer on any
-#   commit in the PR (a build/comment-only change, a revert, etc.).
+# ast-grep: fail on violations not in tools/ast-grep/baseline.json.
+# require-tests: a src/ change needs a test/ or src/test/ change, unless the PR
+# has the "no-test-needed" label or a commit has a "No-Test-Reason:" trailer.
 
 on:
   pull_request:
@@ -21,10 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  # Cancel superseded runs for the same pull request.  Non-PR events fall back
-  # to the run id, which is unique, so a push is never grouped with another:
-  # Actions keeps only one PENDING run per group and would drop a queued commit
-  # even with cancel-in-progress false, which would break bisectability.
+  # A push gets its own group, so no queued commit is dropped.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 

@@ -14,13 +14,9 @@ on:
       # nxt_http_controller_fuzz.c #includes nxt_controller.c, so a change
       # there is a change to what this job fuzzes.
       - 'src/nxt_controller*'
-      # nxt_unit_msg_fuzz.c drives libunit's receive side (the mmap record
-      # walk and request validation) and the shared-memory layouts it reads.
       - 'src/nxt_unit*'
       - 'src/nxt_port_memory_int.h'
       - 'src/nxt_span.h'
-      # nxt_router_app_response_fuzz.c #includes nxt_router.c to drive the
-      # response-header parsing directly.
       - 'src/nxt_router*'
       # configure --fuzz, auto/fuzzing and auto/sources are what produce the
       # binaries; break them and the job has nothing to run.

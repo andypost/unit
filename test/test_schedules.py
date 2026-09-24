@@ -99,7 +99,7 @@ def test_schedules_validation_all_fields():
         )
     )
 
-    assert 'success' in put(schedule(overlap="queue", run_on_start=True))
+    assert 'success' in put(schedule(run_on_start=True))
 
 
 def test_schedules_validation_target():
@@ -218,7 +218,7 @@ def test_schedules_validation_jitter_sum():
     )
 
 
-@pytest.mark.parametrize('value', ['SKIP', 'wait', '', 1, True])
+@pytest.mark.parametrize('value', ['SKIP', 'queue', '', 1, True])
 def test_schedules_validation_overlap_invalid(value):
     assert_error(put(schedule(overlap=value)), path='/schedules/cron/overlap')
 
@@ -519,25 +519,6 @@ def test_schedules_run_overlap_skip():
         r'schedule "cron": run skipped, the previous one is still running'
     )
     assert len(skips) >= 2, skips
-
-
-def test_schedules_run_overlap_queue():
-    put_run(run_schedule(uri="/?sleep=2.5", overlap="queue", timeout=10))
-
-    wait_for_starts(3, 12)
-
-    assert_no_concurrency()
-
-    # A queued run starts as soon as the previous one ends, not on the next
-    # tick; and the due runs coalesced instead of piling up.
-    recs = records()
-    ends = [r['time'] for r in recs if r['event'] == 'end']
-    starts = [r['time'] for r in recs if r['event'] == 'start']
-
-    for end, start in zip(ends, starts[1:]):
-        assert start - end < 0.8, (end, start)
-
-    assert not Log.findall(r'run skipped')
 
 
 def test_schedules_run_timeout():

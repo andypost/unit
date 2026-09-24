@@ -158,23 +158,6 @@ def test_schedules_php_overlap_skip():
     assert len(skips) >= 2, skips
 
 
-def test_schedules_php_overlap_queue():
-    put_run(run_schedule(uri="/?sleep=2.5", overlap="queue", timeout=10))
-
-    wait_for_starts(3, 12)
-
-    assert_no_concurrency()
-
-    recs = records()
-    ends = [r['time'] for r in recs if r['event'] == 'end']
-    starts = [r['time'] for r in recs if r['event'] == 'start']
-
-    for end, start in zip(ends, starts[1:]):
-        assert start - end < 0.8, (end, start)
-
-    assert not Log.findall(r'run skipped')
-
-
 def test_schedules_php_timeout():
     put_run(run_schedule(uri="/?sleep=3", interval=2, timeout=1))
 

@@ -90,7 +90,7 @@ The top level gains a `schedules` object, keyed by schedule name:
 | `interval`     | integer | yes      | —        | seconds between runs, measured from one scheduled start to the next. |
 | `jitter`       | integer | no       | `0`      | up to this many seconds, uniformly random, added to each wait. |
 | `timeout`      | integer | no       | `interval` | seconds before an unfinished run is abandoned (§7.2). |
-| `overlap`      | string  | no       | `"skip"` | `"skip"`: a run that comes due while the previous one is still running is dropped and logged. `"queue"`: at most one run waits and starts when the previous one finishes; further due runs coalesce into it. |
+| `overlap`      | string  | no       | `"skip"` | `"skip"`: a run that comes due while the previous one is still running is dropped and logged. `"queue"` (at most one run waits) shipped in 1.36.2 and was removed afterwards: see "Amendments" below. |
 | `headers`      | object  | no       | `{}`     | extra request headers, string to string. `Host` also sets `server_name`. |
 | `run_on_start` | boolean | no       | `false`  | when the schedule first appears, run it about 1 s after the configuration is applied (plus jitter), instead of waiting a full interval. |
 
@@ -694,3 +694,12 @@ non-Docker deployments.
   code stream's `prepare_msg` change? Agree the order at the Day-3 sync.
 - Per-schedule `/status` counters (N4): the shape belongs to the
   observability stream.
+
+
+## Amendments
+
+- **`overlap: "queue"` removed** (after 1.36.2). It kept a `pending` flag
+  per schedule and a second start path, for a mode no known user needs: a
+  cron endpoint catches up on its own at the next run. `"skip"` is the
+  only value, and the only behaviour; the key stays so that configurations
+  that spell it out keep validating.

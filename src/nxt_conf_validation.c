@@ -5217,12 +5217,12 @@ nxt_conf_vldt_schedule_overlap(nxt_conf_validation_t *vldt,
 
     nxt_conf_get_string(value, &overlap);
 
-    if (nxt_str_eq(&overlap, "skip", 4) || nxt_str_eq(&overlap, "queue", 5)) {
+    if (nxt_str_eq(&overlap, "skip", 4)) {
         return NXT_OK;
     }
 
-    return nxt_conf_vldt_error(vldt, "The \"overlap\" value must be either "
-                               "\"skip\" or \"queue\".");
+    return nxt_conf_vldt_error(vldt, "The \"overlap\" value must be "
+                               "\"skip\".");
 }
 
 

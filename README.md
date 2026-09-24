@@ -207,8 +207,7 @@ curl -s --unix-socket /var/run/control.unit.sock http://localhost/status
 ```
 
 Because the next iteration only starts `interval` seconds after the
-previous `curl` returns, this loop never overlaps by construction, unlike
-`overlap: "queue"`, and it is invisible to `/status` — exactly the
+previous `curl` returns, this loop never overlaps by construction, and it is invisible to `/status` — exactly the
 trade-off in ADR 0004 §10 (plan B2).
 
 ## OpenAPI Specification

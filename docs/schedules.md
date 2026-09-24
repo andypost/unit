@@ -40,7 +40,7 @@ bytes). Each schedule has these fields:
 | `interval`     | integer | yes      | —          | Seconds between runs, measured from one scheduled start to the next. 1 to 2147483 (about 24.8 days; timers are 32-bit millisecond values). |
 | `jitter`       | integer | no       | `0`        | Up to this many seconds, uniformly random, added to each wait. `0` to `interval`; `interval + jitter` must not exceed 2147483. |
 | `timeout`      | integer | no       | `interval` | Seconds before an unfinished run is abandoned. 1 to 2147483. See "Timeout" below. |
-| `overlap`      | string  | no       | `"skip"`   | `"skip"` or `"queue"`. See "Overlap" below. |
+| `overlap`      | string  | no       | `"skip"`   | `"skip"`, the only value. See "Overlap" below. |
 | `headers`      | object  | no       | `{}`       | Extra request headers, string to string. `Host` also sets `server_name`. |
 | `run_on_start` | boolean | no       | `false`    | Run about 1 s after the configuration is applied (plus jitter) instead of waiting a full interval, the first time the schedule appears. |
 
@@ -91,15 +91,12 @@ first run happen about 1 second after the configuration that introduces the
 schedule is applied, instead of waiting a full interval; every later run
 follows the normal `interval`/`jitter` schedule.
 
-### Overlap: skip or queue
+### Overlap
 
-If a run is still in flight when the next one comes due:
-
-- `"skip"` (the default): the new run is dropped and a warning is logged.
-  There is never more than one run of a given schedule in flight.
-- `"queue"`: at most one run waits. It starts as soon as the in-flight run
-  finishes. Further runs that come due while one is already queued coalesce
-  into that single queued run — they do not pile up.
+If a run is still in flight when the next one comes due, the new run is
+dropped and a warning is logged. There is never more than one run of a
+given schedule in flight. `"overlap": "skip"` states this explicitly;
+`"queue"` was removed after 1.36.2.
 
 ### Timeout
 
@@ -151,7 +148,7 @@ Each schedule has its own `timeout`, independent of the application's
   cron endpoint.
 
 - **Schedule state does not survive a router restart.** Whether a run is in
-  flight, and any `queue`d run, is kept only in memory. After a router
+  flight is kept only in memory. After a router
   restart, a `run_on_start` schedule fires again as if it were new, even if
   a run from before the restart is still executing as an orphaned worker.
 

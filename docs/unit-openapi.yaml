@@ -7146,8 +7146,7 @@ components:
         `processes` so that a long-running schedule does not starve ordinary
         requests.
 
-        Schedule state (whether a run is in flight, and any `queue`d run)
-        does not survive a router restart; after a restart, a `run_on_start`
+        Schedule state (whether a run is in flight) does not survive a router restart; after a restart, a `run_on_start`
         schedule fires again even if a run from before the restart is still
         an orphaned worker.
 
@@ -7211,11 +7210,9 @@ components:
         overlap:
           type: string
           description: "What happens when a run comes due while the
-            previous one is still running. `skip` drops the new run and
-            logs a warning. `queue` lets at most one run wait, starting it
-            when the previous one finishes; further due runs coalesce into
-            that single queued run."
-          enum: [skip, queue]
+            previous one is still running: `skip`, the only value, drops
+            the new run and logs a warning."
+          enum: [skip]
           default: skip
 
         headers:

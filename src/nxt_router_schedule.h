@@ -33,12 +33,6 @@
 #define NXT_SCHEDULE_HEADERS_MAX   8192
 
 
-typedef enum {
-    NXT_SCHEDULE_SKIP = 0,
-    NXT_SCHEDULE_QUEUE,
-} nxt_router_schedule_overlap_t;
-
-
 /*
  * One per schedule per configuration.  Allocated from rtcf->mem_pool, so it
  * lives exactly as long as the configuration that defined it.
@@ -57,7 +51,6 @@ typedef struct {
     nxt_msec_t               interval;
     nxt_msec_t               jitter;
     nxt_msec_t               timeout;
-    uint8_t                  overlap;     /* nxt_router_schedule_overlap_t */
     uint8_t                  run_on_start;
 } nxt_router_schedule_t;
 

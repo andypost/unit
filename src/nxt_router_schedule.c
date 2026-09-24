@@ -43,7 +43,6 @@ typedef struct {
     nxt_timer_t              timer;       /* on the main engine */
     nxt_msec_t               base;        /* timers.now when last armed */
 
-    uint8_t                  pending;     /* "queue": one run waiting */
     uint8_t                  seen;        /* in the configuration applied */
 
     /* The name, stored after the struct, the counters and "running". */
@@ -83,7 +82,6 @@ typedef struct {
     int64_t                  interval;
     int64_t                  jitter;
     int64_t                  timeout;
-    nxt_str_t                overlap;
     uint8_t                  run_on_start;
     nxt_conf_value_t         *headers;
 } nxt_router_schedule_conf_t;
@@ -160,12 +158,6 @@ static nxt_conf_map_t  nxt_router_schedule_conf[] = {
         nxt_string("timeout"),
         NXT_CONF_MAP_INT64,
         offsetof(nxt_router_schedule_conf_t, timeout),
-    },
-
-    {
-        nxt_string("overlap"),
-        NXT_CONF_MAP_STR,
-        offsetof(nxt_router_schedule_conf_t, overlap),
     },
 
     {
@@ -390,8 +382,6 @@ nxt_router_schedule_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
         return NXT_ERROR;
     }
 
-    sched->overlap = nxt_str_eq(&scf.overlap, "queue", 5) ? NXT_SCHEDULE_QUEUE
-                                                          : NXT_SCHEDULE_SKIP;
     sched->run_on_start = scf.run_on_start;
 
     sched->action = nxt_http_action_create(task, tmcf, &scf.pass);
@@ -479,9 +469,8 @@ nxt_router_schedules_joint_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
  *
  *   - The new set's joint goes to its worker engine (section 5), where a
  *     job puts it on engine->joints, so that engine cannot exit under a run.
- *   - Each schedule finds its state by name.  "running" and "pending" carry
- *     over, so a run in flight across a reconfiguration still counts for
- *     "overlap".  A state whose name is gone is dropped now, or when its run
+ *   - Each schedule finds its state by name.  "running" carries over, so a
+ *     run in flight across a reconfiguration still blocks the next one.  A state whose name is gone is dropped now, or when its run
  *     ends.
  *   - The previous set's joint gets its own reference dropped, by a job on
  *     its engine: runs still in flight keep that configuration alive, the
@@ -691,10 +680,6 @@ nxt_router_schedule_update(nxt_task_t *task, nxt_router_schedules_t *sc,
     state->schedules = sc;
     state->seen = 1;
 
-    if (sched->overlap == NXT_SCHEDULE_SKIP) {
-        state->pending = 0;
-    }
-
     if (prev == NULL) {
         /* A new schedule, or one removed while running and now back. */
 
@@ -744,7 +729,6 @@ nxt_router_schedule_remove(nxt_task_t *task, nxt_router_schedule_state_t *state)
 
     state->conf = NULL;
     state->schedules = NULL;
-    state->pending = 0;
 
     if (state->stat.running) {
         /* Freed when the run is reported, in nxt_router_schedule_done(). */
@@ -826,14 +810,6 @@ nxt_router_schedule_timer_handler(nxt_task_t *task, void *obj, void *data)
 
     if (!state->stat.running) {
         nxt_router_schedule_start(task, state);
-        return;
-    }
-
-    if (sched->overlap == NXT_SCHEDULE_QUEUE) {
-        nxt_debug(task, "schedule \"%V\": queued behind the running one",
-                  &state->stat.name);
-
-        state->pending = 1;
         return;
     }
 
@@ -1182,12 +1158,6 @@ nxt_router_schedule_done(nxt_task_t *task, void *obj, void *data)
 
     if (state->conf == NULL) {
         nxt_router_schedule_state_free(task, state);
-        return;
-    }
-
-    if (state->pending) {
-        state->pending = 0;
-        nxt_router_schedule_start(task, state);
     }
 }
 

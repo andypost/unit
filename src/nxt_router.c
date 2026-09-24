@@ -1697,53 +1697,6 @@ fail:
 }
 
 
-/*
- * /status support for "schedules" (docs/observability/status-extensions.md).
- * nxt_router_schedules_status_each() hands each schedule's counters to a
- * callback because the states queue is private to nxt_router_schedule.c;
- * these two are that callback, used for the same two-pass size-then-fill
- * shape the "apps" loop below uses.
- */
-
-typedef struct {
-    size_t  names_size;
-} nxt_router_status_sched_size_ctx_t;
-
-
-static void
-nxt_router_status_sched_size(nxt_status_schedule_t *item, void *data)
-{
-    nxt_router_status_sched_size_ctx_t  *ctx;
-
-    ctx = data;
-    ctx->names_size += item->name.length;
-}
-
-
-typedef struct {
-    nxt_buf_t               *b;
-    u_char                  *p;         /* next name lands just before this */
-    nxt_status_schedule_t   *sched_stat;
-} nxt_router_status_sched_fill_ctx_t;
-
-
-static void
-nxt_router_status_sched_fill(nxt_status_schedule_t *item, void *data)
-{
-    nxt_router_status_sched_fill_ctx_t  *ctx;
-
-    ctx = data;
-
-    ctx->p -= item->name.length;
-    nxt_memcpy(ctx->p, item->name.start, item->name.length);
-
-    *ctx->sched_stat = *item;
-    ctx->sched_stat->name.start = (u_char *) (ctx->p - ctx->b->mem.pos);
-
-    ctx->sched_stat++;
-}
-
-
 static void
 nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
@@ -1755,12 +1708,8 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_uint_t              type;
     nxt_port_t              *port;
     nxt_status_app_t        *app_stat;
-    nxt_status_schedule_t   *sched_stat;
     nxt_event_engine_t      *engine;
     nxt_status_report_t     *report;
-
-    nxt_router_status_sched_size_ctx_t  sched_size_ctx;
-    nxt_router_status_sched_fill_ctx_t  sched_fill_ctx;
 
     port = nxt_runtime_port_find(task->thread->runtime,
                                  msg->port_msg.pid,
@@ -1778,13 +1727,7 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     } nxt_queue_loop;
 
-    nsched = nxt_router_schedules_status_count();
-
-    sched_size_ctx.names_size = 0;
-    nxt_router_schedules_status_each(nxt_router_status_sched_size,
-                                     &sched_size_ctx);
-
-    alloc += nsched * sizeof(nxt_status_schedule_t) + sched_size_ctx.names_size;
+    alloc += nxt_router_schedules_status_size(&nsched);
 
     b = nxt_buf_mem_alloc(port->mem_pool, alloc, 0);
     if (nxt_slow_path(b == NULL)) {
@@ -1843,14 +1786,8 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     } nxt_queue_loop;
 
     report->schedules_count = nsched;
-    sched_stat = nxt_status_report_schedules(report);
-
-    sched_fill_ctx.b = b;
-    sched_fill_ctx.p = p;
-    sched_fill_ctx.sched_stat = sched_stat;
-
-    nxt_router_schedules_status_each(nxt_router_status_sched_fill,
-                                     &sched_fill_ctx);
+    nxt_router_schedules_status(nxt_status_report_schedules(report), p,
+                                b->mem.pos);
 
     type = NXT_PORT_MSG_RPC_READY_LAST;
 

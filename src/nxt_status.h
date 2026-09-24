@@ -19,14 +19,9 @@ typedef struct {
 
 
 /*
- * One schedule's counters (src/nxt_router_schedule.c's
- * nxt_router_schedule_state_t), copied out by
- * nxt_router_schedules_status() -- see docs/observability/status-extensions.md.
- * "running" is 0/1: whether a run is in flight right now.  "last_start" is
- * zero until the first run is dispatched, in whole seconds since the Epoch;
- * "last_duration" is in milliseconds and, like "last_status", reflects only
- * the most recently *finished* run, so it lags "running" while one is still
- * in flight.
+ * One schedule's counters, kept by src/nxt_router_schedule.c.  "running" is
+ * 0 or 1; "last_start" is in seconds since the Epoch, zero before the first
+ * run; "last_duration" (ms) and "last_status" are of the last finished run.
  */
 typedef struct {
     nxt_str_t         name;

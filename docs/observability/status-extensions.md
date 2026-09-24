@@ -87,17 +87,12 @@ comes back, matching how the router itself keeps that state alive.
   `nxt_status_get()` (reader) compute that second array's address the
   same way: `nxt_status_report_schedules(report)`, a small inline helper
   next to the struct.
-- `src/nxt_router_schedule.c`/`.h` gained a `/status`-only accessor,
-  `nxt_router_schedules_status_each()`, that hands each schedule's
-  counters to a callback -- the states queue
-  (`nxt_router_schedule_states`) is private to that file, so this is the
-  only way `nxt_router.c` can read it. No lock: both this walk and the
-  counters themselves are touched only on the main engine, exactly like
-  the existing `nxt_router_schedule_state_find()` walk.
-- `src/nxt_router_schedule.c` also gained one new field,
-  `nxt_router_schedule_state_t.last_start`, set from `nxt_realtime()` at
-  the point a run is actually dispatched (`nxt_router_schedule_start()`,
-  right after `state->running = 1`) -- everything else already existed.
+- A schedule's state in `src/nxt_router_schedule.c` embeds the
+  `nxt_status_schedule_t` it reports; `nxt_router_schedules_status_size()`
+  and `nxt_router_schedules_status()` size and copy them into the report.
+  The states queue is private to that file. No lock: the walk and the
+  counters are both touched only on the main engine. `last_start` is set
+  from `nxt_realtime()` when a run is dispatched.
 - `src/nxt_router.c`'s `nxt_router_status_handler()` builds the
   `schedules` part of the report the same two-pass way it already builds
   `apps`: one pass to size the buffer (`nxt_router_schedules_status_count()`

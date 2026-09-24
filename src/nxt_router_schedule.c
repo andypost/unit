@@ -36,7 +36,6 @@
  */
 typedef struct {
     nxt_queue_link_t         link;        /* nxt_router_schedule_states */
-    nxt_str_t                name;        /* stored after the struct */
 
     nxt_router_schedule_t    *conf;       /* current, NULL once removed */
     nxt_router_schedules_t   *schedules;  /* the set "conf" belongs to */
@@ -44,24 +43,11 @@ typedef struct {
     nxt_timer_t              timer;       /* on the main engine */
     nxt_msec_t               base;        /* timers.now when last armed */
 
-    uint8_t                  running;     /* a run is in flight */
     uint8_t                  pending;     /* "queue": one run waiting */
     uint8_t                  seen;        /* in the configuration applied */
 
-    uint32_t                 runs;
-    uint32_t                 skipped;
-    uint32_t                 failed;
-    uint32_t                 timed_out;
-    nxt_msec_t               last_duration;
-    nxt_http_status_t        last_status;
-
-    /*
-     * Wall-clock start of the most recently dispatched run, seconds since
-     * the Epoch; zero until the first run starts.  /status only (section
-     * "Implementation notes" in docs/observability/status-extensions.md):
-     * everything else here is monotonic-clock or counter state.
-     */
-    nxt_time_t               last_start;
+    /* The name, stored after the struct, the counters and "running". */
+    nxt_status_schedule_t    stat;
 } nxt_router_schedule_state_t;
 
 
@@ -233,7 +219,9 @@ static nxt_http_field_proc_t    nxt_router_schedule_fields[] = {
 static nxt_router_schedules_t   *nxt_router_schedules_current;
 
 /* Of nxt_router_schedule_state_t, by name. */
-static nxt_queue_t              nxt_router_schedule_states;
+static nxt_queue_t              nxt_router_schedule_states = {
+    { &nxt_router_schedule_states.head, &nxt_router_schedule_states.head }
+};
 
 
 /*
@@ -509,10 +497,6 @@ nxt_router_schedules_apply(nxt_task_t *task, nxt_router_temp_conf_t *tmcf)
     nxt_router_schedules_t       *sc, *old;
     nxt_router_schedule_state_t  *state;
 
-    if (nxt_router_schedule_states.head.next == NULL) {
-        nxt_queue_init(&nxt_router_schedule_states);
-    }
-
     old = nxt_router_schedules_current;
     sc = tmcf->router_conf->schedules;
 
@@ -650,7 +634,7 @@ nxt_router_schedule_state_find(nxt_str_t *name)
     nxt_queue_each(state, &nxt_router_schedule_states,
                    nxt_router_schedule_state_t, link)
     {
-        if (nxt_strstr_eq(&state->name, name)) {
+        if (nxt_strstr_eq(&state->stat.name, name)) {
             return state;
         }
 
@@ -684,10 +668,10 @@ nxt_router_schedule_update(nxt_task_t *task, nxt_router_schedules_t *sc,
 
         nxt_memzero(state, sizeof(nxt_router_schedule_state_t));
 
-        state->name.start = (u_char *) state
+        state->stat.name.start = (u_char *) state
                             + sizeof(nxt_router_schedule_state_t);
-        state->name.length = sched->name.length;
-        nxt_memcpy(state->name.start, sched->name.start, sched->name.length);
+        state->stat.name.length = sched->name.length;
+        nxt_memcpy(state->stat.name.start, sched->name.start, sched->name.length);
 
         state->timer.bias = NXT_TIMER_DEFAULT_BIAS;
         state->timer.work_queue = &engine->fast_work_queue;
@@ -723,7 +707,7 @@ nxt_router_schedule_update(nxt_task_t *task, nxt_router_schedules_t *sc,
         nxt_router_schedule_arm(engine, state, delay);
 
         nxt_log(task, NXT_LOG_INFO, "schedule \"%V\": first run in %M ms",
-                &state->name, delay);
+                &state->stat.name, delay);
 
         return;
     }
@@ -745,7 +729,7 @@ nxt_router_schedule_update(nxt_task_t *task, nxt_router_schedules_t *sc,
     elapsed = nxt_max(nxt_msec_diff(engine->timers.now, state->base), 0);
 
     nxt_debug(task, "schedule \"%V\": re-armed, %M ms of %M elapsed",
-              &state->name, elapsed, delay);
+              &state->stat.name, elapsed, delay);
 
     nxt_timer_add(engine, &state->timer,
                   (delay > elapsed) ? delay - elapsed : 0);
@@ -755,14 +739,14 @@ nxt_router_schedule_update(nxt_task_t *task, nxt_router_schedules_t *sc,
 static void
 nxt_router_schedule_remove(nxt_task_t *task, nxt_router_schedule_state_t *state)
 {
-    nxt_log(task, NXT_LOG_INFO, "schedule \"%V\": removed%s", &state->name,
-            state->running ? ", the run in progress will complete" : "");
+    nxt_log(task, NXT_LOG_INFO, "schedule \"%V\": removed%s", &state->stat.name,
+            state->stat.running ? ", the run in progress will complete" : "");
 
     state->conf = NULL;
     state->schedules = NULL;
     state->pending = 0;
 
-    if (state->running) {
+    if (state->stat.running) {
         /* Freed when the run is reported, in nxt_router_schedule_done(). */
         (void) nxt_timer_delete(task->thread->engine, &state->timer);
         return;
@@ -837,26 +821,26 @@ nxt_router_schedule_timer_handler(nxt_task_t *task, void *obj, void *data)
 
     nxt_router_schedule_arm(task->thread->engine, state, delay);
 
-    nxt_debug(task, "schedule \"%V\": due, next in %M ms", &state->name,
+    nxt_debug(task, "schedule \"%V\": due, next in %M ms", &state->stat.name,
               delay);
 
-    if (!state->running) {
+    if (!state->stat.running) {
         nxt_router_schedule_start(task, state);
         return;
     }
 
     if (sched->overlap == NXT_SCHEDULE_QUEUE) {
         nxt_debug(task, "schedule \"%V\": queued behind the running one",
-                  &state->name);
+                  &state->stat.name);
 
         state->pending = 1;
         return;
     }
 
-    state->skipped++;
+    state->stat.skipped++;
 
     nxt_log(task, NXT_LOG_WARN, "schedule \"%V\": run skipped, the previous "
-            "one is still running", &state->name);
+            "one is still running", &state->stat.name);
 }
 
 
@@ -877,16 +861,16 @@ nxt_router_schedule_start(nxt_task_t *task, nxt_router_schedule_state_t *state)
     engine = sc->joint.engine;
 
     if (nxt_slow_path(engine == NULL)) {
-        state->failed++;
+        state->stat.failed++;
         return;
     }
 
     run = nxt_zalloc(sizeof(nxt_router_schedule_run_t));
     if (nxt_slow_path(run == NULL)) {
-        state->failed++;
+        state->stat.failed++;
 
         nxt_alert(task, "schedule \"%V\": no memory to start a run",
-                  &state->name);
+                  &state->stat.name);
         return;
     }
 
@@ -894,7 +878,7 @@ nxt_router_schedule_start(nxt_task_t *task, nxt_router_schedule_state_t *state)
     run->sched = sched;
     run->schedules = sc;
     run->main = task->thread->engine;
-    run->seq = ++state->runs;
+    run->seq = ++state->stat.runs;
 
     /*
      * What the log may show of the URI, copied now: the configuration the
@@ -905,13 +889,13 @@ nxt_router_schedule_start(nxt_task_t *task, nxt_router_schedule_state_t *state)
     nxt_memcpy(run->uri, sched->uri.start, run->uri_length);
     run->uri_cut = (run->uri_length < sched->uri.length);
 
-    state->running = 1;
+    state->stat.running = 1;
 
     nxt_realtime(&now);
-    state->last_start = now.sec;
+    state->stat.last_start = now.sec;
 
     nxt_debug(task, "schedule \"%V\": run %uD posted to engine %p",
-              &state->name, run->seq, engine);
+              &state->stat.name, run->seq, engine);
 
     nxt_router_schedule_post(engine, &run->work, nxt_router_schedule_run,
                              run);
@@ -1157,22 +1141,22 @@ nxt_router_schedule_done(nxt_task_t *task, void *obj, void *data)
     state = run->state;
     status = run->devnull.status;
 
-    state->running = 0;
-    state->last_status = status;
-    state->last_duration = run->duration;
+    state->stat.running = 0;
+    state->stat.last_status = status;
+    state->stat.last_duration = run->duration;
 
     if (run->timed_out) {
-        state->timed_out++;
+        state->stat.timed_out++;
 
         nxt_log(task, NXT_LOG_WARN, "schedule \"%V\" run %uD: GET %*s%s "
-                "timed out after %M ms", &state->name, run->seq,
+                "timed out after %M ms", &state->stat.name, run->seq,
                 run->uri_length, run->uri, run->uri_cut ? "..." : "",
                 run->duration);
 
     } else if (status == 0 || status >= NXT_HTTP_BAD_REQUEST
                || run->devnull.discarded)
     {
-        state->failed++;
+        state->stat.failed++;
 
         p = run->devnull.head;
 
@@ -1183,13 +1167,13 @@ nxt_router_schedule_done(nxt_task_t *task, void *obj, void *data)
         }
 
         nxt_log(task, NXT_LOG_WARN, "schedule \"%V\" run %uD: GET %*s%s -> "
-                "%d in %M ms: \"%*s\"", &state->name, run->seq,
+                "%d in %M ms: \"%*s\"", &state->stat.name, run->seq,
                 run->uri_length, run->uri, run->uri_cut ? "..." : "",
                 (int) status, run->duration, run->devnull.head_length, p);
 
     } else {
         nxt_log(task, NXT_LOG_INFO, "schedule \"%V\" run %uD: GET %*s%s -> "
-                "%d in %M ms", &state->name, run->seq, run->uri_length,
+                "%d in %M ms", &state->stat.name, run->seq, run->uri_length,
                 run->uri, run->uri_cut ? "..." : "", (int) status,
                 run->duration);
     }
@@ -1381,63 +1365,49 @@ nxt_router_schedule_request_build(nxt_mp_t *mp, nxt_router_schedule_t *sched,
 
 
 /*
- * /status support (docs/observability/status-extensions.md).  Both walk
- * nxt_router_schedule_states exactly as nxt_router_schedule_state_find()
- * does: main engine only, no lock, because the states and this walk are
- * both touched only there.  A state whose "conf" is already NULL (removed,
- * but its last run has not finished yet) is still included -- it is part of
- * the router's live state until nxt_router_schedule_state_free() drops it,
- * and a run's counters should not vanish from /status mid-flight.
+ * /status (docs/observability/status-extensions.md), on the main engine
+ * like the states themselves.  A removed schedule whose last run is still
+ * in flight is included until that run ends.
  */
 
-nxt_uint_t
-nxt_router_schedules_status_count(void)
+size_t
+nxt_router_schedules_status_size(nxt_uint_t *n)
 {
-    nxt_uint_t        n;
-    nxt_queue_link_t  *lnk;
-
-    if (nxt_router_schedule_states.head.next == NULL) {
-        return 0;
-    }
-
-    n = 0;
-
-    for (lnk = nxt_queue_first(&nxt_router_schedule_states);
-         lnk != nxt_queue_tail(&nxt_router_schedule_states);
-         lnk = nxt_queue_next(lnk))
-    {
-        n++;
-    }
-
-    return n;
-}
-
-
-void
-nxt_router_schedules_status_each(nxt_router_schedule_status_cb_t cb,
-    void *ctx)
-{
-    nxt_status_schedule_t        item;
+    size_t                       size;
     nxt_router_schedule_state_t  *state;
 
-    if (nxt_router_schedule_states.head.next == NULL) {
-        return;
-    }
+    *n = 0;
+    size = 0;
 
     nxt_queue_each(state, &nxt_router_schedule_states,
                    nxt_router_schedule_state_t, link)
     {
-        item.name = state->name;
-        item.runs = state->runs;
-        item.skipped = state->skipped;
-        item.failed = state->failed;
-        item.timed_out = state->timed_out;
-        item.running = state->running;
-        item.last_status = state->last_status;
-        item.last_duration = state->last_duration;
-        item.last_start = state->last_start;
+        (*n)++;
+        size += sizeof(nxt_status_schedule_t) + state->stat.name.length;
 
-        cb(&item, ctx);
+    } nxt_queue_loop;
+
+    return size;
+}
+
+
+/* Names are copied down from "p"; their offsets are relative to "base". */
+
+void
+nxt_router_schedules_status(nxt_status_schedule_t *stat, u_char *p,
+    u_char *base)
+{
+    nxt_router_schedule_state_t  *state;
+
+    nxt_queue_each(state, &nxt_router_schedule_states,
+                   nxt_router_schedule_state_t, link)
+    {
+        p -= state->stat.name.length;
+        nxt_memcpy(p, state->stat.name.start, state->stat.name.length);
+
+        *stat = state->stat;
+        stat->name.start = (u_char *) (p - base);
+        stat++;
 
     } nxt_queue_loop;
 }

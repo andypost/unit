@@ -96,7 +96,7 @@ health_checks() {
   # The response comes from FreeUnit, not nginx/apache.
   run curl -sfI "https://${PROJNAME}.ddev.site/"
   assert_success
-  assert_output --regexp "^[Ss]erver: [Uu]nit"
+  assert_line --regexp "^[Ss]erver: [Uu]nit"
 
   # The control command works.
   run ddev freeunit status
@@ -172,5 +172,5 @@ teardown() {
   assert_success
   assert_output --partial "freeunit-test-ok"
   run curl -sfI "https://${PROJNAME}.ddev.site/"
-  refute_output --regexp "^[Ss]erver: [Uu]nit"
+  refute_line --regexp "^[Ss]erver: [Uu]nit"
 }

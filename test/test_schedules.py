@@ -448,8 +448,9 @@ def test_schedules_run_fires():
         assert rec['server_port'] == '80'
         assert rec['remote_addr'] == '127.0.0.1'
 
+    # The first start also waits for the application process.
     gaps = [b['time'] - a['time'] for a, b in zip(starts, starts[1:])]
-    assert all(0.7 < gap < 2.5 for gap in gaps), gaps
+    assert all(0.5 < gap < 2.5 for gap in gaps), gaps
 
     # The info line shows the URI up to its last "/" only.
     lines = Log.findall(r'.*\[info\].*schedule "cron" run \d+: GET .*')
@@ -520,6 +521,9 @@ def test_schedules_run_overlap_skip():
     )
     assert len(skips) >= 2, skips
 
+    sched = status_schedules()['cron']
+    assert sched['skipped'] >= 2 and sched['runs'] >= 2, sched
+
 
 def test_schedules_run_timeout():
     put_run(run_schedule(uri="/?sleep=3", interval=2, timeout=1))
@@ -534,6 +538,9 @@ def test_schedules_run_timeout():
     # run 2 waits for capacity and may time out in turn: ADR 0004, R5.)
     assert Log.wait_for_record(r'schedule "cron" run 2: GET /\.\.\. ')
     assert not Log.findall(r'run skipped')
+
+    sched = status_schedules()['cron']
+    assert sched['timed_out'] >= 1 and sched['failed'] == 0, sched
 
     # The abandoned worker still finishes its request.
     time.sleep(1.5)
@@ -584,14 +591,12 @@ def test_schedules_run_reconfigure_running():
         )
     )
 
-    time.sleep(4)
+    starts = wait_for_starts(2, 8)
 
     assert_no_concurrency()
     assert Log.findall(r'run skipped'), 'the running state was lost'
-
-    starts = records('start')
     assert starts[0]['uri'] == '/?sleep=2.5'
-    assert any(r['uri'] == '/?sleep=2.5&v=2' for r in starts[1:]), starts
+    assert starts[1]['uri'] == '/?sleep=2.5&v=2', starts
 
 
 def test_schedules_run_reconfigure_keeps_clock():
@@ -684,6 +689,9 @@ def test_schedules_run_several():
 
     uris = [r['uri'] for r in records('start')]
     assert uris.count('/a') >= 2 and uris.count('/b') >= 2, uris
+
+    scheds = status_schedules()
+    assert scheds['a']['runs'] >= 2 and scheds['b']['runs'] >= 2, scheds
 
 
 def test_schedules_run_listener_unaffected():
@@ -805,46 +813,3 @@ def test_schedules_status_counters():
     assert sched['last_duration_ms'] >= 0
     # last_start is wall-clock seconds since the Epoch, close to "now".
     assert abs(sched['last_start'] - begin) < 10, sched
-
-
-def test_schedules_status_skipped():
-    put_run(run_schedule(uri="/?sleep=2.5", overlap="skip", timeout=10))
-
-    wait_for_starts(2, 10)
-    time.sleep(1)
-
-    sched = status_schedules()['cron']
-    assert sched['skipped'] >= 2, sched
-    assert sched['runs'] >= 2, sched
-
-
-def test_schedules_status_timeout():
-    put_run(run_schedule(uri="/?sleep=3", interval=2, timeout=1))
-
-    def timed_out_reached():
-        return status_schedules().get('cron', {}).get('timed_out', 0) >= 1
-
-    end = time.monotonic() + 10
-
-    while time.monotonic() < end and not timed_out_reached():
-        time.sleep(0.1)
-
-    sched = status_schedules()['cron']
-    assert sched['timed_out'] >= 1, sched
-    assert sched['failed'] == 0, sched
-
-
-def test_schedules_status_several():
-    put_run(
-        {
-            "a": {"pass": "applications/schedule", "uri": "/a", "interval": 1},
-            "b": {"pass": "applications/schedule", "uri": "/b", "interval": 1},
-        }
-    )
-
-    wait_for_starts(4, 10)
-
-    scheds = status_schedules()
-    assert set(scheds.keys()) >= {'a', 'b'}, scheds
-    assert scheds['a']['runs'] >= 1
-    assert scheds['b']['runs'] >= 1

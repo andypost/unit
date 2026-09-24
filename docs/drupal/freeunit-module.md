@@ -4,7 +4,8 @@
 - Date: 2026-09-23 (Day 1 of the DrupalCon sprint week)
 - Branch: `stream/drupal-module-explore`, from the integration tip `b3bec257`
 - Code base: every `file:line` below refers to `b3bec257`.
-- Prototype: [`pkg/docker/drupal/modules/freeunit/`](../../pkg/docker/drupal/modules/freeunit/README.md)
+- Prototype: not kept in the tree; see commit eb1da176
+  (`pkg/docker/drupal/modules/freeunit/`).
 
 ## 0. Summary
 
@@ -184,7 +185,7 @@ Router behaviour that shaped the design, all observed:
 
 ### 3.2 Routes
 
-Full example: `pkg/docker/drupal/modules/freeunit/examples/unit-drupal-freeunit.json`.
+Full example: `examples/unit-drupal-freeunit.json` in commit eb1da176.
 The listener's `drupal` route keeps the dev kit's security rules. It adds
 `/freeunit/cron` → 404 and ends with the docroot share, which falls back
 to `routes/drupal_page`:

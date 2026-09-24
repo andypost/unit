@@ -13,7 +13,7 @@ see the Day-2 OPT stream report (not shipped in this tree).
 Builds `unitd` (+ test binaries) with a given compiler, disassembles
 the hot functions listed in `hot-functions.txt` with
 `objdump -d --no-show-raw-insn`, normalizes out address/layout noise,
-and diffs against a stored baseline.
+and diffs against a baseline built from another commit.
 
 ```sh
 tools/perf/disasm-diff.sh --cc clang            # check against baseline
@@ -25,19 +25,18 @@ Exits non-zero (and prints a normalized `diff -u`) when any tracked
 function's codegen changed. `nm --print-size --size-sort` is the
 companion size check -- see "size check" below.
 
-**Canonical (gate-blocking) baseline: `clang-18.1.3-glibc-2.39`.**
-This is the only leg a CI failure here should block a PR on. Clang was
-chosen over gcc because its output is more compact/deterministic
-across trivial register-allocation reshuffles, which lowers the false
--positive rate when the compiler itself is upgraded (see the Day-2
-report, `mca_nncq_dequeue` example). The `gcc-13.3.0-glibc-2.39`
-baseline is kept alongside it and still updated, but it is
-**informational only**: it is not sufficient reason on its own to
-reject a PR, since gcc's build is also part of the production
-toolchain matrix and worth tracking, but clang is the tie-breaking
-signal.
+The baseline is not stored in the tree: it depends on the exact
+compiler, so it is generated on the same machine from the commit to
+compare against (CI builds it from the PR's base commit, see
+`.github/workflows/perf-gates.yml`). Locally:
 
-Baseline layout: `tools/perf/baseline/<cc>-<version>-<libc>/<func>.s`.
+```sh
+git stash; tools/perf/disasm-diff.sh --cc clang --update; git stash pop
+tools/perf/disasm-diff.sh --cc clang
+```
+
+clang is the canonical leg; gcc is informational only.
+Baselines land in `tools/perf/baseline/<cc>-<version>-<libc>/` (ignored).
 
 #### Harness for header-only inlines
 

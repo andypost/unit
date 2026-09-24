@@ -7,8 +7,9 @@
   integration tip of 2026-09-23). The IPC, router, status and schedules
   streams are editing `src/nxt_router.c` this week, so re-check each line
   before editing.
-- Spikes: `docs/adr/0005-spikes/` (an nghttp2 server and a quiche HTTP/3
-  server, both driven from a bare epoll loop; see §8).
+- Spikes: an nghttp2 server and a quiche HTTP/3 server, both driven from
+  a bare epoll loop (see §8); the code is in the history of
+  `stream/h2h3-explore`, commit 48cc253d.
 
 ## Context and problem statement
 
@@ -618,8 +619,9 @@ connection never migrates between engines.
 
 ## 8. Spikes
 
-Both spikes live in `docs/adr/0005-spikes/` with a README that has the
-exact build and test commands. Neither touches `src/`.
+The spike code is not kept in the tree; it is in commit 48cc253d
+(`docs/adr/0005-spikes/`, with the exact build and test commands).
+Neither touches `src/`.
 
 ### 8.1 `h2_epoll_server.c` (nghttp2 + OpenSSL ALPN, epoll)
 

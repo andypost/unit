@@ -29,3 +29,4 @@ test/fake_otlp/target/
 /clang-ast/
 /compile_commands.json
 /AGENTS.md
+tools/perf/baseline/

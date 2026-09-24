@@ -86,7 +86,7 @@ jobs:
             "drush/drush:^13.8 || ^14@dev"
           composer require --dev --no-update "drupal/core-dev:${{ matrix.core }}"
           composer update --no-interaction --no-progress -W
-          composer show drupal/core drush/drush | grep -E '^(name|versions)'
+          composer show | grep -E '^(drupal/core|drush/drush) '
           mkdir -p web/modules/custom web/sites/simpletest/browser_output
           cp -r "$GITHUB_WORKSPACE/$MODULE" web/modules/custom/freeunit
 

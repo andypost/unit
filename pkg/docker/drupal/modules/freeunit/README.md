@@ -97,7 +97,9 @@ configuration for every host in `static_cache.hosts`.
   `gzip` is on.
 - `static_cache.scheme` is the scheme the *router* sees (`http` behind a
   TLS-terminating proxy). Both the writer and the route key the file tree
-  on it, not on the scheme Drupal derives from `X-Forwarded-Proto`.
+  on it, not on the scheme Drupal derives from `X-Forwarded-Proto`. Serve
+  the cached hosts on that one scheme only: a page rendered for the other
+  scheme (absolute URLs differ) would be written into the same tree.
 - The control socket stays root-only. Only Drush uses it, run as the
   socket's owner. Do not make it group-writable for `www-data`: that would
   let any PHP code rewrite the server configuration.

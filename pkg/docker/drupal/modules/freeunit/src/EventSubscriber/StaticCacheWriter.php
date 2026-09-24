@@ -42,10 +42,11 @@ final class StaticCacheWriter implements EventSubscriberInterface {
   /**
    * Response headers the router does not reproduce and that may be dropped.
    *
-   * The router sends its own Date, ETag and Last-Modified; the others are
-   * Drupal debugging or informational headers.
+   * The router sends its own Content-Length, Date, ETag and Last-Modified;
+   * the others are Drupal debugging or informational headers.
    */
   private const DROPPED = [
+    'content-length',
     'date',
     'etag',
     'last-modified',

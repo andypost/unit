@@ -33,8 +33,7 @@ final class StaticCacheIndex {
     $transaction = $this->database->startTransaction();
     $this->database->delete(self::TABLE)->condition('file', $file)->execute();
     $insert = $this->database->insert(self::TABLE)->fields(['file', 'tag', 'expire']);
-    // Every file gets the pseudo-tag "freeunit:all", so a purge is one query.
-    foreach (array_unique([...$tags, 'freeunit:all']) as $tag) {
+    foreach (array_unique($tags) as $tag) {
       $insert->values(['file' => $file, 'tag' => $tag, 'expire' => $expire]);
     }
     $insert->execute();

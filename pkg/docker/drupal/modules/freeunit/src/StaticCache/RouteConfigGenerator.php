@@ -52,6 +52,9 @@ final class RouteConfigGenerator {
       $app .= '/' . $settings->get('control.target');
     }
     $hosts = (array) $settings->get('static_cache.hosts');
+    if ($hosts === []) {
+      throw new \LogicException('freeunit.settings static_cache.hosts is empty: nothing to serve.');
+    }
     $scheme = (string) $settings->get('static_cache.scheme');
     $gzip = (bool) $settings->get('static_cache.gzip');
 

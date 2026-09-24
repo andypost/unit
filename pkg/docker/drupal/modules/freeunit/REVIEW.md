@@ -179,3 +179,47 @@ Counts: blocking 1, major 6, minor 12.
 - Check script additions: `Authorization` header, `/index.php`,
   `/index.php/node/1`, an encoded dot-segment traversal (400) and a plain
   one (normalised, falls through to PHP).
+
+## Round 2 (against the round-1 commit)
+
+Counts: blocking 0, major 0, minor 5.
+
+- **m13.** `StaticCacheIndex::record()` still adds the pseudo-tag
+  `freeunit:all` to every file although nothing queries it any more (purge
+  truncates): one wasted row per page. Fixed: removed.
+- **m14.** `Content-Length` on a Drupal response (some modules set it) is
+  neither reproduced nor dropped, so such pages are never written, although
+  the router computes its own. Fixed: added to `StaticCacheWriter::DROPPED`.
+- **m15.** `RouteConfigGenerator::build()` with empty `static_cache.hosts`
+  produced a route with an empty `cookies` rule and no shares. Fixed:
+  throws `LogicException`.
+- **m16.** With the tree keyed on the configured scheme, a page rendered for
+  the other scheme (direct HTTP hit on an HTTPS site) is written into the
+  same tree. Documented in the README (serve cached hosts on one scheme).
+- **m17.** Session cookie names for the bypass rule are computed with
+  `Request::create("scheme://host/")`, so a site installed under a base
+  path gets the wrong exact name; the `*SESS*` rule still catches it unless
+  the cookie sits on its own second Cookie line. Not fixed (prototype;
+  `hasSession()` in the writer means no authenticated page is ever
+  written, so the failure mode is a PHP round trip, not a leak).
+
+Also re-checked and unchanged: the writer's `Cache-Control` gate handles
+page_cache's own `setPrivate()` on a HIT for a request with a session
+cookie, and 304 responses (status != 200); the invalidator's ordering
+(−50 before −100) holds; `hook_uninstall` runs while the module's
+services are still in the container.
+
+Unverifiable here (no Drupal core readable in this environment): the
+exact names `RequirementSeverity::{OK,Warning,Error,Info}`, the `cron` and
+`state` interface aliases that `AutowireTrait` needs in `CronController`,
+and that `hook_runtime_requirements` is the 11.2 name. Each is one line to
+correct on first install.
+
+### Round 2 fixes
+
+m13, m14, m15, m16 as above.
+
+## Round 3 (against the round-2 commit)
+
+Counts: blocking 0, major 0, minor 0. The round-2 diff is four lines of
+code and a README paragraph; nothing new. Done.

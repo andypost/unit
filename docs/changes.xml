@@ -10,6 +10,16 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+a certificate bundle whose private key does not belong to its first
+certificate is now refused at upload with 400 "Invalid certificate.".  Before,
+the bundle was stored, and the mismatch broke the next reconfiguration of every
+listener that named it.  Certificate names that start with "." are reserved
+for the store's own files, and files with such names are ignored at startup.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 an application worker that served a WebSocket upgrade never became idle again.

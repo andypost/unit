@@ -1,6 +1,13 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Change: a certificate bundle whose private key does not belong to
+       its first certificate is now refused at upload with 400 "Invalid
+       certificate.". Before, the bundle was stored, and the mismatch
+       broke the next reconfiguration of every listener that named it.
+       Certificate names that start with "." are reserved for the store's
+       own files, and files with such names are ignored at startup.
+
     *) Bugfix: an application worker that served a WebSocket upgrade never
        became idle again. The router counts a session on the worker and
        keeps a worker with a session out of the idle queues, but nothing

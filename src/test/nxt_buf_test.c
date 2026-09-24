@@ -1,5 +1,5 @@
 /*
- * Copyright (C) FreeUnit
+ * Copyright (C) FreeUnit contributors.
  */
 
 #include <nxt_main.h>

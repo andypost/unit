@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FreeUnit Drupal Harness</title>
+<style>
+:root {
+  --bg: #f6f7f9;
+  --bg-panel: #ffffff;
+  --bg-nested: #f0f1f4;
+  --border: #dde1e6;
+  --text: #1b1f24;
+  --text-dim: #5b6472;
+  --accent: #2563eb;
+  --ok: #1a7f37;
+  --warn: #b45309;
+  --bad: #c81e3a;
+  --bar-router: #2563eb;
+  --bar-ipc: #7c3aed;
+  --bar-worker: #0891b2;
+  --bar-sql: #d97706;
+  --bar-cache: #059669;
+  --bar-render: #db2777;
+  --mono: "SF Mono", "Consolas", "Menlo", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1115;
+    --bg-panel: #171a21;
+    --bg-nested: #1d2129;
+    --border: #2b303a;
+    --text: #e6e9ef;
+    --text-dim: #8b93a1;
+    --accent: #5b8ef4;
+    --ok: #4fce6a;
+    --warn: #e6a23c;
+    --bad: #f0576b;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1115;
+  --bg-panel: #171a21;
+  --bg-nested: #1d2129;
+  --border: #2b303a;
+  --text: #e6e9ef;
+  --text-dim: #8b93a1;
+  --accent: #5b8ef4;
+  --ok: #4fce6a;
+  --warn: #e6a23c;
+  --bad: #f0576b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 16px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+}
+h1 {
+  font-size: 18px;
+  margin: 0 0 4px;
+}
+.subtitle {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-bottom: 14px;
+}
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+button#theme-toggle {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+details.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+details.panel > summary {
+  padding: 12px 14px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+details.panel > summary::-webkit-details-marker { display: none; }
+details.panel > summary::before {
+  content: "▸";
+  color: var(--text-dim);
+  transition: transform .15s ease;
+  display: inline-block;
+  width: 10px;
+}
+details.panel[open] > summary::before { transform: rotate(90deg); }
+.panel-body { padding: 0 14px 14px; overflow-x: auto; }
+
+details.node {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin: 6px 0;
+  background: var(--bg-nested);
+}
+details.node > summary {
+  padding: 8px 10px;
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+details.node > summary::-webkit-details-marker { display: none; }
+details.node > summary::before {
+  content: "▸";
+  color: var(--text-dim);
+  transition: transform .15s ease;
+  width: 8px;
+  display: inline-block;
+  flex-shrink: 0;
+}
+details.node[open] > summary::before { transform: rotate(90deg); }
+.node-body { padding: 4px 10px 10px 24px; }
+.node-name { font-weight: 600; }
+.node-meta { color: var(--text-dim); font-size: 12px; margin-left: auto; white-space: nowrap; font-family: var(--mono); }
+
+.timebar {
+  display: flex;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--border);
+  margin: 4px 0 6px;
+  width: 100%;
+}
+.timebar span { height: 100%; }
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 10px;
+  font-size: 12px;
+  margin: 4px 0;
+}
+.kv .k { color: var(--text-dim); }
+.kv .v { font-family: var(--mono); }
+
+.badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-family: var(--mono);
+}
+.badge.ok { background: rgba(26,127,55,.15); color: var(--ok); }
+.badge.warn { background: rgba(180,83,9,.15); color: var(--warn); }
+.badge.bad { background: rgba(200,30,58,.15); color: var(--bad); }
+
+table.mini {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin: 6px 0;
+}
+table.mini th, table.mini td {
+  text-align: left;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+}
+table.mini th { color: var(--text-dim); font-weight: 500; }
+code.id { font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+
+.gates span { margin-right: 4px; font-family: var(--mono); }
+.gates .pass { color: var(--ok); }
+.gates .fail { color: var(--bad); }
+
+.diagram {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 12px;
+  margin: 6px 0 10px;
+}
+.diagram .st {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  background: var(--bg-panel);
+}
+.diagram .st.active { border-color: var(--accent); color: var(--accent); }
+.diagram .arrow { color: var(--text-dim); }
+
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+@media (max-width: 480px) {
+  .grid2 { grid-template-columns: 1fr; }
+  .node-meta { display: block; margin-left: 0; }
+  body { padding: 10px; font-size: 13px; }
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin: 4px 0 10px;
+}
+.legend .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div>
+    <h1>FreeUnit Drupal Harness</h1>
+    <div class="subtitle">Прототип дашборда · демо-данные · трейс запроса, schedules, фабрика кода, процессы</div>
+  </div>
+  <button id="theme-toggle" type="button">Тема: авто</button>
+</div>
+
+<!-- ===================== REQUEST TRACE ===================== -->
+<details class="panel" open>
+  <summary>Запрос: <code>GET /node/1</code> — p50 42мс / p99 187мс</summary>
+  <div class="panel-body">
+    <div class="legend">
+      <span><span class="sw" style="background:var(--bar-router)"></span>router</span>
+      <span><span class="sw" style="background:var(--bar-ipc)"></span>IPC/shm</span>
+      <span><span class="sw" style="background:var(--bar-worker)"></span>PHP worker</span>
+      <span><span class="sw" style="background:var(--bar-sql)"></span>SQL</span>
+      <span><span class="sw" style="background:var(--bar-cache)"></span>cache</span>
+      <span><span class="sw" style="background:var(--bar-render)"></span>render</span>
+    </div>
+    <div id="request-tree"></div>
+  </div>
+</details>
+
+<!-- ===================== SCHEDULES ===================== -->
+<details class="panel">
+  <summary>Schedules — <code>drupal-cron</code></summary>
+  <div class="panel-body" id="schedules-body"></div>
+</details>
+
+<!-- ===================== CODE FACTORY ===================== -->
+<details class="panel">
+  <summary>Фабрика кода — принято функций по уровням, гейты, токены</summary>
+  <div class="panel-body" id="factory-body"></div>
+</details>
+
+<!-- ===================== PROCESSES ===================== -->
+<details class="panel">
+  <summary>Процессы и потоки — router / worker / приложение</summary>
+  <div class="panel-body" id="proc-body"></div>
+</details>
+
+<script>
+"use strict";
+
+/* ---------- demo data (embedded JSON) ---------- */
+
+const DATA = {
+  request: {
+    method: "GET", path: "/node/1", p50_ms: 42, p99_ms: 187,
+    children: [
+      {
+        name: "FreeUnit", kind: "freeunit", dur_ms: 9.4,
+        bar: [ {c:"router", ms:1.1}, {c:"ipc", ms:2.8}, {c:"worker", ms:5.5} ],
+        children: [
+          { name: "router: parse/route", kind: "router", dur_ms: 1.1,
+            kv: { "listen": "*:8080", "match": "route#drupal-default", "conf_rev": "1442" } },
+          { name: "IPC: queue → shm → worker", kind: "ipc", dur_ms: 2.8,
+            kv: { "port_queue_depth": "3/64", "mmap_chunk": "#118 (16K)", "wait_for_worker_ms": "1.9" } },
+          { name: "PHP worker (unit_php)", kind: "worker", dur_ms: 5.5,
+            kv: { "pid": "28841", "app_target": "drupal/index", "worker_state": "busy→idle" } }
+        ]
+      },
+      {
+        name: "Drupal", kind: "drupal", dur_ms: 32.6,
+        bar: [ {c:"sql", ms:11.2}, {c:"cache", ms:4.9}, {c:"render", ms:16.5} ],
+        children: [
+          { name: "SQL", kind: "sql", dur_ms: 11.2,
+            kv: { "queries": "14", "slow (>5ms)": "1", "gander_db_ms": "11.2" } },
+          { name: "Cache", kind: "cache", dur_ms: 4.9,
+            kv: { "backend": "database", "hits": "22", "misses": "3", "gander_cache_ms": "4.9" } },
+          { name: "Render", kind: "render", dur_ms: 16.5,
+            kv: { "twig_templates": "9", "render_cache_hits": "6", "gander_render_ms": "16.5" },
+            functions: [
+              { fid: "drupal/node.page.inc:node_page_view", contract: "ok", gates: {G1:1,G2:1,G3:1,G4:1,G5:1,G6:1}, profile_pct: 18.4, git_churn: 2 },
+              { fid: "drupal/views/Plugin/views/style/Fields.php:render", contract: "ok", gates: {G1:1,G2:1,G3:1,G4:1,G5:0,G6:1}, profile_pct: 12.1, git_churn: 5 },
+              { fid: "drupal/Core/Template/TwigEnvironment.php:renderInline", contract: "pending", gates: {G1:1,G2:1,G3:0,G4:0,G5:0,G6:0}, profile_pct: 9.7, git_churn: 11 },
+              { fid: "drupal/Core/Entity/EntityViewBuilder.php:buildMultiple", contract: "ok", gates: {G1:1,G2:1,G3:1,G4:1,G5:1,G6:1}, profile_pct: 7.3, git_churn: 1 }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+
+  schedules: {
+    name: "drupal-cron",
+    uri: "/cron/SECRET_KEY", interval_s: 300, jitter_s: 15, timeout_s: 240, overlap: "skip",
+    state: "idle",
+    last_runs: [
+      { started: "12:05:00", duration_ms: 4210, result: "done" },
+      { started: "12:00:00", duration_ms: 3980, result: "done" },
+      { started: "11:55:00", duration_ms: 240000, result: "timeout" },
+      { started: "11:50:00", duration_ms: 0, result: "skipped (overlap)" }
+    ]
+  },
+
+  factory: {
+    tiers: [
+      { tier: "L1", model: "Haiku", accepted: 214, submitted: 231, gate_pass_pct: 96.8, tokens_per_fn: 1850 },
+      { tier: "L2", model: "Sonnet", accepted: 88, submitted: 121, gate_pass_pct: 81.4, tokens_per_fn: 6200 },
+      { tier: "L3", model: "Sonnet", accepted: 19, submitted: 34, gate_pass_pct: 61.8, tokens_per_fn: 15400 },
+      { tier: "L4", model: "Opus/Fable", accepted: 2, submitted: 9, gate_pass_pct: 33.3, tokens_per_fn: 41200 }
+    ],
+    gates: [
+      { gate: "G1 build -Werror --hardening", pass_rate_pct: 94.1 },
+      { gate: "G2 tests / pytest slice", pass_rate_pct: 78.9 },
+      { gate: "G3 ASan/UBSan", pass_rate_pct: 91.2 },
+      { gate: "G4 fuzz 5 min", pass_rate_pct: 88.0 },
+      { gate: "G5 ast-grep scan", pass_rate_pct: 96.4 },
+      { gate: "G6 @contract (IPC)", pass_rate_pct: 71.5 }
+    ]
+  },
+
+  processes: [
+    { role: "router", pid: 28801, threads: 4, cpu_pct: 6.2, rss_mb: 41 },
+    { role: "worker: unit_php #1", pid: 28841, threads: 2, cpu_pct: 38.5, rss_mb: 96 },
+    { role: "worker: unit_php #2", pid: 28842, threads: 2, cpu_pct: 12.1, rss_mb: 88 },
+    { role: "app: drupal (opcache warm)", pid: 28841, threads: 1, cpu_pct: 33.0, rss_mb: 74 }
+  ]
+};
+
+const BAR_COLOR = {
+  router: "var(--bar-router)", ipc: "var(--bar-ipc)", worker: "var(--bar-worker)",
+  sql: "var(--bar-sql)", cache: "var(--bar-cache)", render: "var(--bar-render)"
+};
+
+function el(tag, attrs, children) {
+  const e = document.createElement(tag);
+  if (attrs) for (const k in attrs) {
+    if (k === "class") e.className = attrs[k];
+    else if (k === "html") e.innerHTML = attrs[k];
+    else e.setAttribute(k, attrs[k]);
+  }
+  (children || []).forEach(c => e.appendChild(c));
+  return e;
+}
+function text(t) { return document.createTextNode(t); }
+
+function timebar(segments) {
+  const total = segments.reduce((s, x) => s + x.ms, 0) || 1;
+  const bar = el("div", { class: "timebar" });
+  segments.forEach(seg => {
+    bar.appendChild(el("span", {
+      style: `width:${(seg.ms / total * 100).toFixed(1)}%;background:${BAR_COLOR[seg.c] || "#999"}`,
+      title: `${seg.c}: ${seg.ms} мс`
+    }));
+  });
+  return bar;
+}
+
+function kvBlock(kv) {
+  const wrap = el("div", { class: "kv" });
+  for (const k in kv) {
+    wrap.appendChild(el("div", { class: "k" }, [text(k)]));
+    wrap.appendChild(el("div", { class: "v" }, [text(kv[k])]));
+  }
+  return wrap;
+}
+
+function gateBadges(gates) {
+  const wrap = el("div", { class: "gates" });
+  for (const g in gates) {
+    wrap.appendChild(el("span", { class: gates[g] ? "pass" : "fail" }, [text(`${g}:${gates[g] ? "✓" : "✗"}`)]));
+  }
+  return wrap;
+}
+
+function contractBadge(status) {
+  const cls = status === "ok" ? "ok" : status === "pending" ? "warn" : "bad";
+  return el("span", { class: `badge ${cls}` }, [text(status)]);
+}
+
+function functionRow(f) {
+  const tr = el("tr", {}, [
+    el("td", {}, [el("code", { class: "id" }, [text(f.fid)])]),
+    el("td", {}, [contractBadge(f.contract)]),
+    el("td", {}, [gateBadges(f.gates)]),
+    el("td", {}, [text(f.profile_pct.toFixed(1) + "%")]),
+    el("td", {}, [text(String(f.git_churn))])
+  ]);
+  return tr;
+}
+
+function functionsTable(functions) {
+  const table = el("table", { class: "mini" });
+  table.appendChild(el("thead", {}, [el("tr", {}, [
+    el("th", {}, [text("fid")]),
+    el("th", {}, [text("контракт")]),
+    el("th", {}, [text("гейты")]),
+    el("th", {}, [text("% профиля")]),
+    el("th", {}, [text("git churn")])
+  ])]));
+  const tbody = el("tbody");
+  functions.forEach(f => tbody.appendChild(functionRow(f)));
+  table.appendChild(tbody);
+  return table;
+}
+
+function renderNode(node) {
+  const details = el("details", { class: "node" });
+  const summary = el("summary");
+  summary.appendChild(el("span", { class: "node-name" }, [text(node.name)]));
+  summary.appendChild(el("span", { class: "node-meta" }, [text(node.dur_ms != null ? node.dur_ms.toFixed(1) + " мс" : "")]));
+  details.appendChild(summary);
+
+  const body = el("div", { class: "node-body" });
+  if (node.bar) body.appendChild(timebar(node.bar));
+  if (node.kv) body.appendChild(kvBlock(node.kv));
+  if (node.functions) {
+    body.appendChild(el("div", { style: "font-size:12px;color:var(--text-dim);margin:6px 0 2px" },
+      [text("Функции (по доле в профиле):")]));
+    body.appendChild(functionsTable(node.functions));
+  }
+  if (node.children) node.children.forEach(c => body.appendChild(renderNode(c)));
+  details.appendChild(body);
+  return details;
+}
+
+function renderRequestTree() {
+  const root = DATA.request;
+  const host = document.getElementById("request-tree");
+  const rootNode = {
+    name: `${root.method} ${root.path}`,
+    dur_ms: null,
+    kv: { "p50": root.p50_ms + " мс", "p99": root.p99_ms + " мс" },
+    children: root.children
+  };
+  host.appendChild(renderNode(rootNode));
+}
+
+function renderSchedules() {
+  const s = DATA.schedules;
+  const host = document.getElementById("schedules-body");
+
+  host.appendChild(el("div", { class: "kv" }, (() => {
+    const nodes = [];
+    const kv = { "pass": "applications/drupal/index", "uri": s.uri, "interval": s.interval_s + " с",
+      "jitter": s.jitter_s + " с", "timeout": s.timeout_s + " с", "overlap": s.overlap };
+    for (const k in kv) {
+      nodes.push(el("div", { class: "k" }, [text(k)]));
+      nodes.push(el("div", { class: "v" }, [text(kv[k])]));
+    }
+    return nodes;
+  })()));
+
+  const states = ["idle", "running", "done", "timeout", "skipped"];
+  const diagram = el("div", { class: "diagram" });
+  ["idle", "running"].forEach((st, i) => {
+    diagram.appendChild(el("span", { class: "st" + (st === s.state ? " active" : "") }, [text(st)]));
+    diagram.appendChild(el("span", { class: "arrow" }, [text("→")]));
+  });
+  ["done", "timeout", "skipped"].forEach((st, i) => {
+    diagram.appendChild(el("span", { class: "st" + (st === s.state ? " active" : "") }, [text(st)]));
+    if (i < 2) diagram.appendChild(el("span", { class: "arrow" }, [text("/")]));
+  });
+  host.appendChild(diagram);
+
+  const table = el("table", { class: "mini" });
+  table.appendChild(el("thead", {}, [el("tr", {}, [
+    el("th", {}, [text("запуск")]), el("th", {}, [text("длительность")]), el("th", {}, [text("итог")])
+  ])]));
+  const tbody = el("tbody");
+  s.last_runs.forEach(r => {
+    const badgeClass = r.result === "done" ? "ok" : r.result === "timeout" ? "bad" : "warn";
+    tbody.appendChild(el("tr", {}, [
+      el("td", {}, [text(r.started)]),
+      el("td", {}, [text((r.duration_ms / 1000).toFixed(2) + " с")]),
+      el("td", {}, [el("span", { class: `badge ${badgeClass}` }, [text(r.result)])])
+    ]));
+  });
+  table.appendChild(tbody);
+  host.appendChild(table);
+}
+
+function renderFactory() {
+  const f = DATA.factory;
+  const host = document.getElementById("factory-body");
+
+  host.appendChild(el("div", { style: "font-size:12px;color:var(--text-dim);margin-bottom:4px" },
+    [text("Принято функций по уровням модели:")]));
+  const t1 = el("table", { class: "mini" });
+  t1.appendChild(el("thead", {}, [el("tr", {}, [
+    el("th", {}, [text("уровень")]), el("th", {}, [text("модель")]),
+    el("th", {}, [text("принято/подано")]), el("th", {}, [text("гейты, %")]),
+    el("th", {}, [text("токены/функцию")])
+  ])]));
+  const b1 = el("tbody");
+  f.tiers.forEach(t => {
+    b1.appendChild(el("tr", {}, [
+      el("td", {}, [text(t.tier)]),
+      el("td", {}, [text(t.model)]),
+      el("td", {}, [text(`${t.accepted}/${t.submitted}`)]),
+      el("td", {}, [text(t.gate_pass_pct.toFixed(1))]),
+      el("td", {}, [text(String(t.tokens_per_fn))])
+    ]));
+  });
+  t1.appendChild(b1);
+  host.appendChild(t1);
+
+  host.appendChild(el("div", { style: "font-size:12px;color:var(--text-dim);margin:10px 0 4px" },
+    [text("Прохождение гейтов:")]));
+  const t2 = el("table", { class: "mini" });
+  t2.appendChild(el("thead", {}, [el("tr", {}, [el("th", {}, [text("гейт")]), el("th", {}, [text("проходят, %")])])]));
+  const b2 = el("tbody");
+  f.gates.forEach(g => {
+    b2.appendChild(el("tr", {}, [el("td", {}, [text(g.gate)]), el("td", {}, [text(g.pass_rate_pct.toFixed(1))])]));
+  });
+  t2.appendChild(b2);
+  host.appendChild(t2);
+}
+
+function renderProcesses() {
+  const host = document.getElementById("proc-body");
+  const table = el("table", { class: "mini" });
+  table.appendChild(el("thead", {}, [el("tr", {}, [
+    el("th", {}, [text("роль")]), el("th", {}, [text("pid")]), el("th", {}, [text("потоки")]),
+    el("th", {}, [text("CPU, %")]), el("th", {}, [text("RSS, МБ")])
+  ])]));
+  const tbody = el("tbody");
+  DATA.processes.forEach(p => {
+    tbody.appendChild(el("tr", {}, [
+      el("td", {}, [text(p.role)]),
+      el("td", {}, [text(String(p.pid))]),
+      el("td", {}, [text(String(p.threads))]),
+      el("td", {}, [text(p.cpu_pct.toFixed(1))]),
+      el("td", {}, [text(String(p.rss_mb))])
+    ]));
+  });
+  table.appendChild(tbody);
+  host.appendChild(table);
+}
+
+/* theme toggle: cycles auto -> light -> dark -> auto, persisted per-viewer only */
+(function initTheme() {
+  const btn = document.getElementById("theme-toggle");
+  const labels = { auto: "Тема: авто", light: "Тема: светлая", dark: "Тема: тёмная" };
+  let mode = "auto";
+  try { mode = localStorage.getItem("fu-theme") || "auto"; } catch (e) {}
+  function apply() {
+    if (mode === "auto") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", mode);
+    btn.textContent = labels[mode];
+  }
+  apply();
+  btn.addEventListener("click", () => {
+    mode = mode === "auto" ? "light" : mode === "light" ? "dark" : "auto";
+    try { localStorage.setItem("fu-theme", mode); } catch (e) {}
+    apply();
+  });
+})();
+
+renderRequestTree();
+renderSchedules();
+renderFactory();
+renderProcesses();
+</script>
+</body>
+</html>

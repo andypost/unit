@@ -23,11 +23,6 @@ nxt_checked_arith_test(nxt_thread_t *thr)
         return NXT_ERROR;
     }
 
-    if (nxt_size_sub(5, 3, &r) != 0 || r != 2) {
-        nxt_log_alert(thr->log, "nxt_size_sub(5, 3) failed");
-        return NXT_ERROR;
-    }
-
     if (nxt_size_mul(6, 7, &r) != 0 || r != 42) {
         nxt_log_alert(thr->log, "nxt_size_mul(6, 7) failed");
         return NXT_ERROR;
@@ -37,13 +32,6 @@ nxt_checked_arith_test(nxt_thread_t *thr)
 
     if (nxt_size_add(SIZE_MAX, 1, &r) == 0) {
         nxt_log_alert(thr->log, "nxt_size_add(SIZE_MAX, 1) did not overflow");
-        return NXT_ERROR;
-    }
-
-    /* size_t subtraction underflow. */
-
-    if (nxt_size_sub(0, 1, &r) == 0) {
-        nxt_log_alert(thr->log, "nxt_size_sub(0, 1) did not overflow");
         return NXT_ERROR;
     }
 

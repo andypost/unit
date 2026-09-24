@@ -29,13 +29,6 @@ nxt_size_add(size_t a, size_t b, size_t *out)
 
 
 nxt_inline int
-nxt_size_sub(size_t a, size_t b, size_t *out)
-{
-    return __builtin_sub_overflow(a, b, out);
-}
-
-
-nxt_inline int
 nxt_size_mul(size_t a, size_t b, size_t *out)
 {
     return __builtin_mul_overflow(a, b, out);

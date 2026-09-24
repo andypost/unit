@@ -380,7 +380,8 @@ static void nxt_router_http_request_done(nxt_task_t *task, void *obj,
 static void nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data);
 static nxt_buf_t *nxt_router_prepare_msg(nxt_task_t *task,
-    nxt_http_request_t *r, nxt_app_t *app, const nxt_str_t *prefix);
+    nxt_http_request_t *r, nxt_app_t *app, const nxt_str_t *prefix,
+    nxt_http_status_t *status);
 
 static void nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data);
 static void nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj,
@@ -5338,19 +5339,152 @@ nxt_router_thread_exit_handler(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * Parses the nxt_unit_response_t an application handed back in "b": the
+ * fixed header, the field array and the piggybacked body.  The buffer is
+ * shared memory the application keeps mapped writable, so every value is
+ * read once, through volatile into a local, and checked before use:
+ * fields_count against the buffer size, each sptr and its length by
+ * nxt_unit_sptr_in_buf().
+ *
+ * Kept as its own function so a harness can drive it with a synthetic
+ * buffer and a bare nxt_http_request_t, without a router or a live app
+ * connection: see fuzzing/nxt_router_app_response_fuzz.c.
+ */
+
+static nxt_int_t
+nxt_router_response_header_parse(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_buf_t *b)
+{
+    size_t                b_size, count;
+    u_char                *p;
+    uint32_t              piggyback_length;
+    nxt_int_t             ret;
+    nxt_unit_field_t      *f, uf;
+    nxt_http_field_t      *field;
+    nxt_unit_response_t   *resp;
+
+    b_size = nxt_buf_is_mem(b) ? nxt_buf_mem_used_size(&b->mem) : 0;
+
+    if (nxt_slow_path(b_size < sizeof(nxt_unit_response_t)
+                       || b_size > UINT32_MAX))
+    {
+        nxt_alert(task, "response buffer too small: %z", b_size);
+        return NXT_ERROR;
+    }
+
+    resp = (void *) b->mem.pos;
+    count = *(volatile uint32_t *) &resp->fields_count;
+
+    if (nxt_slow_path(count > (b_size - sizeof(nxt_unit_response_t))
+                              / sizeof(nxt_unit_field_t)))
+    {
+        nxt_alert(task, "response buffer too small for fields count: %uz",
+                  count);
+        return NXT_ERROR;
+    }
+
+    for (f = resp->fields; f < resp->fields + count; f++) {
+        uf = *(volatile nxt_unit_field_t *) f;
+
+        if (uf.skip) {
+            continue;
+        }
+
+        field = nxt_http_resp_field_add(&r->resp, r->mem_pool);
+
+        if (nxt_slow_path(field == NULL)) {
+            return NXT_ERROR;
+        }
+
+        field->hash = uf.hash;
+        field->skip = 0;
+        field->hopbyhop = 0;
+
+        field->name_length = uf.name_length;
+        field->value_length = uf.value_length;
+        field->name = nxt_unit_sptr_in_buf(&f->name, uf.name_length,
+                                           b->mem.pos, b_size);
+        field->value = nxt_unit_sptr_in_buf(&f->value, uf.value_length,
+                                            b->mem.pos, b_size);
+
+        if (nxt_slow_path(field->name == NULL || field->value == NULL)) {
+            nxt_alert(task, "response field sptr out of bounds");
+            return NXT_ERROR;
+        }
+
+        ret = nxt_http_field_process(field, &nxt_response_fields_hash, r);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NXT_ERROR;
+        }
+
+        nxt_debug(task, "header%s: %*s: %*s",
+                  (field->skip ? " skipped" : ""),
+                  (size_t) field->name_length, field->name,
+                  (size_t) field->value_length, field->value);
+
+        if (field->skip) {
+            if (r->resp.num_inline_fields > 0
+                && field == &r->resp.inline_fields[r->resp.num_inline_fields - 1])
+            {
+                r->resp.num_inline_fields--;
+            } else if (r->resp.fields != NULL && r->resp.fields->last != NULL) {
+                r->resp.fields->last->nelts--;
+            }
+        }
+    }
+
+    r->status = resp->status;
+
+    piggyback_length =
+        *(volatile uint32_t *) &resp->piggyback_content_length;
+
+    if (piggyback_length != 0) {
+        p = nxt_unit_sptr_in_buf(&resp->piggyback_content, piggyback_length,
+                                 b->mem.pos, b_size);
+        if (nxt_slow_path(p == NULL)) {
+            nxt_alert(task, "response piggyback content out of bounds");
+            return NXT_ERROR;
+        }
+
+        b->mem.pos = p;
+        b->mem.free = p + piggyback_length;
+
+    } else {
+        b->mem.pos = b->mem.free;
+    }
+
+    return NXT_OK;
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_response_parse_test.c: the function is static. */
+
+nxt_int_t nxt_router_test_response_header_parse(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_buf_t *b);
+
+
+nxt_int_t
+nxt_router_test_response_header_parse(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_buf_t *b)
+{
+    return nxt_router_response_header_parse(task, r, b);
+}
+
+#endif
+
+
 static void
 nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
-    size_t                  b_size, count;
     nxt_int_t               ret;
     nxt_app_t               *app;
     nxt_buf_t               *b, *next, *out, *last_b, *owned_b;
     nxt_port_t              *app_port;
-    nxt_unit_field_t        *f;
-    nxt_http_field_t        *field;
     nxt_http_request_t      *r;
-    nxt_unit_response_t     *resp;
     nxt_request_rpc_data_t  *req_rpc_data;
 
     /*
@@ -5449,74 +5583,9 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
         nxt_http_request_send_body(task, r, NULL);
     } else {
-        b_size = nxt_buf_is_mem(b) ? nxt_buf_mem_used_size(&b->mem) : 0;
-
-        if (nxt_slow_path(b_size < sizeof(nxt_unit_response_t))) {
-            nxt_alert(task, "response buffer too small: %z", b_size);
+        ret = nxt_router_response_header_parse(task, r, b);
+        if (nxt_slow_path(ret != NXT_OK)) {
             goto fail;
-        }
-
-        resp = (void *) b->mem.pos;
-        count = (b_size - sizeof(nxt_unit_response_t))
-                    / sizeof(nxt_unit_field_t);
-
-        if (nxt_slow_path(count < resp->fields_count)) {
-            nxt_alert(task, "response buffer too small for fields count: %D",
-                      resp->fields_count);
-            goto fail;
-        }
-
-        field = NULL;
-
-        for (f = resp->fields; f < resp->fields + resp->fields_count; f++) {
-            if (f->skip) {
-                continue;
-            }
-
-            field = nxt_http_resp_field_add(&r->resp, r->mem_pool);
-
-            if (nxt_slow_path(field == NULL)) {
-                goto fail;
-            }
-
-            field->hash = f->hash;
-            field->skip = 0;
-            field->hopbyhop = 0;
-
-            field->name_length = f->name_length;
-            field->value_length = f->value_length;
-            field->name = nxt_unit_sptr_get(&f->name);
-            field->value = nxt_unit_sptr_get(&f->value);
-
-            ret = nxt_http_field_process(field, &nxt_response_fields_hash, r);
-            if (nxt_slow_path(ret != NXT_OK)) {
-                goto fail;
-            }
-
-            nxt_debug(task, "header%s: %*s: %*s",
-                      (field->skip ? " skipped" : ""),
-                      (size_t) field->name_length, field->name,
-                      (size_t) field->value_length, field->value);
-
-            if (field->skip) {
-                if (r->resp.num_inline_fields > 0
-                    && field == &r->resp.inline_fields[r->resp.num_inline_fields - 1])
-                {
-                    r->resp.num_inline_fields--;
-                } else if (r->resp.fields != NULL && r->resp.fields->last != NULL) {
-                    r->resp.fields->last->nelts--;
-                }
-            }
-        }
-
-        r->status = resp->status;
-
-        if (resp->piggyback_content_length != 0) {
-            b->mem.pos = nxt_unit_sptr_get(&resp->piggyback_content);
-            b->mem.free = b->mem.pos + resp->piggyback_content_length;
-
-        } else {
-            b->mem.pos = b->mem.free;
         }
 
         if (nxt_buf_mem_used_size(&b->mem) == 0) {
@@ -7503,6 +7572,7 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_buf_t         *buf, *body;
     nxt_int_t         res;
     nxt_port_t        *port, *reply_port;
+    nxt_http_status_t  status;
 
     int                   notify;
     struct {
@@ -7523,13 +7593,14 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     reply_port = task->thread->engine->port;
 
     buf = nxt_router_prepare_msg(task, req_rpc_data->request, app,
-                                 nxt_app_msg_prefix[app->type]);
+                                 nxt_app_msg_prefix[app->type], &status);
     if (nxt_slow_path(buf == NULL)) {
-        nxt_alert(task, "stream #%uD, app '%V': failed to prepare app message",
-                  req_rpc_data->stream, &app->name);
+        if (status == NXT_HTTP_INTERNAL_SERVER_ERROR) {
+            nxt_alert(task, "stream #%uD, app '%V': failed to prepare app "
+                      "message", req_rpc_data->stream, &app->name);
+        }
 
-        nxt_http_request_error(task, req_rpc_data->request,
-                               NXT_HTTP_INTERNAL_SERVER_ERROR);
+        nxt_http_request_error(task, req_rpc_data->request, status);
 
         return;
     }
@@ -7597,9 +7668,32 @@ nxt_router_app_prepare_request(nxt_task_t *task,
 
 
 
+/*
+ * Builds the nxt_unit_request_t for the application in shared memory.
+ *
+ * Every length that lands in a narrow field of the libunit protocol is
+ * checked before the buffer is allocated, and the request is refused rather
+ * than having the field truncated: a truncated length makes the application
+ * see a different string from the one that was copied (a 256-byte method
+ * arrived as an empty one), with the NUL terminator somewhere else.
+ *
+ *   - method_length is uint8_t, and the HTTP parser does not bound a method
+ *     (it is limited only by the header buffer): 501.
+ *   - a field's name_length is uint8_t.  nxt_http_parse_field_name() caps a
+ *     name at 255 bytes (NXT_HTTP_MAX_FIELD_NAME), which fits alone, but the
+ *     PHP/Perl/Ruby prefix "HTTP_" is added on top: names of 251..255 bytes
+ *     wrapped to 0..4.  431.
+ *   - version, the address and port texts are uint8_t as well but produced
+ *     by Unit itself; they are checked all the same, and fail with 500.
+ *   - the uint32_t lengths (server name, target, path, query, values) are
+ *     bounded by req_size <= PORT_MMAP_DATA_SIZE.
+ *
+ * On failure NULL is returned and *status says what to answer.
+ */
+
 static nxt_buf_t *
 nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_app_t *app, const nxt_str_t *prefix)
+    nxt_app_t *app, const nxt_str_t *prefix, nxt_http_status_t *status)
 {
     void                *target_pos, *query_pos;
     u_char              *pos, *end, *p, c;
@@ -7611,6 +7705,29 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     nxt_unit_field_t        *dst_field;
     nxt_http_fields_iter_t  iter, dup_iter;
     nxt_unit_request_t      *req;
+
+    *status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+
+    if (nxt_slow_path(r->method->length > UINT8_MAX)) {
+        nxt_log(task, NXT_LOG_INFO, "request method of %uz bytes is too long "
+                "for the application protocol", r->method->length);
+
+        *status = NXT_HTTP_NOT_IMPLEMENTED;
+        return NULL;
+    }
+
+    if (nxt_slow_path(r->version.length > UINT8_MAX
+                      || r->remote->address_length > UINT8_MAX
+                      || r->local->address_length > UINT8_MAX
+                      || nxt_sockaddr_port_length(r->local) > UINT8_MAX))
+    {
+        nxt_alert(task, "request version or address too long for the "
+                  "application protocol");
+
+        return NULL;
+    }
+
+    /* Every length is of data the request holds, so the sum cannot wrap. */
 
     req_size = sizeof(nxt_unit_request_t)
                + r->method->length + 1
@@ -7630,6 +7747,15 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     {
         fields_count++;
 
+        if (nxt_slow_path(field->name_length + prefix->length > UINT8_MAX)) {
+            nxt_log(task, NXT_LOG_INFO, "header field name of %d bytes is "
+                    "too long for the application protocol with prefix "
+                    "\"%V\"", (int) field->name_length, prefix);
+
+            *status = NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE;
+            return NULL;
+        }
+
         req_size += field->name_length + prefix->length + 1
                     + field->value_length + 1;
     } nxt_http_fields_loop;
@@ -7637,8 +7763,8 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     req_size += fields_count * sizeof(nxt_unit_field_t);
 
     if (nxt_slow_path(req_size > PORT_MMAP_DATA_SIZE)) {
-        nxt_alert(task, "headers to big to fit in shared memory (%d)",
-                  (int) req_size);
+        nxt_alert(task, "headers too big to fit in shared memory (%uz)",
+                  req_size);
 
         return NULL;
     }
@@ -7740,6 +7866,7 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 
         dst_field->hash = field->hash;
         dst_field->skip = 0;
+        /* Checked to fit uint8_t when req_size was summed. */
         dst_field->name_length = field->name_length + prefix->length;
         dst_field->value_length = field->value_length;
 
@@ -7879,6 +8006,30 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 
     return out;
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * For src/test/nxt_router_prepare_msg_test.c, which repeats this prototype:
+ * nxt_router.h cannot name nxt_http_status_t.
+ */
+
+nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status);
+
+
+nxt_buf_t *
+nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status)
+{
+    return nxt_router_prepare_msg(task, r, app,
+                                  use_http_prefix ? &http_prefix
+                                                  : &empty_prefix,
+                                  status);
+}
+
+#endif
 
 
 static void

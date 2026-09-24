@@ -404,36 +404,46 @@ path are the parts that were wrong in the first draft).
   other than `trailers`, and a `content-length` that does not match the
   DATA received, with `RST_STREAM(PROTOCOL_ERROR)`; we log them from
   `on_invalid_header_callback`. Ours: `:path` non-empty and starting with
-  `/` (or `*` for OPTIONS); `:authority` validated with the same checks
-  `nxt_http_request_host()` applies to `Host` (`src/nxt_http_request.c:87`,
-  its validator is factored out in phase 0); a `host` field whose value
-  differs from `:authority` → `RST_STREAM(PROTOCOL_ERROR)` (RFC 9113
-  §8.3.1); `:scheme` is recorded but `scheme` routing keeps using `r->tls`;
+  `/` (or `*` for OPTIONS); `:authority` validated with
+  `nxt_http_validate_host()` (`src/nxt_http_request.c:112`, today a
+  `static` behind the `Host` callback `nxt_http_request_host()`, `:87`,
+  exported in phase 0) and stored in `r->host`. A `host` field must be
+  intercepted in `on_header` because `nxt_http_request_host()` answers 400
+  to any second host (`:96-98`): with `:authority` present, an equal
+  `host` is dropped (not added to the list), a different one is
+  `RST_STREAM(PROTOCOL_ERROR)` (RFC 9113 §8.3.1); without `:authority`
+  the `host` field goes through the neutral hash and sets `r->host` as in
+  h1. `:scheme` is recorded but `scheme` routing keeps using `r->tls`;
   plain `CONNECT` (no `:scheme`/`:path`) → 405, there is no tunnel.
-- **Body and flow control.** The session is created with
-  `nghttp2_option_set_no_auto_window_update(1)`; the initial stream window
-  is `body_buffer_size`, the connection window 2 × `body_buffer_size`
-  (`nghttp2_session_set_local_window_size()` on stream 0). Because DATA can
-  arrive before, or without, the application handler ever calling
-  `body_read` (`share`, `return` and `proxy` never do;
-  `nxt_http_request_read_body`, `src/nxt_http_request.c:680`, runs after
-  routing), the body buffer is allocated at `END_HEADERS` through the
-  neutral allocator (phase 0), sized by `content-length` when present and
-  otherwise growing into a temp file like the chunked path, with
-  `max_body_size` enforced in `on_data_chunk_recv`. Each chunk is copied
-  into `r->body`, the connection window is released at once
-  (`nghttp2_session_consume_connection()`), the stream window when the copy
-  is done (`nghttp2_session_consume_stream()`), so a stream whose body is
-  not being drained stalls at one window without stalling its siblings and
-  the per-connection in-flight body budget is bounded by
-  `MAX_CONCURRENT_STREAMS × body_buffer_size` in memory. `body_read`
+- **Body and flow control.** Because DATA can arrive before, or without,
+  the application handler ever calling `body_read` (`share`, `return` and
+  `proxy` never do; `nxt_http_request_read_body`,
+  `src/nxt_http_request.c:680`, runs after routing), the body buffer is
+  allocated at `END_HEADERS` through the neutral allocator (phase 0), sized
+  by `content-length` when present and otherwise growing into a temp file
+  like the chunked path, with `max_body_size` enforced in
+  `on_data_chunk_recv`, which copies every chunk into `r->body` at once
+  (memory up to `body_buffer_size`, then the temp file, exactly h1's
+  bound). Since the bytes never wait in our memory, nghttp2's **automatic
+  window update stays on**: the windows are throughput knobs, not memory
+  bounds. `SETTINGS_INITIAL_WINDOW_SIZE` = 256 KiB (listener option
+  `http2.stream_window`) and the connection window 1 MiB
+  (`nghttp2_session_set_local_window_size()` on stream 0) give an upload
+  a sane bandwidth-delay product; memory per connection is bounded by
+  `MAX_CONCURRENT_STREAMS × body_buffer_size` plus the engine read buffer,
+  disk by `max_body_size` per stream as for h1. The review's first draft
+  had manual window updates with two consume points; they add code and
+  bound nothing extra, so they are out (the spike still exercises that
+  mode, §8.1, should a temp-file write ever need pacing). `body_read`
   (`nxt_h2p_request_body_read`) only registers interest: if `END_STREAM`
   already arrived it queues `r->state->ready_handler`, else it sets a flag
   that `on_frame_recv(END_STREAM)` acts on. The whole body is buffered
   before the application sees it, which is how h1 works today
   (`prepare_msg` copies `r->body`). For a stream whose action never reads
-  the body nothing changes: nghttp2 sends `RST_STREAM(NO_ERROR)` itself
-  when our `END_STREAM` goes out before the client's. Without a
+  the body nothing changes: DATA after the response has been submitted is
+  dropped, and nghttp2 is expected to send `RST_STREAM(NO_ERROR)` itself
+  when our `END_STREAM` goes out before the client's (a phase-1 test
+  checks this; if it does not, `close` submits it). Without a
   `content-length`, set `r->chunked = 1` so
   `nxt_http_request_chunked_transform()` synthesises `Content-Length` from
   the buffer (after the `chunked_field` NULL guard).
@@ -488,10 +498,14 @@ path are the parts that were wrong in the first draft).
   `SETTINGS_ENABLE_CONNECT_PROTOCOL` is never advertised (RFC 8441 §3, so
   browsers keep opening WebSockets over h1), `r->websocket_handshake`
   stays 0, plain CONNECT is answered 405.
-- Timeouts, all `nxt_timer_t` on the connection with the default bias:
-  `header_read_timeout` from `HEADERS` to `END_STREAM` per stream (armed on
-  the connection for the oldest open request), `send_timeout` on the
-  connection write, `idle_timeout` when no stream exists.
+- Timeouts, all `nxt_timer_t` on the connection with the default bias, no
+  per-stream timers: `header_read_timeout` is a *progress* timer, armed
+  while any stream has an incomplete request and reset by every frame
+  that advances one of them (`body_read_timeout` semantics fold into it);
+  `send_timeout` on the connection write; `idle_timeout` when no stream
+  exists. Process shutdown closes an idle h2 connection with
+  `nxt_conn_close()` directly (`src/nxt_runtime.c:507-508`), so the idle
+  state's `close_handler` must delete the nghttp2 session.
 - `listen_threads` and `SO_REUSEPORT` are unaffected: h2 rides TCP accept.
 
 **Spike result** (§8.1): 810 lines of C against the distro nghttp2 1.59 and
@@ -694,11 +708,15 @@ R1-24), on Ubuntu 24.04 in `unshare -n`.
 
 - Built with the distro `libnghttp2-dev` 1.59.0-1ubuntu0.4 and OpenSSL
   3.0.13, `-Wall -Wextra` clean.
-- Sets the §Security requirements values: `no_auto_window_update`,
-  `stream_reset_rate_limit(1000, 33)`, `max_continuations(8)`,
-  `max_settings(32)`, `MAX_CONCURRENT_STREAMS` 128, stream window 256 KiB,
-  connection window 512 KiB, `MAX_HEADER_LIST_SIZE` 32 KiB; the build
-  proves the 1.59 header carries the backported symbols.
+- Sets the §Security requirements values: `stream_reset_rate_limit(1000,
+  33)`, `max_continuations(8)`, `max_settings(32)`,
+  `MAX_CONCURRENT_STREAMS` 128, stream window 256 KiB, connection window
+  512 KiB, `MAX_HEADER_LIST_SIZE` 32 KiB; the build proves the 1.59 header
+  carries the backported symbols. It also runs with
+  `no_auto_window_update` and explicit consume calls, the manual mode the
+  design ended up not needing (Option 1, body paragraph); it is kept in the
+  spike because it is the harder mode and shows that the stream window can
+  be released from an asynchronous point without stalling the connection.
 - ALPN via `SSL_CTX_set_alpn_select_cb()` selects `h2`;
   `SSL_get0_alpn_selected()` after the handshake decides the protocol; an
   `http/1.1`-only client is closed at once.
@@ -747,8 +765,8 @@ is on GitHub): the conformance run is a CI task, see phase 1.
 **h2: option 1, nghttp2 over the existing TLS connections, after a phase 0
 that generalises four things in the protocol layer.** It is the smallest
 change, uses distro packages on every target, keeps the OpenSSL floor, and
-the spike confirmed the integration model end to end, including manual flow
-control and the mitigation settings.
+the spike confirmed the integration model end to end, including the
+mitigation settings and flow control in the harder, manual mode.
 
 **h3: deferred.** The analysis stands and is kept here so it is not redone:
 when h3 is taken up, option 3 (ngtcp2 + nghttp3 with `ngtcp2_crypto_ossl`,
@@ -773,7 +791,8 @@ are not rediscovered.
 - Workers see `HTTP/2.0` in `SERVER_PROTOCOL`; every other field of
   `nxt_unit_request_t` is filled the same way. Header names arrive
   lower-case, which they may already (h1 clients do send lower-case), and
-  `prepare_msg` upper-cases them for CGI names anyway.
+  `prepare_msg` upper-cases them for CGI names anyway
+  (`src/nxt_router.c:7954-7965`).
 - The access log `$response_header_connection` and
   `$response_header_transfer_encoding` are empty for h2, which is correct
   (the fields do not exist on the wire).
@@ -794,8 +813,8 @@ value in `src/nxt_h2proto.c` (listener options only where marked).
 | CONTINUATION flood (CVE-2024-28182): endless header block without END_HEADERS | `nghttp2_option_set_max_continuations(opt, 8)`; symbol must link. | nghttp2 |
 | HPACK bomb / oversized header lists | Advertise `SETTINGS_MAX_HEADER_LIST_SIZE` = `large_header_buffer_size × large_header_buffers` (32 KiB default); nghttp2's 64 KiB inbound header block cap stays; `SETTINGS_HEADER_TABLE_SIZE` left at 4096 and `nghttp2_option_set_max_deflate_dynamic_table_size(opt, 4096)` for our encoder. A name longer than `NXT_HTTP_MAX_FIELD_NAME` (255) or a total over the list size is a 431 on the stream. `prepare_msg` still refuses the prefixed-name and method overflows (431/501). | `on_header`; nghttp2; router |
 | SETTINGS / PING floods (unbounded ACK queue) | `nghttp2_option_set_max_settings(opt, 32)` and the default `nghttp2_option_set_max_outbound_ack` (1000): nghttp2 closes the session beyond them; we never disable them. | nghttp2 |
-| Empty DATA / WINDOW_UPDATE / PRIORITY floods | Handled inside nghttp2 (`NGHTTP2_ERR_FLOODED`); no per-frame callback work on our side for those frames. Our `on_frame_recv` does nothing for PRIORITY. | nghttp2 |
-| Slow read / stalled body | Manual window (`no_auto_window_update`), stream window `body_buffer_size`, connection window 2×; `header_read_timeout` per request from HEADERS to END_STREAM; `send_timeout` on the connection write; `idle_timeout` with no streams. | `nxt_h2proto.c` timers |
+| Empty DATA / WINDOW_UPDATE / PRIORITY floods | nghttp2 allocates nothing per such frame and our callbacks do no work for them (`on_frame_recv` ignores PRIORITY and empty DATA); the progress timer (`header_read_timeout`) closes a connection whose requests do not advance. No stronger claim is made; the h2load/fuzz runs in 1.6 watch CPU per connection. | nghttp2; timers |
+| Slow read / stalled body | Automatic window updates; stream window 256 KiB, connection window 1 MiB; bytes are copied out of nghttp2 at once so memory per connection ≤ streams × `body_buffer_size`; `header_read_timeout` as a progress timer while a request is incomplete; `send_timeout` on the connection write; `idle_timeout` with no streams. | `nxt_h2proto.c` timers, body allocator |
 | Pseudo-header and framing abuse | nghttp2 HTTP messaging validation on; ours: `:path`, `:authority`/`host` agreement, CONNECT → 405, name cap. | nghttp2; `on_header`/`on_frame_recv` |
 | TLS downgrade of h2 (RFC 9113 §9.2) | TLS ≥ 1.2, no renegotiation and no compression already set (`src/nxt_openssl.c:239-254`); the §9.2.2 cipher black list is not enforced (nginx does not either); ALPN only, no `Upgrade: h2c`. | existing TLS init |
 | Resource leak on connection error | Every stream's request fails through `nxt_http_request_error_handler`; the connection is released at `stream_count == 0`; ASan run of the error matrix in CI. | `nxt_h2proto.c` |
@@ -809,7 +828,7 @@ commit.
 
 | # | Change | Where |
 |---|---|---|
-| 0.1 | Build a second hash over the neutral tail of `nxt_h1p_fields[]` (`&nxt_h1p_fields[5]`, nine or eleven entries with OTel) in `nxt_h1p_init()`, exported as `nxt_http_request_fields_hash`; the array and the h1 hash are untouched. Factor the `Host` value validator out of `nxt_http_request_host()` as `nxt_http_validate_host(r, value)` so `:authority` can call it. | `src/nxt_h1proto.c:172-220`, `src/nxt_http_request.c:87`, `src/nxt_http.h:430-458` |
+| 0.1 | Build a second hash over the neutral tail of `nxt_h1p_fields[]` (`&nxt_h1p_fields[5]`: seven entries, nine with OTel) in `nxt_h1p_init()`, exported as `nxt_http_request_fields_hash`; the array and the h1 hash are untouched. Drop the `static` from `nxt_http_validate_host()` and declare it, so `:authority` can call it. | `src/nxt_h1proto.c:172-220`, `src/nxt_http_request.c:112`, `src/nxt_http.h:430-458` |
 | 0.2 | Factor `nxt_http_request_body_alloc(task, r, body_length)` (memory buffer vs temp file, `max_body_size` check) out of `nxt_h1p_request_body_read()`; h1 calls it. | `src/nxt_h1proto.c:967-1030`, new function in `src/nxt_http_request.c` |
 | 0.3 | Guard `r->chunked_field` in `nxt_http_request_chunked_transform()`. | `src/nxt_http_request.c:557-586` |
 | 0.4 | Add `nxt_h2p_stream_t *h2` to the `r->proto` union (forward-declared type). | `src/nxt_http.h:90-93` |
@@ -829,13 +848,13 @@ status-text tables, the ALPN dispatcher (that is phase 1 code).
 
 | # | Task | Where | Test |
 |---|---|---|---|
-| 1.1 | `--nghttp2` option, `auto/nghttp2` probe (link tests for `nghttp2_session_server_new2`, `nghttp2_option_set_stream_reset_rate_limit`, `nghttp2_option_set_max_continuations`), `NXT_HAVE_NGHTTP2`, `src/nxt_h2proto.c` in sources, summary/help lines. | `auto/options`, `auto/nghttp2`, `auto/sources`, `auto/summary`, `auto/help` | configure with and without the library; a build against Ubuntu 22.04's 1.43 must fail the probe cleanly |
+| 1.1 | `--nghttp2` option, `auto/nghttp2` probe (link tests for `nghttp2_session_server_new2`, `nghttp2_option_set_stream_reset_rate_limit`, `nghttp2_option_set_max_continuations`), `NXT_HAVE_NGHTTP2`, `src/nxt_h2proto.c` in sources, summary/help lines. | `auto/options`, `auto/nghttp2`, `auto/sources`, `auto/summary`, `auto/help` | configure with and without the library; the probe result on Ubuntu 22.04's 1.43 (its security backports may or may not carry the two symbols) is recorded by a CI leg, and either outcome is acceptable as long as it is clean |
 | 1.2 | Listener option `"tls": {"http2": true}` (+ optional `max_concurrent_streams`), validation, OpenAPI. | `src/nxt_conf_validation.c:640`, `src/nxt_router.c:3128,3274`, `docs/unit-openapi.yaml` | `test/test_http2.py::test_config_*` (rejects without `tls`) |
 | 1.3 | `nxt_tls_conf_t::alpn_h2` bit; `SSL_CTX_set_alpn_select_cb()` on every bundle context; selection after the handshake in `nxt_h1p_conn_proto_init()` under `#if (NXT_HAVE_NGHTTP2)`. | `src/nxt_tls.h:64-82`, `src/nxt_openssl.c:217-370`, `src/nxt_h1proto.c:465-484` | `curl --http1.1` and `--http2` on the same listener; SNI bundles both negotiate h2 (`test_tls_sni.py` parametrised) |
 | 1.4 | `src/nxt_h2proto.c` / `.h`: connection init with the §Security options and settings, read state, flush with back-pressure, the nghttp2 callbacks, the seven request hooks, stream/request lifetimes, timers, GOAWAY, error matrix. | new files; table entry `src/nxt_h1proto.c:136-167` | below |
 | 1.5 | `$request_line` for h2; `body_bytes_sent`; `$response_header_*` untouched. | `src/nxt_h2proto.c`, `src/nxt_http_variables.c:431-454` | `test_access_log.py` parametrised over h2 |
 | 1.6 | CI: `apt-get install libnghttp2-dev nghttp2-client`, an `h2spec` step (release binary, `h2spec -t -k -h 127.0.0.1 -p PORT --strict`, allow-list file in `test/h2spec-allow.txt` for the known generic cases), `h2load` smoke, ASan leg of the error matrix. deb/rpm build deps `libnghttp2-dev` / `libnghttp2-devel`. | `.github/workflows/build-test.yml:88`, `pkg/deb/debian/control.in:7`, `pkg/rpm/unit.spec.in:8-10` | the workflow |
-| 1.7 | `fuzzing/nxt_http_h2p_fuzz.c`: like `nxt_http_h1p_fuzz.c`, includes `nxt_h2proto.c`, builds a session with the real callbacks and a fake `nxt_conn_t`, feeds the input to `nghttp2_session_mem_recv()` after the client preface, drains `mem_send()` into a sink; seed corpus recorded from the pytest run (`NGHTTP2_DEBUG`-free: capture with a tiny `on_frame_recv` dump). | `fuzzing/`, `fuzzing/build-fuzz.sh` | runs in `fuzzing/run-ci.sh` |
+| 1.7 | `fuzzing/nxt_http_h2p_fuzz.c`: like `nxt_http_h1p_fuzz.c`, includes `nxt_h2proto.c`, builds a session with the real callbacks and a fake `nxt_conn_t`, feeds the input to `nghttp2_session_mem_recv()` after the client preface, drains `mem_send()` into a sink; seed corpus (`fuzzing/fuzz_http_h2p_seed_corpus/`) generated once with the Python `h2` package: preface + SETTINGS, a GET, a POST with DATA, a CONTINUATION split, an RST_STREAM. | `fuzzing/`, `fuzzing/build-fuzz.sh` | runs in `fuzzing/run-ci.sh` |
 
 Tests for 1.4, `test/test_http2.py` on the existing TLS helpers
 (`test/unit/applications/tls.py` certificates, raw sockets via
@@ -850,8 +869,11 @@ Tests for 1.4, `test/test_http2.py` on the existing TLS helpers
   method of 256 bytes (501), header list over 32 KiB (431);
 - body: `content-length` present/absent, over `max_body_size` (413), DATA
   before `body_read` on a `share` route, body larger than
-  `body_buffer_size` (temp file), stalled client (window exhausted, other
-  streams still served), `header_read_timeout`;
+  `body_buffer_size` (temp file), a response completed before the request
+  body (client observes `RST_STREAM(NO_ERROR)`), a client that stops
+  sending mid-body (progress timeout closes it, other connections
+  unaffected), a slow client on one stream while another stream on the
+  same connection is served;
 - error matrix: client RST mid-body, client RST after headers sent, client
   GOAWAY with streams in flight, app crash with N streams, TLS close with
   N streams, reconfigure with streams in flight (GOAWAY, all complete,
@@ -925,9 +947,10 @@ Effort when taken up: 25–40 engineer-days.
   h2spec is in CI and one release has shipped with it optional.
 - Do we want plaintext h2c for internal proxies (`nxt_http_proxy.c` peers)?
   Not in this plan; the peer protocol field makes it possible later.
-- `header_read_timeout` per stream: one connection timer for the oldest
-  open request (proposed, no per-stream `nxt_timer_t`) or a timer per
-  stream? Decide in the 1.4 review from the h1 timer code.
+- `http2.stream_window` (256 KiB) and the connection window (1 MiB) are
+  proposed defaults from the spike; the h2load upload numbers in 1.6
+  decide whether they need to be listener options at all in the first
+  release.
 - h3 listener JSON shape (`"listeners": {"*:443": {"http3": true}}`
   creating a TCP and a UDP socket) and the two-fd socket RPC: decide when
   h3 is taken up.

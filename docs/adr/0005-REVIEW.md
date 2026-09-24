@@ -34,7 +34,7 @@ files by a few lines. Verified against the current tree:
 | `nxt_router.c:3065` `listen->handler = nxt_http_conn_init` | `:3137` |
 | `nxt_router.c:3005-3060` `nxt_router_conf_tls_insert` caller | `:3128` (function `:3274`) |
 | `nxt_router.c:7520` `r->proto.any`; `:7428-7470` rpc data | `:7604`; `:7549-7604` |
-| `nxt_router.c:7790-7806` CGI upper-casing | `:7900-7920` region (`http_prefix` `:426`) |
+| `nxt_router.c:7790-7806` CGI upper-casing | `:7954-7965` (`http_prefix` `:426`) |
 | `nxt_http_request.c:819/1088/1060/1071` | `:820/:1089/:1061/:1072` |
 | `nxt_http_route.c:1665`; `:482-490` scheme | `:1666`; `:2045-2053` |
 | `nxt_http_variables.c:530-534` | `:531` |
@@ -355,3 +355,66 @@ cases; the 5 MB POST now completes under manual flow control (window
 released 256 KiB per 100 ms tick), `nghttp -nv` shows the stream-0
 WINDOW_UPDATE, the `http/1.1` client is closed immediately (curl exit 52
 instead of 56). h3: three GETs, `alpn h3`, `recv=10 sent=10 lost=0`.
+
+---
+
+## Round 2 (re-review of the round-1 text)
+
+**R2-01 · H (simplicity) · Manual window updates were kept for no gain.**
+Round 1 specified `no_auto_window_update` with a connection-level consume
+in `on_data_chunk_recv` and a stream-level consume after the copy. But the
+same paragraph copies every chunk into `r->body` immediately (memory up to
+`body_buffer_size`, then a temp file), so the bytes never wait in our
+memory and the consume points release the window at once anyway: two code
+paths that bound nothing. *Fix:* automatic window updates (nghttp2's
+default); `SETTINGS_INITIAL_WINDOW_SIZE` 256 KiB and a 1 MiB connection
+window as throughput knobs; memory bound = streams × `body_buffer_size`,
+disk = `max_body_size` per stream, as for h1. The spike keeps the manual
+mode as the harder demonstration. Security table row "Slow read" and the
+open questions updated. **Status: fixed.**
+
+**R2-02 · M · `:authority` versus `host` was wrong in detail.**
+`nxt_http_request_host()` answers 400 to any second host
+(`src/nxt_http_request.c:96-98`), so routing a `host` field through the
+neutral hash after `:authority` set `r->host` rejects every request whose
+client sends both, even when equal. Also `nxt_http_validate_host()` is
+already a separate `static` function (`:112`), so phase 0.1 is an export,
+not a refactor. *Fix:* `on_header` intercepts `host`: equal → dropped,
+different → `RST_STREAM(PROTOCOL_ERROR)`, no `:authority` → normal path.
+Phase 0.1 reworded. **Status: fixed.**
+
+**R2-03 · M · "nghttp2 sends `RST_STREAM(NO_ERROR)` itself" stated as
+fact.** It is nghttp2's documented server behaviour after a response ends
+before the request, but it was not verified against the source here.
+*Fix:* stated as expected and made a phase-1 test, with the fallback
+(`close` submits it). **Status: fixed.**
+
+**R2-04 · L · Security table overstated nghttp2 for empty-frame floods.**
+`NGHTTP2_ERR_FLOODED` is the outbound ACK-queue check (PING/SETTINGS), not
+a defence against empty DATA/WINDOW_UPDATE/PRIORITY floods. *Fix:* row
+rewritten to what is true: no allocation per frame, no callback work, the
+progress timer, and a CPU watch in the h2load run. **Status: fixed.**
+
+**R2-05 · L · Phase 1.1 asserted that Ubuntu 22.04's nghttp2 1.43 must
+fail the probe.** Jammy's security backports (USN-6432-1, USN-6754-1) may
+carry both symbols. *Fix:* the CI leg records the probe result; either is
+acceptable. **Status: fixed.**
+
+**R2-06 · L · Miscounts and missing lines.** Phase 0.1 said "nine or
+eleven" neutral entries; it is seven, nine with OTel. The CGI upper-casing
+had no line reference; it is `src/nxt_router.c:7954-7965` (R1-01 table
+corrected too). Process shutdown closes idle connections with
+`nxt_conn_close()` directly (`src/nxt_runtime.c:507-508`), which the idle
+state's `close_handler` must survive; added. **Status: fixed.**
+
+**R2-07 · L · Timers were over-designed.** "One timer for the oldest open
+request" needs ordering bookkeeping. *Fix:* one connection progress timer
+armed while any request is incomplete and reset by any frame that
+advances one; the open question about per-stream timers is closed.
+**Status: fixed.**
+
+**R2-08 · L · The fuzz seed-corpus sentence was muddled.** *Fix:* generate
+the seeds once with the Python `h2` package (preface + SETTINGS, GET, POST
+with DATA, CONTINUATION split, RST_STREAM). **Status: fixed.**
+
+No spike change in round 2; the round-1 binaries and results stand.

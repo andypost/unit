@@ -19,7 +19,8 @@ CASES = ["anon_front", "anon_node", "uncached_front", "uncached_node", "static"]
 
 def parse_hey(text):
     rps = float(re.search(r"Requests/sec:\s+([\d.]+)", text).group(1))
-    lat = dict(re.findall(r"(\d+)% in ([\d.]+) secs", text))
+    # hey prints "50%% in 0.0123 secs" (a doubled percent sign).
+    lat = dict(re.findall(r"(\d+)%+ in ([\d.]+) secs", text))
     codes = [(int(c), int(n)) for c, n in re.findall(r"\[(\d+)\]\s+(\d+) responses", text)]
     errs = text.split("Error distribution:")[1] if "Error distribution:" in text else ""
     errors = sum(n for c, n in codes if c >= 400)

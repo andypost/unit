@@ -274,3 +274,46 @@ Remaining, deliberately not changed:
   `max_execution_time` still applies.
 - The `release` bats test cannot pass until the add-on has its own
   repository.
+
+## Round 4 (CI)
+
+`.github/workflows/ddev-freeunit.yml` (repository root; the add-on's own
+`.github/` never runs from a subdirectory) installs DDEV on ubuntu-latest,
+runs `tests/test.bats` on PHP 8.5 with FreeUnit built from the commit
+under test, then benchmarks nginx-fpm against the add-on on Drupal 11 and
+Drupal 12 (`tests/metrics.sh`, `tests/metrics-site.php`,
+`tests/metrics-report.py`; table in the job summary, JSON as artifact).
+`web-build/Dockerfile.freeunit` builds from
+`.ddev/web-build/freeunit-src.tar.gz` when present (bind-mounted build
+context) and from the release tarball otherwise.
+
+Verified by CI (previously *unverified* above): php8.5-embed/-dev exist
+on deb.sury.org and the add-on builds and serves on DDEV v1.25.4 with
+PHP 8.5.9; the removal test passes; the Xdebug toggle works.
+
+What CI caught:
+
+1. **test bug** — `assert_output --regexp "^[Ss]erver: [Uu]nit"` anchors
+   `^` at the start of the whole header block, so the check could never
+   pass on FreeUnit and the `refute_output` in the removal test could
+   never fail. *Fixed:* `assert_line` / `refute_line`.
+2. **metrics** — `composer create-project` refuses a non-empty project
+   directory; raw results now live outside it (`METRICS_DIR`).
+3. **metrics** — drush does not install on Drupal 12.0.0-alpha1 (core
+   conflicts with old drush; the rest is blocked by Composer's advisory
+   policy). *Fixed:* no drush; `tests/metrics-site.php` installs through
+   `install_drupal()` and does node creation and `page_cache` toggling
+   through Drupal's API.
+4. **metrics** — the node page answered 500 (`displaySubmitted()` on
+   null in `NodeThemeHooks::preprocessNode()`): the standard profile of
+   Drupal 11.4/12 has no `article` type, so the node had no bundle. The
+   earlier "cold start 500" was this same broken page, not a start-up
+   problem. Drupal 12 alpha1 also answers 403 on `/` to anonymous users.
+   *Fixed:* the script creates a `bench` type, grants `access content`,
+   and every measured URL (and the first request after a restart) must
+   return 200 before anything is measured; cached cases must show
+   `X-Drupal-Cache: HIT`, uncached ones no page-cache header at all.
+5. **metrics** — hey prints percentiles as `50%% in`; the parser now
+   accepts that.
+
+No add-on defect showed up in CI.

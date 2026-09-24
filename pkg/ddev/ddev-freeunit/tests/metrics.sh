@@ -76,7 +76,7 @@ bench() {
     fi
     for i in $(seq 1 "$REPEAT"); do
         hey -z "$DURATION" -c "$CONCURRENCY" "$url" > "$RAW/$server.$case.$i.txt"
-        grep -E 'Requests/sec|50% in|99% in' "$RAW/$server.$case.$i.txt" | tr -s ' \t' ' ' >&2
+        grep -E 'Requests/sec|50%+ in|99%+ in' "$RAW/$server.$case.$i.txt" | tr -s ' \t' ' ' >&2
     done
 }
 

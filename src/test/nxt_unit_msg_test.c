@@ -5,25 +5,10 @@
 
 /*
  * Malformed port messages at libunit's receive side (src/nxt_unit.c), fed
- * through nxt_unit_test_process_msg() as if read from a port.
- *
- * nxt_unit_mmap_read() walks the payload of an mmap message as an array of
- * nxt_port_mmap_msg_t.  It used to step through it with
- * "mmap_msg < end; mmap_msg++", so a payload that is not a whole number of
- * 12-byte records had its last "record" read from past the end of the
- * message -- here, from zero bytes, which name a real segment, so the
- * message was accepted with an extra buffer the sender never described.
- *
- * mmap_id indexes lib->incoming, which nxt_unit_mmap_at() grows to fit.
- * The id is deliberately not capped (the router allocates its outgoing
- * segments without a limit, see #172), but 0xFFFFFFFF wrapped "i + 1" to 0
- * and returned a pointer 4G elements past the array.  The same id arrives in
- * the header of a segment the router hands over with an MMAP message, which
- * is also where a segment of any size other than PORT_MMAP_SIZE used to be
- * accepted.
- *
- * Cases that could crash the old code run in a child process; a child
- * killed by a signal is reported as a failure.
+ * through nxt_unit_test_process_msg().  nxt_unit_mmap_read() used to read a
+ * partial last record past the message, mmap_id 0xFFFFFFFF wrapped the
+ * lib->incoming index, and a segment of any size was accepted.  Cases that
+ * could crash the old code run in a child; a signal is a failure.
  */
 
 #include "nxt_main.h"
@@ -117,26 +102,24 @@ nxt_unit_msg_test_shm(size_t size)
 }
 
 
-/*
- * A segment the router would hand over: "size" bytes, with the header
- * naming this process as both ends and "id" as its index.
- */
+/* A segment the router would hand over, from this process to itself. */
 static int
-nxt_unit_msg_test_segment(size_t size, uint32_t id)
+nxt_unit_msg_test_send_segment(size_t size, uint32_t id)
 {
     int                     fd;
+    nxt_port_msg_t          msg;
     nxt_port_mmap_header_t  *hdr;
 
     fd = nxt_unit_msg_test_shm(size);
     if (fd == -1) {
-        return -1;
+        return -2;
     }
 
     hdr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (hdr == MAP_FAILED) {
         perror("mmap");
         close(fd);
-        return -1;
+        return -2;
     }
 
     hdr->id = id;
@@ -144,21 +127,6 @@ nxt_unit_msg_test_segment(size_t size, uint32_t id)
     hdr->dst_pid = getpid();
 
     munmap(hdr, size);
-
-    return fd;
-}
-
-
-static int
-nxt_unit_msg_test_send_segment(size_t size, uint32_t id)
-{
-    int             fd;
-    nxt_port_msg_t  msg;
-
-    fd = nxt_unit_msg_test_segment(size, id);
-    if (fd == -1) {
-        return -2;
-    }
 
     memset(&msg, 0, sizeof(msg));
 
@@ -171,10 +139,7 @@ nxt_unit_msg_test_send_segment(size_t size, uint32_t id)
 }
 
 
-/*
- * An RPC_READY message with the mmap bit set: its handling after the mmap
- * read is a no-op, so the return code is the mmap read's verdict.
- */
+/* RPC_READY with the mmap bit: the result is the mmap read's verdict. */
 static int
 nxt_unit_msg_test_send_records(const nxt_port_mmap_msg_t *records,
     size_t nrecords, size_t tail)
@@ -202,48 +167,38 @@ nxt_unit_msg_test_send_records(const nxt_port_mmap_msg_t *records,
 }
 
 
-typedef int (*nxt_unit_msg_test_case_t)(void *data);
+/* The child cases exit with the return code + 10, to tell it from 1, 2. */
+
+#define NXT_UNIT_MSG_TEST_RC(rc)  ((rc) + 10)
 
 
-/*
- * Runs "fn" in a child and returns its exit code, or -1 if the child was
- * killed by a signal.
- */
-static int
-nxt_unit_msg_test_in_child(nxt_unit_msg_test_case_t fn, void *data)
+/* Runs "fn" in a child: asserts that it exits with RC(expect). */
+static void
+nxt_unit_msg_test_in_child(const char *name, int (*fn)(void *), void *data,
+    int expect)
 {
     int    status;
     pid_t  child;
 
+    status = -1;
     fflush(stdout);
 
     child = fork();
-
-    if (child == -1) {
-        perror("fork");
-        return -1;
-    }
 
     if (child == 0) {
         _exit(fn(data) & 0xFF);
     }
 
-    if (waitpid(child, &status, 0) != child) {
-        return -1;
-    }
-
-    if (WIFSIGNALED(status)) {
+    if (child != -1 && waitpid(child, &status, 0) == child
+        && WIFSIGNALED(status))
+    {
         printf("unit msg test: child killed by signal %d\n", WTERMSIG(status));
-        return -1;
     }
 
-    return WEXITSTATUS(status);
+    nxt_unit_msg_test_assert(child != -1 && WIFEXITED(status)
+                             && WEXITSTATUS(status)
+                                == NXT_UNIT_MSG_TEST_RC(expect), name);
 }
-
-
-/* The child cases exit with the return code + 10; see NXT_UNIT_MSG_TEST_RC. */
-
-#define NXT_UNIT_MSG_TEST_RC(rc)  ((rc) + 10)
 
 
 static int
@@ -254,17 +209,40 @@ nxt_unit_msg_test_records_case(void *data)
 
 
 typedef struct {
-    size_t    size;
-    uint32_t  id;
+    const char  *name;
+    size_t      size;
+    uint32_t    id;
+    int         expect;
 } nxt_unit_msg_test_segment_t;
+
+
+static const nxt_unit_msg_test_segment_t  segments[] = {
+    { "segment id 0xFFFFFFFF is refused", PORT_MMAP_SIZE, 0xFFFFFFFF,
+      NXT_UNIT_ERROR },
+    { "segment id 1000 is accepted", PORT_MMAP_SIZE, 1000, NXT_UNIT_OK },
+    { "segment shorter than PORT_MMAP_SIZE is refused",
+      PORT_MMAP_HEADER_SIZE, 1, NXT_UNIT_ERROR },
+    { "segment longer than PORT_MMAP_SIZE is refused",
+      2 * PORT_MMAP_SIZE, 1, NXT_UNIT_ERROR },
+};
+
+
+static const struct {
+    const char           *name;
+    nxt_port_mmap_msg_t  rec;
+} bad_records[] = {
+    { "mmap_id 0xFFFFFFFF is refused", { 0xFFFFFFFF, 0, 100 } },
+    { "chunk_id past the data area is refused",
+      { 0, PORT_MMAP_CHUNK_COUNT, 100 } },
+    { "size past the data area is refused",
+      { 0, PORT_MMAP_CHUNK_COUNT - 1, PORT_MMAP_CHUNK_SIZE + 1 } },
+};
 
 
 static int
 nxt_unit_msg_test_segment_case(void *data)
 {
-    nxt_unit_msg_test_segment_t  *seg;
-
-    seg = data;
+    const nxt_unit_msg_test_segment_t  *seg = data;
 
     return NXT_UNIT_MSG_TEST_RC(nxt_unit_msg_test_send_segment(seg->size,
                                                                seg->id));
@@ -279,12 +257,9 @@ nxt_unit_msg_test_quit(nxt_unit_ctx_t *ctx)
 
 
 /*
- * A record for a segment libunit does not have parks the read buffer on
- * that segment's wait queue, counts it in wait_items, and asks the router
- * for the segment.  When that request cannot be sent the message fails and
- * the buffer goes back to the free list -- which it used to do while still
- * linked into the wait queue and still counted, so a graceful quit, which
- * waits for wait_items to drain, never happened.
+ * A record for an unknown segment parks the read buffer and asks the router
+ * for the segment.  When that cannot be sent, the buffer used to be freed
+ * still counted in wait_items, so a graceful quit never happened.
  */
 static int
 nxt_unit_msg_test_get_mmap_fail_case(void *data)
@@ -347,10 +322,7 @@ nxt_unit_msg_test_count_maps(void)
 }
 
 
-/*
- * A segment with an id libunit already has must not leak a mapping.  The
- * first one stays: buffers may still point into it.
- */
+/* A duplicate segment id must not leak a mapping; the first one stays. */
 static int
 nxt_unit_msg_test_dup_id_case(void *data)
 {
@@ -383,12 +355,11 @@ nxt_unit_msg_test_dup_id_case(void *data)
 int
 main(void)
 {
-    int                          rc, ready[2], router[2], read[2], shared[2];
-    char                         name[64];
-    size_t                       tail;
-    nxt_unit_init_t              init;
-    nxt_port_mmap_msg_t          rec[2];
-    nxt_unit_msg_test_segment_t  seg;
+    int                  rc, ready[2], router[2], read[2], shared[2];
+    char                 name[64];
+    size_t               tail, i;
+    nxt_unit_init_t      init;
+    nxt_port_mmap_msg_t  rec[2];
 
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, ready) == -1
         || socketpair(AF_UNIX, SOCK_DGRAM, 0, router) == -1
@@ -449,11 +420,7 @@ main(void)
 
     memset(rec, 0, sizeof(rec));
 
-    rec[0].mmap_id = 0;
-    rec[0].chunk_id = 0;
     rec[0].size = 100;
-
-    rec[1].mmap_id = 0;
     rec[1].chunk_id = 1;
     rec[1].size = PORT_MMAP_CHUNK_SIZE;
 
@@ -478,73 +445,28 @@ main(void)
         nxt_unit_msg_test_send_records(rec, 0, 5) == NXT_UNIT_ERROR,
         "a lone partial record is refused");
 
-    /* Per-field bounds. */
-
-    rec[0].mmap_id = 0xFFFFFFFF;
-
-    nxt_unit_msg_test_assert(
-        nxt_unit_msg_test_in_child(nxt_unit_msg_test_records_case, rec)
-        == NXT_UNIT_MSG_TEST_RC(NXT_UNIT_ERROR),
-        "mmap_id 0xFFFFFFFF is refused");
-
-    rec[0].mmap_id = 0;
-    rec[0].chunk_id = PORT_MMAP_CHUNK_COUNT;
-
-    nxt_unit_msg_test_assert(
-        nxt_unit_msg_test_in_child(nxt_unit_msg_test_records_case, rec)
-        == NXT_UNIT_MSG_TEST_RC(NXT_UNIT_ERROR),
-        "chunk_id past the data area is refused");
-
-    rec[0].chunk_id = PORT_MMAP_CHUNK_COUNT - 1;
-    rec[0].size = PORT_MMAP_CHUNK_SIZE + 1;
-
-    nxt_unit_msg_test_assert(
-        nxt_unit_msg_test_in_child(nxt_unit_msg_test_records_case, rec)
-        == NXT_UNIT_MSG_TEST_RC(NXT_UNIT_ERROR),
-        "size past the data area is refused");
-
-    /* The segment header's id and the segment's size. */
-
-    seg.size = PORT_MMAP_SIZE;
-    seg.id = 0xFFFFFFFF;
-
-    nxt_unit_msg_test_assert(
-        nxt_unit_msg_test_in_child(nxt_unit_msg_test_segment_case, &seg)
-        == NXT_UNIT_MSG_TEST_RC(NXT_UNIT_ERROR),
-        "segment id 0xFFFFFFFF is refused");
+    for (i = 0; i < nxt_nitems(bad_records); i++) {
+        nxt_unit_msg_test_in_child(bad_records[i].name,
+                                   nxt_unit_msg_test_records_case,
+                                   (void *) &bad_records[i].rec,
+                                   NXT_UNIT_ERROR);
+    }
 
     /* Not capped: the router's outgoing segments are unbounded (#172). */
-    seg.id = 1000;
 
-    nxt_unit_msg_test_assert(
-        nxt_unit_msg_test_in_child(nxt_unit_msg_test_segment_case, &seg)
-        == NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK),
-        "segment id 1000 is accepted");
+    for (i = 0; i < nxt_nitems(segments); i++) {
+        nxt_unit_msg_test_in_child(segments[i].name,
+                                   nxt_unit_msg_test_segment_case,
+                                   (void *) &segments[i], segments[i].expect);
+    }
 
-    seg.size = PORT_MMAP_HEADER_SIZE;
-    seg.id = 1;
+    nxt_unit_msg_test_in_child("failed get_mmap does not block a graceful "
+                               "quit", nxt_unit_msg_test_get_mmap_fail_case,
+                               NULL, NXT_UNIT_OK);
 
-    nxt_unit_msg_test_assert(
-        nxt_unit_msg_test_in_child(nxt_unit_msg_test_segment_case, &seg)
-        == NXT_UNIT_MSG_TEST_RC(NXT_UNIT_ERROR),
-        "segment shorter than PORT_MMAP_SIZE is refused");
-
-    seg.size = 2 * PORT_MMAP_SIZE;
-
-    nxt_unit_msg_test_assert(
-        nxt_unit_msg_test_in_child(nxt_unit_msg_test_segment_case, &seg)
-        == NXT_UNIT_MSG_TEST_RC(NXT_UNIT_ERROR),
-        "segment longer than PORT_MMAP_SIZE is refused");
-
-    nxt_unit_msg_test_assert(
-        nxt_unit_msg_test_in_child(nxt_unit_msg_test_get_mmap_fail_case, NULL)
-        == NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK),
-        "failed get_mmap does not block a graceful quit");
-
-    nxt_unit_msg_test_assert(
-        nxt_unit_msg_test_in_child(nxt_unit_msg_test_dup_id_case, NULL)
-        == NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK),
-        "duplicate segment id does not leak a mapping");
+    nxt_unit_msg_test_in_child("duplicate segment id does not leak a mapping",
+                               nxt_unit_msg_test_dup_id_case, NULL,
+                               NXT_UNIT_OK);
 
     if (nxt_unit_msg_test_failures != 0) {
         printf("unit msg test: %d failure(s)\n", nxt_unit_msg_test_failures);

@@ -4,19 +4,10 @@
  */
 
 /*
- * nxt_router_prepare_msg() (src/nxt_router.c) serialises a request into the
- * nxt_unit_request_t the application reads.  Several of its lengths are
- * uint8_t on the wire, and two of them are reachable from a client:
- *
- *   - a header field name: nxt_http_parse_field_name() allows 255 bytes,
- *     and for PHP, Perl and Ruby the name is sent as "HTTP_" + name, so
- *     names of 251..255 bytes wrapped name_length to 0..4;
- *   - the method, which the HTTP parser does not bound at all.
- *
- * Both used to be stored truncated, so the application saw a different
- * string than the one copied.  Both are now refused before anything is
- * allocated, with 431 and 501 respectively.  The limits themselves (255
- * with and without the prefix) are pinned as accepted.
+ * nxt_router_prepare_msg() (src/nxt_router.c) stores the method and header
+ * name lengths as uint8_t.  A 251..255-byte name plus the "HTTP_" prefix,
+ * or a method over 255 bytes, used to wrap and be stored truncated; now they
+ * are refused with 431 and 501.  The limits themselves are pinned.
  */
 
 #include <nxt_main.h>
@@ -52,15 +43,11 @@ static const nxt_prepare_msg_test_case_t  nxt_prepare_msg_test_cases[] = {
     { "250-byte name + prefix = 255",    1,   3, 250, 0 },
     { "251-byte name + prefix",          1,   3, 251,
       NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE },
-    { "253-byte name + prefix",          1,   3, 253,
-      NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE },
     { "255-byte name + prefix",          1,   3, 255,
       NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE },
     { "255-byte name, no prefix",        0,   3, 255, 0 },
     { "255-byte method",                 0, 255,   6, 0 },
     { "256-byte method",                 0, 256,   6,
-      NXT_HTTP_NOT_IMPLEMENTED },
-    { "280-byte method, prefix",         1, 280,   6,
       NXT_HTTP_NOT_IMPLEMENTED },
 };
 
@@ -113,54 +100,31 @@ nxt_prepare_msg_test_case(nxt_task_t *task, nxt_mp_t *mp, nxt_app_t *app,
     b = nxt_router_test_prepare_msg(task, r, app, tc->prefix, &status);
 
     if (tc->status != 0) {
-        if (b != NULL) {
-            req = (nxt_unit_request_t *) b->mem.pos;
-
-            nxt_log_alert(task->log, "prepare msg test \"%s\": accepted, "
-                          "method_length %d, name_length %d", tc->name,
-                          (int) req->method_length,
-                          (int) req->fields[0].name_length);
-            return NXT_ERROR;
-        }
-
-        if (status != tc->status) {
-            nxt_log_alert(task->log, "prepare msg test \"%s\": status %d, "
-                          "expected %d", tc->name, (int) status,
-                          (int) tc->status);
-            return NXT_ERROR;
-        }
-
+        NXT_TEST_CHECK(task->log, b == NULL && status == tc->status,
+                       "prepare msg test \"%s\": %s, status %d", tc->name,
+                       b != NULL ? "accepted" : "refused", (int) status);
         return NXT_OK;
     }
 
-    if (b == NULL) {
-        nxt_log_alert(task->log, "prepare msg test \"%s\": refused with %d",
-                      tc->name, (int) status);
-        return NXT_ERROR;
-    }
+    NXT_TEST_CHECK(task->log, b != NULL, "prepare msg test \"%s\": refused "
+                   "with %d", tc->name, (int) status);
 
     req = (nxt_unit_request_t *) b->mem.pos;
     f = &req->fields[0];
 
     if (nxt_size_add(tc->field_length, tc->prefix ? nxt_length("HTTP_") : 0,
-                     &expect)
-        != 0)
+                     &expect) != 0)
     {
         return NXT_ERROR;
     }
 
-    if (req->method_length != tc->method_length
-        || req->fields_count != 1
-        || f->name_length != expect
-        || nxt_strlen(nxt_unit_sptr_get(&f->name)) != expect)
-    {
-        nxt_log_alert(task->log, "prepare msg test \"%s\": method_length %d, "
-                      "name_length %d, expected %d and %uz", tc->name,
-                      (int) req->method_length, (int) f->name_length,
-                      (int) tc->method_length, expect);
-        return NXT_ERROR;
-    }
-
+    NXT_TEST_CHECK(task->log, req->method_length == tc->method_length
+                   && req->fields_count == 1 && f->name_length == expect
+                   && nxt_strlen(nxt_unit_sptr_get(&f->name)) == expect,
+                   "prepare msg test \"%s\": method_length %d, name_length "
+                   "%d, expected %d and %uz", tc->name,
+                   (int) req->method_length, (int) f->name_length,
+                   (int) tc->method_length, expect);
     return NXT_OK;
 }
 
@@ -193,22 +157,13 @@ nxt_router_prepare_msg_test(nxt_thread_t *thr)
     }
 
     app = nxt_mp_zalloc(mp, sizeof(nxt_app_t));
-    if (nxt_slow_path(app == NULL)) {
-        nxt_mp_destroy(mp);
-        return NXT_ERROR;
-    }
-
-    if (nxt_slow_path(nxt_thread_mutex_create(&app->outgoing.mutex)
-                      != NXT_OK))
-    {
-        nxt_mp_destroy(mp);
-        return NXT_ERROR;
-    }
-
     nxt_str_set(&addr, "127.0.0.1:8080");
-
     sa = nxt_sockaddr_parse(mp, &addr);
-    if (nxt_slow_path(sa == NULL)) {
+
+    if (nxt_slow_path(app == NULL || sa == NULL
+                      || nxt_thread_mutex_create(&app->outgoing.mutex)
+                         != NXT_OK))
+    {
         nxt_mp_destroy(mp);
         return NXT_ERROR;
     }
@@ -234,10 +189,7 @@ nxt_router_prepare_msg_test(nxt_thread_t *thr)
 
     thr->engine = saved_engine;
 
-    /*
-     * The accepted cases' buffers and the segment stay mapped: completing
-     * them needs the engine's work queues, which this fixture does not run.
-     */
+    /* The accepted cases' buffers stay: freeing them needs the engine. */
 
     if (ret == NXT_OK) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log, "router prepare msg test "

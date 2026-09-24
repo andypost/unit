@@ -2,14 +2,9 @@
 /*
  * Copyright (C) NGINX, Inc.
  *
- * Microbenchmark for the IPC queue primitives (O1, freeunit optimisation
- * stream).  Covers single-thread enqueue/dequeue throughput for
- * nxt_nncq, nxt_app_nncq, nxt_port_queue and nxt_app_queue, plus a
- * multi-thread producer/consumer benchmark for nxt_port_queue (1P1C and
- * NPxNC).
- *
- * This is measurement tooling only: it does not touch the SHM layout,
- * atomics or memory ordering of the queues it benchmarks.
+ * Microbenchmark for the IPC queues: single-thread throughput of nxt_nncq,
+ * nxt_app_nncq, nxt_port_queue and nxt_app_queue, and NPxNC producers and
+ * consumers on nxt_port_queue.  Run by tools/perf/bench-queues.sh.
  */
 
 #include <nxt_main.h>
@@ -27,37 +22,10 @@
 #define NXT_QBENCH_DEFAULT_NOPS  2000000
 
 
-#if (__x86_64__ || __i386__)
-#define NXT_QBENCH_HAVE_RDTSC  1
-
-static inline uint64_t
-nxt_qbench_rdtsc(void)
-{
-    uint32_t  eax, edx;
-
-    __asm__ volatile ("rdtsc" : "=a" (eax), "=d" (edx));
-
-    return ((uint64_t) edx << 32) | eax;
-}
-
-#else
-#define NXT_QBENCH_HAVE_RDTSC  0
-#endif
-
-
-static int  use_rdtsc = 0;
-
-
 static uint64_t
 nxt_qbench_now(void)
 {
     struct timespec  ts;
-
-    if (use_rdtsc) {
-#if NXT_QBENCH_HAVE_RDTSC
-        return nxt_qbench_rdtsc();
-#endif
-    }
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
 
@@ -71,13 +39,6 @@ nxt_qbench_report(const char *name, uint64_t ops, uint64_t start,
 {
     double  elapsed, ops_per_sec;
 
-    if (use_rdtsc) {
-        printf("%-24s  ops=%12" PRIu64 "  cycles=%14" PRIu64
-               "  cycles/op=%8.2f\n",
-               name, ops, end - start, (double) (end - start) / ops);
-        return;
-    }
-
     elapsed = (double) (end - start) / 1e9;
     ops_per_sec = (double) ops / elapsed;
 
@@ -87,9 +48,6 @@ nxt_qbench_report(const char *name, uint64_t ops, uint64_t start,
            elapsed * 1e9 / (double) ops);
 }
 
-
-/* -------------------------------------------------------------------- */
-/* Single-thread nxt_nncq.                                              */
 
 static void
 bench_nncq(uint64_t nops)
@@ -120,9 +78,6 @@ bench_nncq(uint64_t nops)
 }
 
 
-/* -------------------------------------------------------------------- */
-/* Single-thread nxt_app_nncq.                                          */
-
 static void
 bench_app_nncq(uint64_t nops)
 {
@@ -152,16 +107,11 @@ bench_app_nncq(uint64_t nops)
 }
 
 
-/* -------------------------------------------------------------------- */
-/* Single-thread nxt_port_queue send/recv.                              */
-
 static void
 bench_port_queue(uint64_t nops, uint8_t size)
 {
     int                 notify;
     uint64_t            i, start, end;
-    nxt_int_t           rc;
-    ssize_t             r;
     nxt_port_queue_t    *q;
     uint8_t             buf[NXT_PORT_QUEUE_MSG_SIZE];
 
@@ -172,15 +122,10 @@ bench_port_queue(uint64_t nops, uint8_t size)
     start = nxt_qbench_now();
 
     for (i = 0; i < nops; i++) {
-        rc = nxt_port_queue_send(q, buf, size, &notify);
-        if (nxt_slow_path(rc != NXT_OK)) {
-            fprintf(stderr, "port_queue_send failed unexpectedly\n");
-            exit(1);
-        }
-
-        r = nxt_port_queue_recv(q, buf);
-        if (nxt_slow_path(r < 0)) {
-            fprintf(stderr, "port_queue_recv failed unexpectedly\n");
+        if (nxt_port_queue_send(q, buf, size, &notify) != NXT_OK
+            || nxt_port_queue_recv(q, buf) < 0)
+        {
+            fprintf(stderr, "port_queue send/recv failed\n");
             exit(1);
         }
     }
@@ -193,17 +138,12 @@ bench_port_queue(uint64_t nops, uint8_t size)
 }
 
 
-/* -------------------------------------------------------------------- */
-/* Single-thread nxt_app_queue send/recv.                               */
-
 static void
 bench_app_queue(uint64_t nops, uint8_t size)
 {
     int                    notify;
     uint32_t               cookie;
     uint64_t               i, start, end;
-    nxt_int_t              rc;
-    ssize_t                r;
     nxt_app_queue_t        *q;
     uint8_t                buf[NXT_APP_QUEUE_MSG_SIZE];
 
@@ -214,15 +154,10 @@ bench_app_queue(uint64_t nops, uint8_t size)
     start = nxt_qbench_now();
 
     for (i = 0; i < nops; i++) {
-        rc = nxt_app_queue_send(q, buf, size, 1, &notify, &cookie);
-        if (nxt_slow_path(rc != NXT_OK)) {
-            fprintf(stderr, "app_queue_send failed unexpectedly\n");
-            exit(1);
-        }
-
-        r = nxt_app_queue_recv(q, buf, &cookie);
-        if (nxt_slow_path(r < 0)) {
-            fprintf(stderr, "app_queue_recv failed unexpectedly\n");
+        if (nxt_app_queue_send(q, buf, size, 1, &notify, &cookie) != NXT_OK
+            || nxt_app_queue_recv(q, buf, &cookie) < 0)
+        {
+            fprintf(stderr, "app_queue send/recv failed\n");
             exit(1);
         }
     }
@@ -234,9 +169,6 @@ bench_app_queue(uint64_t nops, uint8_t size)
     nxt_free(q);
 }
 
-
-/* -------------------------------------------------------------------- */
-/* Multi-thread producer/consumer for nxt_port_queue.                   */
 
 typedef struct {
     nxt_port_queue_t   *q;
@@ -257,7 +189,6 @@ nxt_qbench_producer(void *p)
 {
     int                         notify;
     uint64_t                    i;
-    nxt_int_t                   rc;
     uint8_t                     buf[NXT_PORT_QUEUE_MSG_SIZE];
     nxt_qbench_producer_arg_t   *arg;
 
@@ -265,15 +196,8 @@ nxt_qbench_producer(void *p)
     nxt_memzero(buf, sizeof(buf));
 
     for (i = 0; i < arg->nops; i++) {
-        for ( ;; ) {
-            rc = nxt_port_queue_send(arg->q, buf, arg->size, &notify);
-
-            if (rc == NXT_OK) {
-                break;
-            }
-
-            /* NXT_AGAIN: queue full, spin until the consumer drains it. */
-            sched_yield();
+        while (nxt_port_queue_send(arg->q, buf, arg->size, &notify) != NXT_OK) {
+            sched_yield();      /* Full: wait for the consumers. */
         }
     }
 
@@ -284,22 +208,15 @@ nxt_qbench_producer(void *p)
 static void *
 nxt_qbench_consumer(void *p)
 {
-    ssize_t                      r;
     uint8_t                      buf[NXT_PORT_QUEUE_MSG_SIZE];
     nxt_qbench_consumer_arg_t    *arg;
 
     arg = p;
 
-    for ( ;; ) {
-        if (atomic_load_explicit(arg->received, memory_order_relaxed)
-            >= arg->total)
-        {
-            break;
-        }
-
-        r = nxt_port_queue_recv(arg->q, buf);
-
-        if (r >= 0) {
+    while (atomic_load_explicit(arg->received, memory_order_relaxed)
+           < arg->total)
+    {
+        if (nxt_port_queue_recv(arg->q, buf) >= 0) {
             atomic_fetch_add_explicit(arg->received, 1,
                                        memory_order_relaxed);
         } else {
@@ -339,12 +256,8 @@ bench_port_queue_mt(uint64_t nops_total, uint8_t size, int nprod, int ncons)
     for (i = 0; i < nprod; i++) {
         prod_arg[i].q    = q;
         prod_arg[i].size = size;
-        prod_arg[i].nops = nops_total / nprod;
-
-        if (i == nprod - 1) {
-            /* give the remainder to the last producer */
-            prod_arg[i].nops += nops_total - (prod_arg[i].nops * nprod);
-        }
+        prod_arg[i].nops = nops_total / nprod
+                           + (i == nprod - 1 ? nops_total % nprod : 0);
     }
 
     start = nxt_qbench_now();
@@ -377,14 +290,12 @@ bench_port_queue_mt(uint64_t nops_total, uint8_t size, int nprod, int ncons)
 }
 
 
-/* -------------------------------------------------------------------- */
-
 static void
 usage(const char *prog)
 {
     fprintf(stderr,
         "usage: %s <mode> [-n ops] [--size N] [--producers N] "
-        "[--consumers N] [--rdtsc]\n"
+        "[--consumers N]\n"
         "  modes: nncq, app_nncq, port_queue, app_queue, port_queue_mt\n",
         prog);
 }
@@ -430,23 +341,10 @@ main(int argc, char **argv)
             continue;
         }
 
-        if (strcmp(argv[i], "--rdtsc") == 0) {
-            use_rdtsc = 1;
-            continue;
-        }
-
         fprintf(stderr, "unknown option: %s\n", argv[i]);
         usage(argv[0]);
         return 1;
     }
-
-#if !NXT_QBENCH_HAVE_RDTSC
-    if (use_rdtsc) {
-        fprintf(stderr, "--rdtsc is not supported on this architecture, "
-                         "falling back to clock_gettime\n");
-        use_rdtsc = 0;
-    }
-#endif
 
     if (strcmp(mode, "nncq") == 0) {
         bench_nncq(nops);

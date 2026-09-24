@@ -27,6 +27,44 @@ nxt_test_fd_is_open(nxt_fd_t fd)
 }
 
 
+/* Runs fn(data) in a child: its exit status, or -1 if it did not exit. */
+
+int
+nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),
+    void *data)
+{
+    int    status;
+    pid_t  child;
+
+    child = fork();
+
+    if (child == 0) {
+        _exit(fn(data));
+    }
+
+    if (child == -1 || waitpid(child, &status, 0) != child) {
+        nxt_log_alert(thr->log, "%s: fork() failed %E", name, nxt_errno);
+        return -1;
+    }
+
+    if (!WIFEXITED(status)) {
+        nxt_log_alert(thr->log, "%s: child killed by signal %d", name,
+                      WTERMSIG(status));
+        return -1;
+    }
+
+    return WEXITSTATUS(status);
+}
+
+
+static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
+    nxt_port_mmap_read_test, nxt_nncq_bound_test, nxt_checked_test,
+    nxt_router_schedule_test, nxt_router_prepare_msg_test,
+    nxt_router_response_parse_test, nxt_port_frag_test,
+    nxt_port_release_test,
+};
+
+
 /* The function is defined here to prevent inline optimizations. */
 static nxt_bool_t
 nxt_msec_less(nxt_msec_t first, nxt_msec_t second)
@@ -38,6 +76,7 @@ nxt_msec_less(nxt_msec_t first, nxt_msec_t second)
 int nxt_cdecl
 main(int argc, char **argv)
 {
+    nxt_uint_t    i;
     nxt_task_t    task;
     nxt_thread_t  *thr;
 
@@ -203,10 +242,6 @@ main(int argc, char **argv)
         return 1;
     }
 
-    if (nxt_port_mmap_read_test(thr) != NXT_OK) {
-        return 1;
-    }
-
     if (nxt_port_ready_test(thr) != NXT_OK) {
         return 1;
     }
@@ -282,32 +317,10 @@ main(int argc, char **argv)
         return 1;
     }
 
-    if (nxt_nncq_bound_test(thr) != NXT_OK) {
-        return 1;
-    }
-
-    if (nxt_checked_test(thr) != NXT_OK) {
-        return 1;
-    }
-
-    if (nxt_router_schedule_test(thr) != NXT_OK) {
-        return 1;
-    }
-
-    if (nxt_router_prepare_msg_test(thr) != NXT_OK) {
-        return 1;
-    }
-
-    if (nxt_router_response_parse_test(thr) != NXT_OK) {
-        return 1;
-    }
-
-    if (nxt_port_frag_test(thr) != NXT_OK) {
-        return 1;
-    }
-
-    if (nxt_port_release_test(thr) != NXT_OK) {
-        return 1;
+    for (i = 0; i < nxt_nitems(nxt_security_tests); i++) {
+        if (nxt_security_tests[i](thr) != NXT_OK) {
+            return 1;
+        }
     }
 
 #if (NXT_HAVE_CGROUP)

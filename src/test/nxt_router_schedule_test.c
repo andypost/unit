@@ -40,11 +40,8 @@ nxt_router_schedule_uri_public_test(nxt_thread_t *thr)
     for (i = 0; i < nxt_nitems(tests); i++) {
         n = nxt_router_schedule_uri_public(&tests[i].uri);
 
-        if (n != tests[i].public) {
-            nxt_log_alert(thr->log, "schedule uri public \"%V\": %uz, "
-                          "expected %uz", &tests[i].uri, n, tests[i].public);
-            return NXT_ERROR;
-        }
+        NXT_TEST_CHECK(thr->log, n == tests[i].public, "schedule uri public "
+                       "\"%V\": %uz", &tests[i].uri, n);
     }
 
     return NXT_OK;
@@ -162,31 +159,24 @@ nxt_router_schedule_joint_test(nxt_thread_t *thr)
         sc->joint.count++;                          /* a run */
         nxt_router_conf_release(task, &sc->joint);  /* the next conf */
 
-        if (sc->joint.count != 1 || rtcf->count != held + 1) {
-            nxt_log_alert(thr->log, "schedule joint released too early");
-            return NXT_ERROR;
-        }
+        NXT_TEST_CHECK(thr->log,
+                       sc->joint.count == 1 && rtcf->count == held + 1,
+                       "schedule joint released too early");
 
         nxt_router_conf_release(task, &sc->joint);  /* the run ends */
 
         if (held) {
-            if (rtcf->count != 1) {
-                nxt_log_alert(thr->log, "schedule joint: rtcf count %uD",
-                              rtcf->count);
-                return NXT_ERROR;
-            }
+            NXT_TEST_CHECK(thr->log, rtcf->count == 1,
+                           "schedule joint: rtcf count %uD", rtcf->count);
 
             nxt_tstr_state_release(rtcf->tstr_state);
             nxt_mp_destroy(mp);
         }
     }
 
-    if (nxt_queue_first(&router.sockets) != &sentinel
-        || nxt_queue_last(&router.sockets) != &sentinel)
-    {
-        nxt_log_alert(thr->log, "schedule joint: router->sockets changed");
-        return NXT_ERROR;
-    }
+    NXT_TEST_CHECK(thr->log, nxt_queue_first(&router.sockets) == &sentinel
+                   && nxt_queue_last(&router.sockets) == &sentinel,
+                   "schedule joint: router->sockets changed");
 
     return NXT_OK;
 }
@@ -238,14 +228,11 @@ nxt_router_schedule_resolve_test(nxt_thread_t *thr)
 
         ret = nxt_router_conf_resolve(task, tmcf, root);
 
-        if (ret != tests[i].ret || rtcf->schedules != NULL
-            || rtcf->count != 0)
-        {
-            nxt_log_alert(thr->log, "schedule resolve \"%s\": %i, "
-                          "schedules %p, count %uD", tests[i].json, ret,
-                          rtcf->schedules, rtcf->count);
-            return NXT_ERROR;
-        }
+        NXT_TEST_CHECK(thr->log, ret == tests[i].ret
+                       && rtcf->schedules == NULL && rtcf->count == 0,
+                       "schedule resolve \"%s\": %i, schedules %p, count "
+                       "%uD", tests[i].json, ret, rtcf->schedules,
+                       rtcf->count);
 
         nxt_tstr_state_release(rtcf->tstr_state);
         nxt_mp_destroy(rtcf->mem_pool);

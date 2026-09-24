@@ -103,6 +103,17 @@ nxt_int_t nxt_cgroup_test(nxt_thread_t *thr);
 nxt_int_t nxt_clone_creds_test(nxt_thread_t *thr);
 
 nxt_bool_t nxt_test_fd_is_open(nxt_fd_t fd);
+int nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),
+    void *data);
+
+
+#define NXT_TEST_CHECK(log, cond, ...)                                        \
+    do {                                                                      \
+        if (!(cond)) {                                                        \
+            nxt_log_alert(log, __VA_ARGS__);                                  \
+            return NXT_ERROR;                                                 \
+        }                                                                     \
+    } while (0)
 
 
 #endif /* _NXT_TESTS_H_INCLUDED_ */

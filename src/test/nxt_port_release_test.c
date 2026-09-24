@@ -4,23 +4,10 @@
  */
 
 /*
- * nxt_port_release() and a port linked into a process's port list without
- * the process reference that goes with it (#425, src/nxt_port.c).
- *
- * The release decides from port->link.next alone whether the port belongs
- * to a process, then drops port->process's reference.  The only place that
- * links a port, nxt_process_port_add(), also sets port->process and takes
- * the reference, so the two agree in production; but nothing stops a port
- * being linked by hand (src/test/nxt_port_ready_test.c does it for its
- * fixtures), and the only guard was an nxt_assert() that release builds
- * compile out.  A debug build aborted and a release build dereferenced
- * NULL in nxt_process_use().
- *
- * The release now unlinks such a port -- leaving it on the list would leave
- * the list pointing into the pool the release is about to free -- reports
- * the broken pairing, and drops no reference it does not hold.  The case
- * runs in a child so that the pre-fix crash (either build) is reported as
- * a failure rather than taking the test binary down.
+ * nxt_port_release() of a port linked into a process's list by hand, with
+ * no port->process and no reference (#425): a debug build aborted and a
+ * release build dereferenced NULL.  It must unlink the port and drop no
+ * reference it does not hold.  Runs in a child, so a crash is a failure.
  */
 
 #include <nxt_main.h>
@@ -28,14 +15,21 @@
 #include <nxt_runtime.h>
 #include "nxt_tests.h"
 
-#include <sys/wait.h>
-
 
 static int
-nxt_port_release_test_child(nxt_task_t *task, nxt_runtime_t *rt)
+nxt_port_release_test_child(void *data)
 {
+    nxt_task_t     *task;
     nxt_port_t     *port, *paired;
+    nxt_thread_t   *thr;
+    nxt_runtime_t  *rt;
     nxt_process_t  *process;
+
+    rt = data;
+    thr = nxt_thread();
+    thr->runtime = rt;
+    thr->engine = NULL;
+    task = thr->task;
 
     process = nxt_mp_zalloc(rt->mem_pool, sizeof(nxt_process_t));
     if (process == NULL) {
@@ -86,30 +80,20 @@ nxt_port_release_test_child(nxt_task_t *task, nxt_runtime_t *rt)
 
     nxt_port_use(task, port, -1);
 
-    if (!nxt_queue_is_empty(&process->ports)) {
-        /* The list still points at the freed port. */
-        return 5;
-    }
-
-    if (process->use_count != 1) {
-        return 6;
-    }
-
-    return 0;
+    /* A port still on the list would point into the freed pool. */
+    return !nxt_queue_is_empty(&process->ports) ? 5
+           : process->use_count != 1 ? 6 : 0;
 }
 
 
 nxt_int_t
 nxt_port_release_test(nxt_thread_t *thr)
 {
-    int            status;
-    pid_t          child;
+    int            rc;
     nxt_mp_t       *mp;
-    nxt_task_t     *task;
     nxt_runtime_t  *rt;
 
-    task = thr->task;
-    task->thread = thr;
+    thr->task->thread = thr;
 
     mp = nxt_mp_create(1024, 128, 256, 32);
     if (nxt_slow_path(mp == NULL)) {
@@ -117,51 +101,24 @@ nxt_port_release_test(nxt_thread_t *thr)
     }
 
     rt = nxt_mp_zalloc(mp, sizeof(nxt_runtime_t));
-    if (nxt_slow_path(rt == NULL)) {
+
+    if (nxt_slow_path(rt == NULL
+                      || nxt_thread_mutex_create(&rt->processes_mutex)
+                         != NXT_OK))
+    {
         nxt_mp_destroy(mp);
         return NXT_ERROR;
     }
 
     rt->mem_pool = mp;
 
-    if (nxt_slow_path(nxt_thread_mutex_create(&rt->processes_mutex)
-                      != NXT_OK))
-    {
-        nxt_mp_destroy(mp);
-        return NXT_ERROR;
-    }
-
-    child = fork();
-
-    if (child == -1) {
-        nxt_mp_destroy(mp);
-        return NXT_ERROR;
-    }
-
-    if (child == 0) {
-        thr->runtime = rt;
-        thr->engine = NULL;
-
-        _exit(nxt_port_release_test_child(task, rt));
-    }
+    rc = nxt_test_in_child(thr, "port release test",
+                           nxt_port_release_test_child, rt);
 
     nxt_mp_destroy(mp);
 
-    if (waitpid(child, &status, 0) != child) {
-        return NXT_ERROR;
-    }
-
-    if (WIFSIGNALED(status)) {
-        nxt_log_alert(thr->log, "port release test: a hand-linked port "
-                      "killed the release with signal %d", WTERMSIG(status));
-        return NXT_ERROR;
-    }
-
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        nxt_log_alert(thr->log, "port release test failed at step %d",
-                      WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-        return NXT_ERROR;
-    }
+    NXT_TEST_CHECK(thr->log, rc == 0, "port release test failed at step %d",
+                   rc);
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "port release test passed");
 

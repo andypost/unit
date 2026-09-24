@@ -4,27 +4,10 @@
  */
 
 /*
- * Fragment reassembly limits at a receiving port (#394, src/nxt_port.h,
- * nxt_port_read_msg_process() in src/nxt_port_socket.c).
- *
- * The receiver holds every fragment of a message until the last one
- * arrives, and the sender decides how many streams it opens and how long
- * each one runs.  Nothing bounded either, so a peer could grow the receiver
- * without limit by never finishing a stream, or by opening a new one per
- * message.  Now:
- *
- *   - at most NXT_PORT_FRAG_STREAMS_MAX streams are open on a port;
- *   - a stream holds at most NXT_PORT_FRAG_SIZE_MAX bytes;
- *   - the open streams of a port hold at most NXT_PORT_FRAG_TOTAL_MAX.
- *
- * A stream past a limit is dropped whole, and its last fragment then finds
- * nothing to complete: the handler never sees it.  What each case asserts is
- * whether the handler ran for the stream, and with what size.
- *
- * The fragments are sized, not filled: their buffers point into a
- * PROT_NONE reservation that nothing reads, so a 128 MB stream costs no
- * memory.  The port has no socket; the messages go straight to
- * nxt_port_read_msg_process() through its NXT_TESTS wrapper.
+ * Fragment reassembly limits at a receiving port (#394): streams per port,
+ * bytes per stream and bytes per port.  A stream past a limit is dropped
+ * whole, so its handler never runs.  Fragment buffers point into a
+ * PROT_NONE reservation that nothing reads, so a 128 MB stream is free.
  */
 
 #include <nxt_main.h>
@@ -43,6 +26,7 @@ static u_char      *nxt_frag_test_space;
 static nxt_uint_t  nxt_frag_test_calls;
 static uint32_t    nxt_frag_test_last_stream;
 static size_t      nxt_frag_test_last_size;
+static nxt_bool_t  nxt_frag_test_oom;
 
 
 static void
@@ -54,8 +38,7 @@ nxt_frag_test_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 }
 
 
-/* One fragment of "size" payload bytes: first, middle or last. */
-static nxt_int_t
+static void
 nxt_frag_test_send(nxt_task_t *task, nxt_port_t *port, uint32_t stream,
     size_t size, nxt_bool_t first, nxt_bool_t last)
 {
@@ -64,7 +47,8 @@ nxt_frag_test_send(nxt_task_t *task, nxt_port_t *port, uint32_t stream,
 
     b = nxt_mp_zalloc(port->mem_pool, sizeof(nxt_buf_t));
     if (nxt_slow_path(b == NULL)) {
-        return NXT_ERROR;
+        nxt_frag_test_oom = 1;
+        return;
     }
 
     b->mem.start = nxt_frag_test_space;
@@ -86,66 +70,31 @@ nxt_frag_test_send(nxt_task_t *task, nxt_port_t *port, uint32_t stream,
     msg.port_msg.mf = !last;
 
     nxt_port_test_run_read_msg_process(task, port, &msg);
-
-    return NXT_OK;
 }
 
 
-/*
- * A stream of "n" fragments of "mb" MB each; returns whether the handler
- * ran for it, and checks the size it saw.
- */
+/* A stream of "n" fragments of "mb" MB: delivered whole, or not at all. */
 static nxt_int_t
-nxt_frag_test_stream(nxt_task_t *task, nxt_port_t *port, uint32_t stream,
-    nxt_uint_t n, size_t mb, nxt_bool_t *delivered)
+nxt_frag_test_expect(nxt_task_t *task, nxt_port_t *port, const char *name,
+    uint32_t stream, nxt_uint_t n, size_t mb, nxt_bool_t expect)
 {
     nxt_uint_t  i, calls;
 
     calls = nxt_frag_test_calls;
 
     for (i = 0; i < n; i++) {
-        if (nxt_frag_test_send(task, port, stream, mb * NXT_FRAG_TEST_MB,
-                               i == 0, i == n - 1)
-            != NXT_OK)
-        {
-            return NXT_ERROR;
-        }
+        nxt_frag_test_send(task, port, stream, mb * NXT_FRAG_TEST_MB, i == 0,
+                           i == n - 1);
     }
 
-    *delivered = (nxt_frag_test_calls != calls);
-
-    if (*delivered
-        && (nxt_frag_test_last_stream != stream
-            || nxt_frag_test_last_size != n * mb * NXT_FRAG_TEST_MB))
-    {
-        nxt_log_alert(task->log, "port frag test: stream #%uD delivered "
-                      "%uz bytes, expected %uz", stream,
-                      nxt_frag_test_last_size, n * mb * NXT_FRAG_TEST_MB);
-        return NXT_ERROR;
-    }
-
-    return NXT_OK;
-}
-
-
-static nxt_int_t
-nxt_frag_test_expect(nxt_task_t *task, nxt_port_t *port, const char *name,
-    uint32_t stream, nxt_uint_t n, size_t mb, nxt_bool_t expect)
-{
-    nxt_bool_t  delivered;
-
-    if (nxt_frag_test_stream(task, port, stream, n, mb, &delivered)
-        != NXT_OK)
-    {
-        return NXT_ERROR;
-    }
-
-    if (delivered != expect) {
-        nxt_log_alert(task->log, "port frag test: %s: %s", name,
-                      delivered ? "delivered" : "dropped");
-        return NXT_ERROR;
-    }
-
+    NXT_TEST_CHECK(task->log, (nxt_frag_test_calls != calls) == expect,
+                   "port frag test: %s: %s", name,
+                   expect ? "dropped" : "delivered");
+    NXT_TEST_CHECK(task->log, !expect
+                   || (nxt_frag_test_last_stream == stream
+                       && nxt_frag_test_last_size == n * mb * NXT_FRAG_TEST_MB),
+                   "port frag test: %s: %uz bytes", name,
+                   nxt_frag_test_last_size);
     return NXT_OK;
 }
 
@@ -153,30 +102,20 @@ nxt_frag_test_expect(nxt_task_t *task, nxt_port_t *port, const char *name,
 static nxt_int_t
 nxt_frag_test_run(nxt_task_t *task, nxt_port_t *port)
 {
-    size_t      mb;
+    size_t      mb, half;
     uint32_t    s;
     nxt_uint_t  i, calls;
 
     s = NXT_FRAG_TEST_STREAM;
     mb = NXT_PORT_FRAG_SIZE_MAX / NXT_FRAG_TEST_MB;
 
-    /*
-     * Per stream: exactly at the limit; past it on the last fragment; and
-     * past it on a middle one, which drops the stream while it is open.
-     */
+    /* Per stream: at the limit; past it on the last or a middle fragment. */
 
-    if (nxt_frag_test_expect(task, port, "a stream at the size limit",
-                             s++, mb, 1, 1)
-        != NXT_OK
-        || nxt_frag_test_expect(task, port, "past the size limit, last",
-                                s++, mb + 1, 1, 0)
-           != NXT_OK
-        || nxt_frag_test_expect(task, port, "past the size limit, middle",
-                                s++, mb + 2, 1, 0)
-           != NXT_OK
-        || nxt_frag_test_expect(task, port, "a stream after a dropped one",
-                                s++, 3, 1, 1)
-           != NXT_OK)
+    if (nxt_frag_test_expect(task, port, "at the size limit", s++, mb, 1, 1)
+        || nxt_frag_test_expect(task, port, "past it, last", s++, mb + 1, 1, 0)
+        || nxt_frag_test_expect(task, port, "past it, middle", s++, mb + 2, 1,
+                                0)
+        || nxt_frag_test_expect(task, port, "after a drop", s++, 3, 1, 1))
     {
         return NXT_ERROR;
     }
@@ -184,83 +123,62 @@ nxt_frag_test_run(nxt_task_t *task, nxt_port_t *port)
     /* Per port, streams: open the most there may be, then one more. */
 
     for (i = 0; i < NXT_PORT_FRAG_STREAMS_MAX; i++) {
-        if (nxt_frag_test_send(task, port, s + i, 1, 1, 0) != NXT_OK) {
-            return NXT_ERROR;
-        }
+        nxt_frag_test_send(task, port, s + i, 1, 1, 0);
     }
 
     calls = nxt_frag_test_calls;
 
-    if (nxt_frag_test_send(task, port, s + i, 1, 1, 0) != NXT_OK
-        || nxt_frag_test_send(task, port, s + i, 1, 0, 1) != NXT_OK)
-    {
-        return NXT_ERROR;
-    }
+    nxt_frag_test_send(task, port, s + i, 1, 1, 0);
+    nxt_frag_test_send(task, port, s + i, 1, 0, 1);
 
-    if (nxt_frag_test_calls != calls) {
-        nxt_log_alert(task->log, "port frag test: stream %ui of %ui was "
-                      "accepted", i + 1, (nxt_uint_t) NXT_PORT_FRAG_STREAMS_MAX);
-        return NXT_ERROR;
-    }
+    NXT_TEST_CHECK(task->log, nxt_frag_test_calls == calls,
+                   "port frag test: a stream past the most was accepted");
 
     /* The open ones still complete, and free their slots as they do. */
 
     for (i = 0; i < NXT_PORT_FRAG_STREAMS_MAX; i++) {
-        if (nxt_frag_test_send(task, port, s + i, 1, 0, 1) != NXT_OK) {
-            return NXT_ERROR;
-        }
+        nxt_frag_test_send(task, port, s + i, 1, 0, 1);
     }
 
-    if (nxt_frag_test_calls != calls + NXT_PORT_FRAG_STREAMS_MAX) {
-        nxt_log_alert(task->log, "port frag test: %ui of %ui open streams "
-                      "completed", nxt_frag_test_calls - calls,
-                      (nxt_uint_t) NXT_PORT_FRAG_STREAMS_MAX);
-        return NXT_ERROR;
-    }
+    NXT_TEST_CHECK(task->log,
+                   nxt_frag_test_calls == calls + NXT_PORT_FRAG_STREAMS_MAX,
+                   "port frag test: open streams did not complete");
 
     s += NXT_PORT_FRAG_STREAMS_MAX + 1;
 
-    /*
-     * Per port, bytes: two open streams at half the total each fill it;
-     * a third that would add to it is dropped, and the two still complete.
-     */
+    /* Per port, bytes: two open halves fill it; a third stream is dropped. */
 
-    mb = NXT_PORT_FRAG_TOTAL_MAX / 2 / NXT_FRAG_TEST_MB;
+    half = NXT_PORT_FRAG_TOTAL_MAX / 2 / NXT_FRAG_TEST_MB * NXT_FRAG_TEST_MB;
 
-    if (nxt_frag_test_send(task, port, s, mb * NXT_FRAG_TEST_MB, 1, 0)
-        != NXT_OK
-        || nxt_frag_test_send(task, port, s + 1, mb * NXT_FRAG_TEST_MB, 1, 0)
-           != NXT_OK)
-    {
-        return NXT_ERROR;
-    }
+    nxt_frag_test_send(task, port, s, half, 1, 0);
+    nxt_frag_test_send(task, port, s + 1, half, 1, 0);
 
-    if (nxt_frag_test_expect(task, port, "a stream past the port's total",
-                             s + 2, 2, 1, 0)
-        != NXT_OK)
+    if (nxt_frag_test_expect(task, port, "past the port's total", s + 2, 2,
+                             1, 0))
     {
         return NXT_ERROR;
     }
 
     calls = nxt_frag_test_calls;
 
-    if (nxt_frag_test_send(task, port, s, 0, 0, 1) != NXT_OK
-        || nxt_frag_test_send(task, port, s + 1, 0, 0, 1) != NXT_OK)
+    nxt_frag_test_send(task, port, s, 0, 0, 1);
+    nxt_frag_test_send(task, port, s + 1, 0, 0, 1);
+
+    NXT_TEST_CHECK(task->log, nxt_frag_test_calls == calls + 2,
+                   "port frag test: streams within the total did not "
+                   "complete");
+
+    /* Everything is accounted back: a fresh stream at the limit passes. */
+
+    if (nxt_frag_test_expect(task, port, "at the limit, again", s + 3, mb, 1,
+                             1))
     {
         return NXT_ERROR;
     }
 
-    if (nxt_frag_test_calls != calls + 2) {
-        nxt_log_alert(task->log, "port frag test: streams within the total "
-                      "did not complete");
-        return NXT_ERROR;
-    }
-
-    /* Everything is accounted back: a fresh stream at the limit passes. */
-
-    return nxt_frag_test_expect(task, port, "a stream at the limit, again",
-                                s + 3, NXT_PORT_FRAG_SIZE_MAX
-                                       / NXT_FRAG_TEST_MB, 1, 1);
+    NXT_TEST_CHECK(task->log, !nxt_frag_test_oom,
+                   "port frag test: out of memory");
+    return NXT_OK;
 }
 
 
@@ -277,7 +195,6 @@ nxt_port_frag_test(nxt_thread_t *thr)
     task = thr->task;
     task->thread = thr;
 
-    /* A whole stream past the size limit, as address space only. */
     reserve = NXT_PORT_FRAG_TOTAL_MAX + 16 * NXT_FRAG_TEST_MB;
 
     nxt_frag_test_space = mmap(NULL, reserve, PROT_NONE,
@@ -301,11 +218,7 @@ nxt_port_frag_test(nxt_thread_t *thr)
 
     ret = nxt_frag_test_run(task, port);
 
-    /*
-     * The port is left behind like the other port tests' fixtures: its
-     * pool still holds the fragments' buffer headers, which point into the
-     * reservation, so the reservation stays too.
-     */
+    /* The port and the reservation it points into are left behind. */
 
     if (ret == NXT_OK) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log, "port frag test passed");

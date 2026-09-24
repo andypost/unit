@@ -1468,8 +1468,6 @@ nxt_port_read_handler(nxt_task_t *task, void *obj, void *data)
 
     port = msg.port = nxt_container_of(obj, nxt_port_t, socket);
 
-    NXT_USDT(port__recv, port->pid);
-
     nxt_assert(port->engine == task->thread->engine);
 
     for ( ;; ) {
@@ -1504,6 +1502,8 @@ nxt_port_read_handler(nxt_task_t *task, void *obj, void *data)
         n = nxt_socketpair_recv(&port->socket, iov, 2, &oob);
 
         if (n > 0) {
+            NXT_USDT(port__recv, port->pid);
+
             msg.fd[0] = -1;
             msg.fd[1] = -1;
 

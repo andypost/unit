@@ -21,7 +21,7 @@ it, each probe is a `nop` until a tracer attaches.
 | `freeunit:mmap-chunk-get` | `nxt_router_prepare_msg()` | `req_size + content_length` |
 | `freeunit:queue-enqueue` | `nxt_app_queue_send()` | `slot index, tracking id` |
 | `freeunit:queue-dequeue` | `nxt_app_queue_recv()`, in the application process | `slot index` |
-| `freeunit:process-spawn` | `nxt_process_create()`, parent only | `child pid` |
+| `freeunit:process-spawn` | `nxt_process_create()`, parent only | `child pid` (the global one, also with pid isolation) |
 | `freeunit:request-start` | `nxt_http_request_create()` | `(uintptr_t) r` |
 | `freeunit:request-done` | `nxt_http_request_done()` | `(uintptr_t) r, status` |
 

@@ -41,6 +41,16 @@ extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 extern char  **environ;
 
 
+/*
+ * Keeps a fuzzing run quiet.  The parser answers a bad response with an
+ * alert, and nxt_alert() calls the handler whatever the log level is.
+ */
+static void nxt_cdecl
+nxt_fuzz_log_handler(nxt_uint_t level, nxt_log_t *log, const char *fmt, ...)
+{
+}
+
+
 int
 LLVMFuzzerInitialize(int *argc, char ***argv)
 {
@@ -48,8 +58,7 @@ LLVMFuzzerInitialize(int *argc, char ***argv)
         return NXT_ERROR;
     }
 
-    /* Keep a fuzzing run quiet: nothing below alert is worth printing. */
-    nxt_main_log.level = NXT_LOG_ALERT;
+    nxt_main_log.handler = nxt_fuzz_log_handler;
 
     if (nxt_http_response_hash_init(NULL) != NXT_OK) {
         return NXT_ERROR;

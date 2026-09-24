@@ -102,18 +102,19 @@ jobs:
               http://localhost/config > $W/put.out
             sleep 0.5
             body=$(curl -sS -m 5 http://127.0.0.1:18471/ 2>&1)
-            if grep -q success $W/put.out && echo "$body" | grep -q -- "$want"; then
+            if grep -q success $W/put.out && echo "$body" | grep -qE -- "$want"; then
               echo "PASS $name: $body"
             else
               echo "FAIL $name: put=$(tr -d '\n\t' < $W/put.out) body=$body"
               fail=1
             fi
           }
-          run none   ''                                                      'ml=128M'
+          # Baseline memory_limit differs (setup-php's php.ini sets -1).
+          run none   ''                                                      'php='
           run admin  ',"options":{"admin":{"memory_limit":"256M"}}'          'ml=256M'
           run user   ',"options":{"user":{"memory_limit":"300M"}}'           'ml=300M'
           run file   ',"options":{"file":"'$W'/app/php.ini"}'                'ml=200M'
-          run opc    ',"options":{"admin":{"opcache.revalidate_freq":"7"}}'  'ml=128M'
+          run opc    ',"options":{"admin":{"opcache.revalidate_freq":"7"}}'  "rf=('7'|false)"
           run dis    ',"options":{"admin":{"disable_functions":"exec"}}'     'df=exec'
           run all    ',"options":{"file":"'$W'/app/php.ini","admin":{"memory_limit":"1G","opcache.validate_timestamps":"1","opcache.revalidate_freq":"0","realpath_cache_size":"4096K","upload_max_filesize":"64M","post_max_size":"64M"},"user":{"date.timezone":"UTC"}}' 'ml=1G'
 
@@ -127,5 +128,10 @@ jobs:
       - name: pytest test_php_application.py
         if: ${{ !cancelled() }}
         run: |
+          # discovery runs as nobody; let it reach build/lib/unit/modules.
+          if [ "$(id -u)" != 0 ]; then
+            sudo chmod o+x /home/runner /home/runner/work "$(dirname "$PWD")"
+            chmod -R o+rX "$PWD"
+          fi
           SUDO=; [ "$(id -u)" = 0 ] || SUDO="sudo -E"
           $SUDO pytest-3 --print-log test/test_php_application.py

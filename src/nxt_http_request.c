@@ -283,8 +283,6 @@ nxt_http_request_create(nxt_task_t *task)
 
     task->thread->engine->requests_cnt++;
 
-    NXT_USDT(request__start, (uintptr_t) r);
-
     r->tstr_cache.var.pool = mp;
 
 #if (NXT_HAVE_OTEL)
@@ -296,6 +294,9 @@ nxt_http_request_create(nxt_task_t *task)
         r->otel->status = NXT_OTEL_INIT_STATE;
     }
 #endif
+
+    /* Last: a request that fails to be created never reaches request-done. */
+    NXT_USDT(request__start, (uintptr_t) r);
 
     return r;
 

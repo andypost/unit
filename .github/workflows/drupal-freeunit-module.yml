@@ -1,0 +1,347 @@
+name: "Drupal freeunit module"
+
+# Tests the Drupal module in pkg/docker/drupal/modules/freeunit against real
+# Drupal cores, under a FreeUnit built from this branch, and measures the
+# router-served static cache against Drupal's page_cache (and nginx+php-fpm).
+
+on:
+  pull_request:
+    paths:
+      - 'pkg/docker/drupal/modules/freeunit/**'
+      - 'pkg/docker/drupal/unit-drupal.json'
+      - 'docs/drupal/**'
+      - '.github/workflows/drupal-freeunit-module.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drupal-freeunit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drupal:
+    name: Drupal ${{ matrix.drupal }} / PHP 8.5
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - drupal: '11'
+            stability: stable
+            project: '^11'
+            core: '^11.4'
+          - drupal: '12'
+            stability: dev
+            project: '^12'
+            core: '12.0.x-dev'
+    env:
+      MODULE: pkg/docker/drupal/modules/freeunit
+      PORT: 8080
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: gd, pdo_sqlite, pdo_mysql, zip
+          coverage: none
+          tools: composer
+
+      - name: Paths
+        run: |
+          {
+            echo "SITE=$RUNNER_TEMP/site"
+            echo "RUN=$RUNNER_TEMP/unit"
+            echo "PHP_INI_SCAN_DIR=$(php -r 'echo PHP_CONFIG_FILE_SCAN_DIR;')"
+            echo "PHP_INI=$(php -r 'echo php_ini_loaded_file();')"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/unit/state" "$RUNNER_TEMP/unit/tmp"
+          php -v
+          php-config --php-sapis
+
+      ##
+      ## Drupal
+      ##
+
+      - name: Create the Drupal ${{ matrix.drupal }} project
+        run: |
+          composer create-project --no-install --no-interaction \
+            --stability=${{ matrix.stability }} \
+            "drupal/recommended-project:${{ matrix.project }}" "$SITE"
+          cd "$SITE"
+          composer config minimum-stability dev
+          composer config prefer-stable true
+          for p in dealerdirect/phpcodesniffer-composer-installer \
+                   phpstan/extension-installer php-http/discovery tbachert/spi; do
+            composer config --no-plugins "allow-plugins.$p" true
+          done
+          composer require --no-update \
+            "drupal/core-recommended:${{ matrix.core }}" \
+            "drupal/core-composer-scaffold:${{ matrix.core }}" \
+            "drupal/core-project-message:${{ matrix.core }}" \
+            "drush/drush:^13.8 || ^14@dev"
+          composer require --dev --no-update "drupal/core-dev:${{ matrix.core }}"
+          composer update --no-interaction --no-progress -W
+          composer show drupal/core drush/drush | grep -E '^(name|versions)'
+          mkdir -p web/modules/custom web/sites/simpletest/browser_output
+          cp -r "$GITHUB_WORKSPACE/$MODULE" web/modules/custom/freeunit
+
+      - name: phpcs (drupal/coder)
+        working-directory: ${{ env.SITE }}/web/modules/custom/freeunit
+        run: ../../../../vendor/bin/phpcs
+
+      - name: phpstan (mglaman/phpstan-drupal, level 6)
+        working-directory: ${{ env.SITE }}
+        run: vendor/bin/phpstan analyse --no-progress -c web/modules/custom/freeunit/phpstan.neon.dist
+
+      - name: PHPUnit unit and kernel tests
+        working-directory: ${{ env.SITE }}
+        env:
+          SIMPLETEST_DB: sqlite://localhost/${{ runner.temp }}/kernel.sqlite
+        run: |
+          vendor/bin/phpunit -c web/core/phpunit.xml.dist --testdox \
+            web/modules/custom/freeunit/tests/src/Unit \
+            web/modules/custom/freeunit/tests/src/Kernel
+
+      ##
+      ## FreeUnit from this branch
+      ##
+
+      - name: Build FreeUnit with the PHP 8.5 embed SAPI
+        run: |
+          if ! php-config --php-sapis | grep -qw embed; then
+            sudo apt-get install -y "libphp$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')-embed"
+          fi
+          ./configure --openssl
+          ./configure php
+          make -j"$(nproc)" unitd php
+
+      - name: Start unitd
+        run: |
+          # Unprivileged: applications run as the runner user, which owns the
+          # site.  PHP_INI_SCAN_DIR (from Paths) gives the embed SAPI the
+          # CLI's extensions.
+          build/sbin/unitd --control "unix:$RUN/control.sock" --pid "$RUN/unit.pid" \
+            --log "$RUN/unit.log" --statedir "$RUN/state" --tmpdir "$RUN/tmp" \
+            --modulesdir build/lib/unit/modules
+          for i in $(seq 50); do [ -S "$RUN/control.sock" ] && break; sleep 0.1; done
+          curl -sf --unix-socket "$RUN/control.sock" http://localhost/status >/dev/null
+
+      - name: examples/check-static-cache.py (router rules, stand-in PHP)
+        run: python3 "$MODULE/examples/check-static-cache.py" "$RUN/control.sock" "$RUN/check" 18080
+
+      - name: Functional tests under FreeUnit (pkg/docker/drupal/unit-drupal.json)
+        working-directory: ${{ env.SITE }}
+        env:
+          SIMPLETEST_DB: sqlite://localhost/${{ runner.temp }}/functional.sqlite
+          SIMPLETEST_BASE_URL: http://127.0.0.1:8080
+          BROWSERTEST_OUTPUT_DIRECTORY: ${{ env.SITE }}/web/sites/simpletest/browser_output
+        run: |
+          python3 - "$GITHUB_WORKSPACE/pkg/docker/drupal/unit-drupal.json" > "$RUN/functional.json" <<'EOF'
+          import json, os, sys
+          raw = open(sys.argv[1]).read().replace('/var/www/drupal/web', os.environ['SITE'] + '/web')
+          conf = json.loads(raw)
+          conf['listeners'] = {'127.0.0.1:' + os.environ['PORT']: {'pass': 'routes/drupal'}}
+          app = conf['applications']['drupal']
+          del app['user'], app['group']
+          app['options']['file'] = os.environ['PHP_INI']
+          print(json.dumps(conf))
+          EOF
+          curl -sf -X PUT --data-binary @"$RUN/functional.json" --unix-socket "$RUN/control.sock" http://localhost/config
+          vendor/bin/phpunit -c web/core/phpunit.xml.dist --testdox web/modules/custom/freeunit/tests/src/Functional
+
+      - name: Install a site and route it through the module's example config
+        working-directory: ${{ env.SITE }}
+        run: |
+          sudo systemctl start mysql
+          vendor/bin/drush -y site:install standard --db-url=mysql://root:root@127.0.0.1/drupal \
+            --account-pass=admin --site-name=FreeUnit
+          vendor/bin/drush -y pm:uninstall automated_cron
+          vendor/bin/drush -y pm:install freeunit
+          vendor/bin/drush -y config:set system.performance cache.page.max_age 300
+          vendor/bin/drush -y php:eval '
+            \Drupal::configFactory()->getEditable("freeunit.settings")
+              ->set("static_cache.enabled", TRUE)
+              ->set("static_cache.directory", getenv("SITE") . "/page-cache")
+              ->set("static_cache.hosts", ["127.0.0.1"])
+              ->save();
+            $n = \Drupal\node\Entity\Node::create(["type" => "article", "title" => "FreeUnit", "body" => str_repeat("Lorem ipsum dolor sit amet. ", 200)]);
+            $n->setPublished()->save();'
+          mkdir -p "$SITE/page-cache"
+          vendor/bin/drush freeunit:routes > "$RUN/drupal_page.json"
+          export CRON_KEY="$(vendor/bin/drush state:get system.cron_key)"
+          python3 - "$GITHUB_WORKSPACE/$MODULE/examples/unit-drupal-freeunit.json" > "$RUN/site.json" <<'EOF'
+          import json, os, sys
+          raw = open(sys.argv[1]).read().replace('/var/www/drupal/web', os.environ['SITE'] + '/web')
+          conf = json.loads(raw)
+          conf['listeners'] = {'127.0.0.1:' + os.environ['PORT']: {'pass': 'routes/drupal'}}
+          conf['routes']['drupal_page'] = json.load(open(os.environ['RUN'] + '/drupal_page.json'))
+          app = conf['applications']['drupal']
+          del app['user'], app['group']
+          app['options']['file'] = os.environ['PHP_INI']
+          s = conf['schedules']['drupal-cron']
+          s.update(interval=3600, jitter=0, run_on_start=True)
+          s['headers'] = {'Host': '127.0.0.1', 'X-FreeUnit-Cron-Key': os.environ['CRON_KEY']}
+          print(json.dumps(conf))
+          EOF
+          vendor/bin/drush state:set system.cron_last 0
+          curl -sf -X PUT --data-binary @"$RUN/site.json" --unix-socket "$RUN/control.sock" http://localhost/config
+
+      - name: Check the live site under FreeUnit
+        working-directory: ${{ env.SITE }}
+        run: |
+          set -x
+          u=http://127.0.0.1:$PORT/node/1
+          file=$SITE/page-cache/http/127.0.0.1/node/1_.html
+          # Response headers, lower-cased, one per line.
+          hdr() { curl -s -o /dev/null -D - "$@" | tr -d '\r' | tr 'A-Z' 'a-z'; }
+          has() { grep -x -- "$1" >/dev/null; }
+          hdr "$u" | has 'x-drupal-cache: miss'
+          for i in $(seq 50); do [ -f "$file" ] && break; sleep 0.1; done
+          hdr "$u" | has 'x-drupal-cache: hit-freeunit'
+          hdr -H 'Accept-Encoding: gzip' "$u" | has 'content-encoding: gzip'
+          cmp <(curl -s "$u") <(curl -s -H 'Accept-Encoding: gzip' "$u" | gunzip)
+          cmp <(curl -s "$u") "$file"
+          hdr -H 'Cookie: SESSabc=1' "$u" | has 'x-drupal-cache: hit'
+          hdr "$u?x=1" | has 'x-drupal-cache: miss'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/freeunit/cron)" = 404
+          # Editing the node deletes the file; the next request is PHP again.
+          vendor/bin/drush php:eval '\Drupal\node\Entity\Node::load(1)->setTitle("Edited")->save();'
+          test ! -e "$file"
+          hdr "$u" | has 'x-drupal-cache: miss'
+          # The FreeUnit schedule (run_on_start) ran cron through /freeunit/cron.
+          for i in $(seq 50); do [ "$(vendor/bin/drush state:get system.cron_last)" != 0 ] && break; sleep 0.2; done
+          test "$(vendor/bin/drush state:get system.cron_last)" != 0
+          # The status report, rendered by FreeUnit, as uid 1.
+          uli=$(vendor/bin/drush user:login --uid=1 --no-browser --uri=http://127.0.0.1:$PORT)
+          cookie=$(curl -s -o /dev/null -c - "$uli" | awk '/SESS/ {print $6"="$7}')
+          test -n "$cookie"
+          echo "AUTH_COOKIE=$cookie" >> "$GITHUB_ENV"
+          curl -s -H "Cookie: $cookie" "http://127.0.0.1:$PORT/admin/reports/status" > "$RUN/status.html"
+          grep -q 'Unit/' "$RUN/status.html"
+          grep -q 'fastcgi_finish_request() available' "$RUN/status.html"
+
+      ##
+      ## Metrics
+      ##
+
+      - name: Install hey
+        run: go install github.com/rakyll/hey@latest
+
+      - name: Measure under FreeUnit and nginx + php-fpm
+        working-directory: ${{ env.SITE }}
+        run: |
+          # Reference stack: nginx + php-fpm on the same site and PHP.
+          v=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+          command -v "php-fpm$v" >/dev/null || sudo apt-get install -y "php$v-fpm"
+          cat > "$RUN/fpm.conf" <<EOF
+          [global]
+          pid = $RUN/fpm.pid
+          error_log = $RUN/fpm.log
+          [www]
+          listen = $RUN/fpm.sock
+          pm = static
+          pm.max_children = 8
+          php_admin_value[memory_limit] = 1G
+          EOF
+          "php-fpm$v" -c "$PHP_INI" -y "$RUN/fpm.conf"
+          cat > "$RUN/nginx.conf" <<EOF
+          worker_processes 2;
+          pid $RUN/nginx.pid;
+          error_log $RUN/nginx.log;
+          events {}
+          http {
+            include /etc/nginx/mime.types;
+            access_log off;
+            client_body_temp_path $RUN/tmp; proxy_temp_path $RUN/tmp;
+            fastcgi_temp_path $RUN/tmp; uwsgi_temp_path $RUN/tmp; scgi_temp_path $RUN/tmp;
+            server {
+              listen 127.0.0.1:8081;
+              root $SITE/web;
+              location / { try_files \$uri /index.php?\$query_string; }
+              location ~ \.php$ {
+                include /etc/nginx/fastcgi_params;
+                fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+                fastcgi_pass unix:$RUN/fpm.sock;
+              }
+            }
+          }
+          EOF
+          nginx -c "$RUN/nginx.conf" -p "$RUN"
+          export HEY="$(go env GOPATH)/bin/hey"
+          python3 - <<'EOF'
+          import json, os, re, statistics, subprocess, time
+          env = os.environ
+          def drush(*a):
+              subprocess.run(['vendor/bin/drush', '-y', *a], check=True, capture_output=True)
+          def head(url, cookie=None):
+              h = ['-H', 'Cookie: ' + cookie] if cookie else []
+              return subprocess.run(['curl', '-s', '-o', '/dev/null', '-D', '-', *h, url],
+                                    capture_output=True, text=True).stdout.lower()
+          def hey(url, cookie=None):
+              h = ['-H', 'Cookie: ' + cookie] if cookie else []
+              out = subprocess.run([env['HEY'], '-z', '5s', '-c', '10', '-disable-compression', *h, url],
+                                   capture_output=True, text=True, check=True).stdout
+              lat = dict(re.findall(r'(\d+)% in ([\d.]+) secs', out))
+              codes = dict(re.findall(r'\[(\d+)\]\s+(\d+) responses', out))
+              errors = sum(int(n) for c, n in codes.items() if c != '200')
+              errors += sum(int(n) for n in re.findall(r'\[(\d+)\]\s+Get', out))
+              return {'rps': float(re.search(r'Requests/sec:\s+([\d.]+)', out)[1]),
+                      'p50_ms': float(lat['50']) * 1000, 'p99_ms': float(lat['99']) * 1000,
+                      'errors': errors}
+          def run(name, server, url, expect, cookie=None):
+              hey(url, cookie)  # warm up the workers and OPcache
+              seen = head(url, cookie)
+              assert expect in seen, (name, server, expect, seen)
+              runs = [hey(url, cookie) for _ in range(3)]
+              med = {k: statistics.median(r[k] for r in runs) for k in runs[0]}
+              med['errors'] = sum(r['errors'] for r in runs)
+              return {'scenario': name, 'server': server, 'url': url, 'check': expect, 'runs': runs, **med}
+          unit, nginx = f"http://127.0.0.1:{env['PORT']}", 'http://127.0.0.1:8081'
+          page, asset = '/node/1', '/core/misc/drupal.js'
+          results = []
+          # (b) router-served static cache: the file exists after one MISS.
+          head(unit + page); time.sleep(1)
+          results.append(run('b. anonymous, freeunit static cache', 'freeunit', unit + page, 'x-drupal-cache: hit-freeunit'))
+          # (a) page_cache only: module cache off and purged.
+          drush('config:set', 'freeunit.settings', 'static_cache.enabled', '0')
+          drush('freeunit:cache-purge')
+          head(unit + page)
+          results.append(run('a. anonymous, page_cache only', 'freeunit', unit + page, 'x-drupal-cache: hit'))
+          results.append(run('a. anonymous, page_cache only', 'nginx+fpm', nginx + page, 'x-drupal-cache: hit'))
+          for srv, base in (('freeunit', unit), ('nginx+fpm', nginx)):
+              results.append(run('c. authenticated (uid 1)', srv, base + page, '200 ok', env['AUTH_COOKIE']))
+              results.append(run('d. static asset', srv, base + asset, '200 ok'))
+          meta = {'php': subprocess.run(['php', '-r', 'echo PHP_VERSION;'], capture_output=True, text=True).stdout,
+                  'drupal': subprocess.run(['vendor/bin/drush', 'status', '--field=drupal-version'], capture_output=True, text=True).stdout.strip(),
+                  'tool': 'hey -z 5s -c 10 -disable-compression, 3 runs, median; errors summed',
+                  'cpus': os.cpu_count(), 'commit': env['GITHUB_SHA']}
+          json.dump({'meta': meta, 'results': results}, open('drupal-freeunit-metrics.json', 'w'), indent=2)
+          with open(env['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(f"### Drupal {meta['drupal']}, PHP {meta['php']}, {meta['cpus']} vCPU\n\n")
+              f.write('| scenario | server | req/s | p50 ms | p99 ms | errors |\n|---|---|---:|---:|---:|---:|\n')
+              for r in results:
+                  f.write(f"| {r['scenario']} | {r['server']} | {r['rps']:.0f} | {r['p50_ms']:.2f} | {r['p99_ms']:.2f} | {r['errors']} |\n")
+              f.write(f"\n{meta['tool']}. Loopback, client and server share the runner.\n")
+          EOF
+          cat drupal-freeunit-metrics.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: drupal-freeunit-metrics-d${{ matrix.drupal }}
+          path: |
+            ${{ env.SITE }}/drupal-freeunit-metrics.json
+            ${{ env.SITE }}/web/sites/simpletest/browser_output
+            ${{ runner.temp }}/unit/*.log
+            ${{ runner.temp }}/unit/*.json
+          if-no-files-found: ignore
+
+      - name: Logs
+        if: failure()
+        run: |
+          tail -n 100 "$RUN"/*.log || true

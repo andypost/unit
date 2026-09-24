@@ -355,6 +355,7 @@ struct nxt_port_s {
      */
     nxt_thread_mutex_t  write_mutex;
     nxt_queue_t         messages;   /* of nxt_port_send_msg_t */
+    /* Set by nxt_process_port_add() only; nxt_port_release() clears them. */
     nxt_queue_link_t    link;       /* for nxt_process_t.ports */
     nxt_queue_link_t    app_link;   /* for nxt_app_t.ports */
     nxt_queue_link_t    idle_link;  /* for nxt_app_t.idle_ports */

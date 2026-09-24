@@ -2,6 +2,7 @@
 #
 # Compare DDEV's default nginx-fpm with the freeunit add-on on a fresh
 # Drupal site. Run from an empty directory; needs ddev, hey, curl, python3.
+# Drupal chores run through metrics-site.php, not drush.
 #
 #   metrics.sh <add-on dir> <out.json>
 #
@@ -41,14 +42,21 @@ ddev start -y
 # Drupal 12 has pre-releases only so far: DRUPAL_STABILITY=alpha.
 ddev composer create-project ${DRUPAL_STABILITY:+--stability="$DRUPAL_STABILITY"} \
     "drupal/recommended-project:$DRUPAL_CONSTRAINT"
-if [ -n "${DRUPAL_STABILITY:-}" ]; then
-    ddev composer config minimum-stability "$DRUPAL_STABILITY"
-    ddev composer config prefer-stable true
-fi
-ddev composer require -W drush/drush
-ddev drush site:install standard -y --account-pass=admin --site-name=bench
-ddev drush php:eval '\Drupal\node\Entity\Node::create(["type" => "article", "title" => "Bench", "body" => str_repeat("Lorem ipsum dolor sit amet. ", 200), "status" => 1])->save();'
-ddev drush status --fields=drupal-version,php-version | tee "$RAW/versions.txt"
+# No drush: it does not install on Drupal 12 pre-releases yet.
+cp "$ADDON/tests/metrics-site.php" .
+site() { ddev exec php metrics-site.php "$@"; }
+site install
+NODE=$(site node | tail -n1 | tr -d "\r")
+site version | tee "$RAW/versions.txt"
+# Oracle: the pages exist for anonymous users before anything is measured.
+for path in / "/node/$NODE" /core/misc/druplicon.png; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE$path")
+    if [ "$code" != 200 ]; then
+        echo "$path returned $code" >&2
+        site log >&2 || true
+        exit 1
+    fi
+done
 end
 
 # ---- helpers ---------------------------------------------------------------
@@ -81,21 +89,21 @@ measure() {
     t0=$(date +%s.%N)
     ddev restart -y
     t1=$(date +%s.%N)
-    first=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' "$BASE/node/1")
+    first=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' "$BASE/node/$NODE")
     echo "restart_s=$(awk "BEGIN{printf \"%.1f\", $t1 - $t0}")" > "$RAW/$server.cold.txt"
     echo "first_request=$first" >> "$RAW/$server.cold.txt"
     cat "$RAW/$server.cold.txt" >&2
+    case "$first" in 200\ *) ;; *) site log >&2 || true; exit 1 ;; esac
 
-    ddev drush cr
     curl -sI "$BASE/" | tr -d '\r' | grep -i '^server:' > "$RAW/$server.server.txt" || true
     bench "$server" anon_front / HIT
-    bench "$server" anon_node /node/1 HIT
+    bench "$server" anon_node "/node/$NODE" HIT
     bench "$server" static /core/misc/druplicon.png
     docker stats --no-stream --format '{{.MemUsage}}' "ddev-${PROJ}-web" > "$RAW/$server.mem.txt"
-    ddev drush pm:uninstall -y page_cache
+    site module-off page_cache
     bench "$server" uncached_front / none
-    bench "$server" uncached_node /node/1 none
-    ddev drush pm:install -y page_cache
+    bench "$server" uncached_node "/node/$NODE" none
+    site module-on page_cache
     end
 }
 

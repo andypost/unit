@@ -92,6 +92,11 @@ def test_traceparent_generated_when_missing_with_otel():
 
 
 def test_traceparent_inherited_with_otel():
+    """Telemetry configured, inbound traceparent present: PHP must see the
+    same trace id, but with FreeUnit's own span id as parent-id rather than
+    the client's original parent-id, so PHP's spans (e.g. Drupal/Gander,
+    the OTel PHP SDK) become children of FreeUnit's span rather than
+    siblings of it."""
     client.load('traceparent')
     _configure_telemetry_or_skip()
 
@@ -106,3 +111,7 @@ def test_traceparent_inherited_with_otel():
     assert seen, 'PHP must see a traceparent header at all'
     assert TRACEPARENT_RE.match(seen), f'not a valid traceparent: {seen!r}'
     assert TRACE_ID in seen, 'trace id must be inherited, not replaced'
+    assert PARENT_ID not in seen, (
+        'PHP must see FreeUnit\'s own span id as parent-id, not the '
+        'client-supplied parent-id it sent in'
+    )

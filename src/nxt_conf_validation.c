@@ -11,7 +11,6 @@
 #include <nxt_script.h>
 #include <nxt_router.h>
 #include <nxt_router_schedule.h>
-#include <nxt_checked.h>
 #include <nxt_http.h>
 #include <nxt_sockaddr.h>
 #include <nxt_http_route_addr.h>
@@ -5024,9 +5023,12 @@ nxt_conf_vldt_schedule(nxt_conf_validation_t *vldt, nxt_str_t *name,
 {
     double            interval, jitter;
     nxt_int_t         ret;
+    nxt_str_t         uri;
     nxt_uint_t        i;
     nxt_conf_value_t  *member;
 
+    static const nxt_str_t  uri_str = nxt_string("uri");
+    static const nxt_str_t  headers_str = nxt_string("headers");
     static const nxt_str_t  interval_str = nxt_string("interval");
     static const nxt_str_t  jitter_str = nxt_string("jitter");
 
@@ -5051,6 +5053,25 @@ nxt_conf_vldt_schedule(nxt_conf_validation_t *vldt, nxt_str_t *name,
     ret = nxt_conf_vldt_object(vldt, value, nxt_conf_vldt_schedule_members);
     if (ret != NXT_OK) {
         return ret;
+    }
+
+    /* The request as a run would make it, with every header handled. */
+
+    nxt_conf_get_string(nxt_conf_get_object_member(value, &uri_str, NULL),
+                        &uri);
+
+    ret = nxt_router_schedule_request_check(vldt->pool, name, &uri,
+              nxt_conf_get_object_member(value, &headers_str, NULL));
+
+    if (ret != NXT_OK) {
+        if (ret == NXT_ERROR) {
+            return NXT_ERROR;
+        }
+
+        return nxt_conf_vldt_member_error(vldt, &headers_str, "The schedule "
+                                          "\"uri\" and \"headers\" do not "
+                                          "make a request the router "
+                                          "accepts.");
     }
 
     member = nxt_conf_get_object_member(value, &jitter_str, NULL);
@@ -5116,16 +5137,14 @@ nxt_conf_vldt_schedule_pass(nxt_conf_validation_t *vldt,
 }
 
 
-/* A target in origin form, which the router's request parser accepts. */
+/* A target in origin form; nxt_router_schedule_request_check() parses it. */
 
 static nxt_int_t
 nxt_conf_vldt_schedule_uri(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data)
 {
-    nxt_str_t                 uri, req;
-    nxt_int_t                 ret;
-    nxt_uint_t                i;
-    nxt_http_request_parse_t  rp;
+    nxt_str_t   uri;
+    nxt_uint_t  i;
 
     nxt_conf_get_string(value, &uri);
 
@@ -5148,24 +5167,6 @@ nxt_conf_vldt_schedule_uri(nxt_conf_validation_t *vldt,
                                        "characters, non-ASCII bytes or "
                                        "\"#\".");
         }
-    }
-
-    req.length = nxt_length("GET  HTTP/1.1\r\n\r\n") + uri.length;
-    req.start = nxt_mp_nget(vldt->pool, req.length);
-    if (nxt_slow_path(req.start == NULL)) {
-        return NXT_ERROR;
-    }
-
-    (void) nxt_sprintf(req.start, req.start + req.length,
-                       "GET %V HTTP/1.1\r\n\r\n", &uri);
-
-    nxt_memzero(&rp, sizeof(nxt_http_request_parse_t));
-
-    ret = nxt_router_schedule_parse(vldt->pool, &req, &rp);
-
-    if (ret != NXT_DONE) {
-        return nxt_conf_vldt_error(vldt, "The \"uri\" value \"%V\" is not a "
-                                   "valid request target.", &uri);
     }
 
     return NXT_OK;

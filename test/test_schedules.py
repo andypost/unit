@@ -1,6 +1,8 @@
 """The top-level "schedules" object (docs/adr/0004-schedules.md)."""
 
+import os
 import re
+import subprocess
 import time
 
 import pytest
@@ -120,6 +122,9 @@ INVALID = (
        for n in ['', 'Bad Name', 'Bad:Name', 'X-é', 'X\r\nY', '(x)']]
     + [({"headers": {"X-Test": v}}, None, f'{C}/headers/X-Test')
        for v in ['a\rb', 'a\nb', 'a\x00b', 'a\x7fb', 1, None, ["x"]]]
+    + [({"headers": h}, 'do not make a request', f'{C}/headers')
+       for h in [{"Host": "a..b"}, {"Host": "x", "host": "y"},
+                 {'X-' + 'a' * 254: "x"}]]
     + [({"headers": {f'X-{i:02d}': 'v' * 2100 for i in range(4)}},
         'must not exceed 8192 bytes', f'{C}/headers'),
        ({"headers": ["Host: x"]}, None, f'{C}/headers'),
@@ -463,3 +468,36 @@ def test_schedules_run_lifecycle():
             live.discard(m.group(1))
 
     assert not live, f'configurations never destroyed: {live}'
+
+
+def test_schedules_run_otel(tmp_path):
+    """A run is traced as a client's request would be: one span per run."""
+    from test_otel import (FAKE_OTLP_BIN, _get_free_port, _kill,
+                           _run_fake_otlp, _valid_telemetry)
+
+    if not os.path.exists(FAKE_OTLP_BIN):
+        pytest.skip(f'{FAKE_OTLP_BIN} not installed (build via test/fake_otlp)')
+
+    port = _get_free_port()
+    dump = str(tmp_path / 'otlp_dump.bin')
+    proc = _run_fake_otlp(port, requests=1, dump=dump)
+
+    try:
+        put_run(run(uri="/cron/otel", run_on_start=True),
+                settings={"telemetry": _valid_telemetry(port)})
+
+        wait_for_starts(1, 10, '/cron/otel')
+
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            pytest.fail('the run exported no span')
+
+        with open(dump, 'rb') as f:
+            body = f.read()
+
+        assert b'/cron/otel' in body, body
+        assert b'http.response.status_code' in body, body
+
+    finally:
+        _kill(proc)

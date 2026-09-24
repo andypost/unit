@@ -77,6 +77,9 @@ nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
     *cookie = i;
 
     if (nxt_slow_path(nxt_app_nncq_enqueue(&q->queue, i) != NXT_OK)) {
+        /* The slot is not lost with the message. */
+        (void) nxt_app_nncq_enqueue(&q->free_items, i);
+
         return NXT_ERROR;
     }
 

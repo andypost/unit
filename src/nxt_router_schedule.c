@@ -14,9 +14,7 @@
 #include <nxt_http.h>
 #include <nxt_http_devnull.h>
 #include <nxt_router_schedule.h>
-#if (NXT_HAVE_OTEL)
 #include <nxt_otel.h>
-#endif
 
 
 /* "run_on_start": the first run, about a second after the apply. */
@@ -101,8 +99,9 @@ static void nxt_router_schedule_arm(nxt_event_engine_t *engine,
 static void nxt_router_schedule_timer_handler(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_router_schedule_run(nxt_task_t *task, void *obj, void *data);
+static nxt_int_t nxt_router_schedule_fields_init(void);
 static nxt_int_t nxt_router_schedule_request_init(nxt_http_request_t *r,
-    nxt_router_schedule_t *sched, nxt_socket_conf_t *skcf);
+    nxt_router_schedule_t *sched, nxt_bool_t discard_unsafe_fields);
 static void nxt_router_schedule_run_timeout(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_router_schedule_run_close(nxt_task_t *task,
@@ -225,15 +224,8 @@ nxt_router_conf_resolve(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
         return NXT_OK;
     }
 
-    if (!nxt_router_schedule_fields_ready) {
-        ret = nxt_http_fields_hash(&nxt_router_schedule_fields_hash,
-                                   nxt_router_schedule_fields,
-                                   nxt_nitems(nxt_router_schedule_fields));
-        if (nxt_slow_path(ret != NXT_OK)) {
-            return NXT_ERROR;
-        }
-
-        nxt_router_schedule_fields_ready = 1;
+    if (nxt_slow_path(nxt_router_schedule_fields_init() != NXT_OK)) {
+        return NXT_ERROR;
     }
 
     rtcf = tmcf->router_conf;
@@ -271,6 +263,28 @@ nxt_router_conf_resolve(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     rtcf->schedules = sc;
 
     nxt_debug(task, "router conf %p: %uD schedules", rtcf, sc->nschedules);
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_router_schedule_fields_init(void)
+{
+    nxt_int_t  ret;
+
+    if (nxt_router_schedule_fields_ready) {
+        return NXT_OK;
+    }
+
+    ret = nxt_http_fields_hash(&nxt_router_schedule_fields_hash,
+                               nxt_router_schedule_fields,
+                               nxt_nitems(nxt_router_schedule_fields));
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return NXT_ERROR;
+    }
+
+    nxt_router_schedule_fields_ready = 1;
 
     return NXT_OK;
 }
@@ -744,12 +758,22 @@ nxt_router_schedule_run(nxt_task_t *task, void *obj, void *data)
     /* The schedule's deadline; r->timer carries the application's. */
     nxt_timer_add(engine, &run->timer, run->sched->timeout);
 
-    ret = nxt_router_schedule_request_init(r, run->sched, &sc->skcf);
+    ret = nxt_router_schedule_request_init(r, run->sched,
+                                           sc->skcf.discard_unsafe_fields);
     if (nxt_slow_path(ret != NXT_OK)) {
         nxt_http_request_error(task, r, (ret > 0) ? (nxt_http_status_t) ret
                                         : NXT_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
+
+    /*
+     * The span transitions a client's request makes on its way to the
+     * action: nxt_h1p_conn_request_header_parse(), nxt_http_request_start()
+     * and nxt_http_request_ready().  The devnull header send collects it.
+     */
+    NXT_OTEL_TRACE();
+    NXT_OTEL_TRACE();
+    NXT_OTEL_TRACE();
 
     nxt_http_request_action(task, r, run->sched->action);
 }
@@ -759,7 +783,7 @@ nxt_router_schedule_run(nxt_task_t *task, void *obj, void *data)
 
 static nxt_int_t
 nxt_router_schedule_request_init(nxt_http_request_t *r,
-    nxt_router_schedule_t *sched, nxt_socket_conf_t *skcf)
+    nxt_router_schedule_t *sched, nxt_bool_t discard_unsafe_fields)
 {
     nxt_http_request_parse_t  *rp;
 
@@ -768,7 +792,7 @@ nxt_router_schedule_request_init(nxt_http_request_t *r,
         return NXT_ERROR;
     }
 
-    rp->discard_unsafe_fields = skcf->discard_unsafe_fields;
+    rp->discard_unsafe_fields = discard_unsafe_fields;
 
     if (nxt_router_schedule_parse(r->mem_pool, &sched->request, rp)
         != NXT_DONE)
@@ -1058,6 +1082,42 @@ nxt_router_schedule_parse(nxt_mp_t *mp, nxt_str_t *request,
     (void) nxt_http_parse_request_init(rp, mp);
 
     return nxt_http_parse_request(rp, &mem);
+}
+
+
+/*
+ * For the validator: the request a run would make, built and taken in as
+ * nxt_router_schedule_run() does.  What the run would refuse with 400 -- a
+ * "Host" that is not a host name, a field given twice, a name over 255
+ * bytes -- is refused at configuration time instead.  Returns NXT_DECLINED
+ * for such a request.
+ */
+
+nxt_int_t
+nxt_router_schedule_request_check(nxt_mp_t *mp, nxt_str_t *name,
+    nxt_str_t *uri, nxt_conf_value_t *headers)
+{
+    nxt_int_t              ret;
+    nxt_http_request_t     r;
+    nxt_router_schedule_t  sched;
+
+    nxt_memzero(&sched, sizeof(nxt_router_schedule_t));
+    sched.name = *name;
+    sched.uri = *uri;
+
+    if (nxt_slow_path(nxt_router_schedule_fields_init() != NXT_OK
+                      || nxt_router_schedule_request_build(mp, &sched, headers)
+                         != NXT_OK))
+    {
+        return NXT_ERROR;
+    }
+
+    nxt_memzero(&r, sizeof(nxt_http_request_t));
+    r.mem_pool = mp;
+
+    ret = nxt_router_schedule_request_init(&r, &sched, 0);
+
+    return (ret == NXT_OK || ret == NXT_ERROR) ? ret : NXT_DECLINED;
 }
 
 

@@ -11,16 +11,11 @@
 
 
 /*
- * NXT_HTTP_PROTO_DEVNULL: the protocol of a request that has no client
- * connection (docs/adr/0004-schedules.md, section 6.4).  The response is
- * counted, its first bytes are kept for the log, and every buffer is
- * completed at once, which is what ends the request: the router's
- * completion handler on r->last closes it.
- *
- * r->proto.any points at an nxt_http_devnull_t that the owner of the
- * request embeds in its own object.  The owner is told through ->close,
- * called in place of the h1 connection close, and must release "joint",
- * the request's r->conf, from there or later on the same engine.
+ * NXT_HTTP_PROTO_DEVNULL: a request with no client connection
+ * (docs/adr/0004-schedules.md, section 6.4).  The response is counted and
+ * its head kept, and every buffer is completed at once.  r->proto.any
+ * points at an nxt_http_devnull_t embedded in the owner's object; ->close
+ * replaces the connection close, and must release "joint" on this engine.
  */
 
 #define NXT_HTTP_DEVNULL_HEAD  256

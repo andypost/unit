@@ -3,23 +3,14 @@
  * Copyright (C) FreeUnit contributors.
  */
 
-/*
- * The NXT_HTTP_PROTO_DEVNULL slot of nxt_http_proto[] (src/nxt_h1proto.c),
- * reserved since 2019 and filled for "schedules".  See nxt_http_devnull.h.
- *
- * Every call site of nxt_http_proto[] is guarded by r->proto.any != NULL
- * or runs only for a request that has a protocol, so filling the slot is
- * what lets a connection-less request go through the ordinary request code
- * unchanged: the start, the application handler, the response, the error
- * paths, the access log and the close.
- */
+/* The NXT_HTTP_PROTO_DEVNULL slot of nxt_http_proto[]; see the header. */
 
 #include <nxt_router.h>
 #include <nxt_http.h>
 #include <nxt_http_devnull.h>
 
 
-/* There is no body: the request is ready at once, as h1 does. */
+/* No body: ready at once. */
 
 void
 nxt_http_devnull_body_read(nxt_task_t *task, nxt_http_request_t *r)
@@ -36,10 +27,7 @@ nxt_http_devnull_local_addr(nxt_task_t *task, nxt_http_request_t *r)
 }
 
 
-/*
- * The header goes nowhere.  The body handler is queued rather than called,
- * as h1 does, so that it never runs inside the caller's frame.
- */
+/* As h1 does, the body handler is queued, never called in place. */
 
 void
 nxt_http_devnull_header_send(nxt_task_t *task, nxt_http_request_t *r,
@@ -69,11 +57,7 @@ nxt_http_devnull_header_send(nxt_task_t *task, nxt_http_request_t *r,
 }
 
 
-/*
- * Count the body, keep its first bytes, and complete the whole chain at
- * once.  Completing the sync "last" buffer runs its handler, which is how
- * the request ends.
- */
+/* Completing the sync "last" buffer is what ends the request. */
 
 void
 nxt_http_devnull_send(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
@@ -117,7 +101,6 @@ nxt_http_devnull_body_bytes_sent(nxt_task_t *task, nxt_http_proto_t proto)
 }
 
 
-/* An error ends the request: nothing is queued, so only "last" is left. */
 
 void
 nxt_http_devnull_discard(nxt_task_t *task, nxt_http_request_t *r,
@@ -136,11 +119,7 @@ nxt_http_devnull_discard(nxt_task_t *task, nxt_http_request_t *r,
 }
 
 
-/*
- * Called from nxt_http_request_close_handler(), which releases the request
- * pool as soon as this returns: the owner must not touch dn->request from
- * its close callback onwards.
- */
+/* The request pool goes as soon as this returns. */
 
 void
 nxt_http_devnull_close(nxt_task_t *task, nxt_http_proto_t proto,

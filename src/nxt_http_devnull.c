@@ -8,6 +8,7 @@
 #include <nxt_router.h>
 #include <nxt_http.h>
 #include <nxt_http_devnull.h>
+#include <nxt_otel.h>
 
 
 /* No body: ready at once. */
@@ -37,6 +38,8 @@ nxt_http_devnull_header_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_devnull_t  *dn;
 
     nxt_debug(task, "devnull request header send: %d", (int) r->status);
+
+    NXT_OTEL_TRACE();
 
     dn = r->proto.any;
     dn->status = r->status;

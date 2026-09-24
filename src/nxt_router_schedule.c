@@ -14,9 +14,7 @@
 #include <nxt_http.h>
 #include <nxt_http_devnull.h>
 #include <nxt_router_schedule.h>
-#if (NXT_HAVE_OTEL)
 #include <nxt_otel.h>
-#endif
 
 
 /* "run_on_start": the first run, about a second after the apply. */
@@ -750,6 +748,15 @@ nxt_router_schedule_run(nxt_task_t *task, void *obj, void *data)
                                         : NXT_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
+
+    /*
+     * The span transitions a client's request makes on its way to the
+     * action: nxt_h1p_conn_request_header_parse(), nxt_http_request_start()
+     * and nxt_http_request_ready().  The devnull header send collects it.
+     */
+    NXT_OTEL_TRACE();
+    NXT_OTEL_TRACE();
+    NXT_OTEL_TRACE();
 
     nxt_http_request_action(task, r, run->sched->action);
 }

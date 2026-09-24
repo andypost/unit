@@ -2,7 +2,7 @@
   {
     "ruleId": "len-add-to-checked",
     "file": "src/nxt_h1proto.c",
-    "line": 962,
+    "line": 973,
     "text": "tmp_name.length = tmp_path->length + tmp_name_pattern.length;"
   },
   {
@@ -32,7 +32,7 @@
   {
     "ruleId": "len-add-to-checked",
     "file": "src/nxt_router.c",
-    "line": 7742,
+    "line": 7962,
     "text": "dst_field->name_length = field->name_length + prefix->length;"
   },
   {
@@ -56,13 +56,13 @@
   {
     "ruleId": "narrowing-to-proto",
     "file": "src/nxt_router.c",
-    "line": 7703,
+    "line": 7922,
     "text": "(uint32_t) r->path->length"
   },
   {
     "ruleId": "narrowing-to-proto",
     "file": "src/nxt_router.c",
-    "line": 7713,
+    "line": 7932,
     "text": "(uint32_t) r->args->length"
   },
   {
@@ -112,12 +112,6 @@
     "file": "src/nxt_utf8.c",
     "line": 261,
     "text": "*d++ = *p++;"
-  },
-  {
-    "ruleId": "sprintf-unbounded",
-    "file": "src/nxt_otel.c",
-    "line": 190,
-    "text": "sprintf((char *) traceval, \"%s-%s-%s-%s\",\n                (char *) r->otel->version,\n                (char *) r->otel->trace_id,\n                (char *) r->otel->parent_id,\n                (char *) r->otel->trace_flags)"
   },
   {
     "ruleId": "unchecked-realloc",

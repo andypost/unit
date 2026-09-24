@@ -108,7 +108,6 @@
             "options": {
                 "admin": {
                     "memory_limit": "1G",
-                    "opcache.enable": "1",
                     "opcache.validate_timestamps": "1",
                     "opcache.revalidate_freq": "0",
                     "realpath_cache_size": "4096K",

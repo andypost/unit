@@ -194,7 +194,6 @@ cat <<JSON
             "options": {
                 "admin": {
                     "memory_limit": "${FREEUNIT_MEMORY_LIMIT:-256M}",
-                    "opcache.enable": "1",
                     "opcache.validate_timestamps": "1",
                     "opcache.revalidate_freq": "0"
                 }

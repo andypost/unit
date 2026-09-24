@@ -30,6 +30,10 @@ static int             nxt_unit_msg_test_failures;
 static int             nxt_unit_msg_test_send_fails;
 static int             nxt_unit_msg_test_quit_called;
 static nxt_unit_ctx_t  *nxt_unit_msg_test_ctx;
+static nxt_unit_ctx_t  *nxt_unit_msg_test_follower;
+
+static int nxt_unit_msg_test_send_records_to(nxt_unit_ctx_t *ctx,
+    const nxt_port_mmap_msg_t *records, size_t nrecords, size_t tail);
 
 
 static void
@@ -57,6 +61,28 @@ static ssize_t
 nxt_unit_msg_test_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     const void *buf, size_t buf_size, const void *oob, size_t oob_size)
 {
+    const nxt_port_msg_t  *msg;
+    nxt_port_mmap_msg_t   rec;
+
+    msg = buf;
+
+    /*
+     * While one context asks the router for a segment, another one reads
+     * a record for the same segment and parks behind it.
+     */
+    if (msg->type == _NXT_PORT_MSG_GET_MMAP
+        && nxt_unit_msg_test_follower != NULL)
+    {
+        rec.mmap_id = ((const nxt_port_msg_get_mmap_t *) (msg + 1))->id;
+        rec.chunk_id = 0;
+        rec.size = 100;
+
+        (void) nxt_unit_msg_test_send_records_to(nxt_unit_msg_test_follower,
+                                                 &rec, 1, 0);
+
+        nxt_unit_msg_test_follower = NULL;
+    }
+
     return nxt_unit_msg_test_send_fails ? -1 : (ssize_t) buf_size;
 }
 
@@ -141,8 +167,8 @@ nxt_unit_msg_test_send_segment(size_t size, uint32_t id)
 
 /* RPC_READY with the mmap bit: the result is the mmap read's verdict. */
 static int
-nxt_unit_msg_test_send_records(const nxt_port_mmap_msg_t *records,
-    size_t nrecords, size_t tail)
+nxt_unit_msg_test_send_records_to(nxt_unit_ctx_t *ctx,
+    const nxt_port_mmap_msg_t *records, size_t nrecords, size_t tail)
 {
     u_char          buf[256];
     size_t          size;
@@ -162,8 +188,16 @@ nxt_unit_msg_test_send_records(const nxt_port_mmap_msg_t *records,
     memcpy(buf + sizeof(msg), records, size);
     memset(buf + sizeof(msg) + size, 0, tail);
 
-    return nxt_unit_test_process_msg(nxt_unit_msg_test_ctx, buf,
-                                     sizeof(msg) + size + tail, -1);
+    return nxt_unit_test_process_msg(ctx, buf, sizeof(msg) + size + tail, -1);
+}
+
+
+static int
+nxt_unit_msg_test_send_records(const nxt_port_mmap_msg_t *records,
+    size_t nrecords, size_t tail)
+{
+    return nxt_unit_msg_test_send_records_to(nxt_unit_msg_test_ctx, records,
+                                             nrecords, tail);
 }
 
 
@@ -295,6 +329,56 @@ nxt_unit_msg_test_get_mmap_fail_case(void *data)
 
     return nxt_unit_msg_test_quit_called ? NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK)
                                          : 2;
+}
+
+
+/*
+ * Two contexts park on the same unknown segment; only the first asks the
+ * router for it.  When that failed, the second buffer stayed parked with
+ * its wait counted, so the second context never quit gracefully.
+ */
+static int
+nxt_unit_msg_test_get_mmap_follower_case(void *data)
+{
+    int                  rc;
+    u_char               buf[sizeof(nxt_port_msg_t) + 1];
+    nxt_port_msg_t       msg;
+    nxt_unit_ctx_t       *ctx2;
+    nxt_port_mmap_msg_t  rec;
+
+    ctx2 = nxt_unit_ctx_alloc(nxt_unit_msg_test_ctx, NULL);
+    if (ctx2 == NULL) {
+        return 1;
+    }
+
+    rec.mmap_id = 6;
+    rec.chunk_id = 0;
+    rec.size = 100;
+
+    nxt_unit_msg_test_follower = ctx2;
+    nxt_unit_msg_test_send_fails = 1;
+
+    rc = nxt_unit_msg_test_send_records(&rec, 1, 0);
+
+    if (rc != NXT_UNIT_ERROR || nxt_unit_msg_test_follower != NULL) {
+        return 2;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+
+    msg.pid = getpid();
+    msg.type = _NXT_PORT_MSG_QUIT;
+    msg.last = 1;
+
+    memcpy(buf, &msg, sizeof(msg));
+    buf[sizeof(msg)] = NXT_PORT_QUIT_GRACEFUL;
+
+    /* The follower reads its record again, asks, fails, and quits. */
+
+    (void) nxt_unit_test_process_msg(ctx2, buf, sizeof(buf), -1);
+
+    return nxt_unit_msg_test_quit_called ? NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK)
+                                         : 3;
 }
 
 
@@ -462,6 +546,10 @@ main(void)
 
     nxt_unit_msg_test_in_child("failed get_mmap does not block a graceful "
                                "quit", nxt_unit_msg_test_get_mmap_fail_case,
+                               NULL, NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("failed get_mmap unparks the other contexts",
+                               nxt_unit_msg_test_get_mmap_follower_case,
                                NULL, NXT_UNIT_OK);
 
     nxt_unit_msg_test_in_child("duplicate segment id does not leak a mapping",

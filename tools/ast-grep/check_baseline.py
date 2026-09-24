@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Fail on ast-grep violations in src/ not in baseline.json, keyed by rule,
-file and text rather than line.  --update rewrites the baseline.
+file and text rather than line.  A key is counted: the baseline holds one
+entry per violation, so a second copy of a known one is new.  --update
+rewrites the baseline.
 
 Exit codes: 0 no new violations, 1 new violations, 2 the scan failed.
 """
 import json
+from collections import Counter
 import subprocess
 import sys
 from pathlib import Path
@@ -52,6 +55,20 @@ def key(e):
     return (e['ruleId'], e['file'], e['text'])
 
 
+def new_violations(matches, baseline):
+    """The matches the baseline does not cover, one baseline entry each."""
+    known = Counter(key(e) for e in baseline)
+    new = []
+
+    for m in matches:
+        if known[key(m)] > 0:
+            known[key(m)] -= 1
+        else:
+            new.append(m)
+
+    return new
+
+
 def main():
     matches = scan()
 
@@ -60,8 +77,7 @@ def main():
         print(f'wrote {len(matches)} entries to {BASELINE}')
         return 0
 
-    known = {key(e) for e in json.loads(BASELINE.read_text())}
-    new = [m for m in matches if key(m) not in known]
+    new = new_violations(matches, json.loads(BASELINE.read_text()))
 
     if not new:
         print(f'ast-grep: {len(matches)} violation(s), all in baseline. OK.')

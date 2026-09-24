@@ -8,6 +8,8 @@
  * bytes per stream and bytes per port.  A stream past a limit is dropped
  * whole, so its handler never runs.  Fragment buffers point into a
  * PROT_NONE reservation that nothing reads, so a 128 MB stream is free.
+ * A fragment counts for the buffer it came in, so empty fragments are
+ * bounded too.
  */
 
 #include <nxt_main.h>
@@ -104,7 +106,7 @@ nxt_frag_test_run(nxt_task_t *task, nxt_port_t *port)
 {
     size_t      mb, half;
     uint32_t    s;
-    nxt_uint_t  i, calls;
+    nxt_uint_t  i, n, calls;
 
     s = NXT_FRAG_TEST_STREAM;
     mb = NXT_PORT_FRAG_SIZE_MAX / NXT_FRAG_TEST_MB;
@@ -172,6 +174,22 @@ nxt_frag_test_run(nxt_task_t *task, nxt_port_t *port)
 
     if (nxt_frag_test_expect(task, port, "at the limit, again", s + 3, mb, 1,
                              1))
+    {
+        return NXT_ERROR;
+    }
+
+    /*
+     * Empty fragments: each one holds a buffer of port->max_size, so the
+     * port's total admits NXT_PORT_FRAG_TOTAL_MAX / max_size of them.
+     */
+
+    port->max_size = 16 * 1024;
+    n = NXT_PORT_FRAG_TOTAL_MAX / port->max_size;
+
+    if (nxt_frag_test_expect(task, port, "empty fragments up to the total",
+                             s + 4, n + 1, 0, 1)
+        || nxt_frag_test_expect(task, port, "empty fragments past the total",
+                                s + 5, n + 2, 0, 0))
     {
         return NXT_ERROR;
     }

@@ -97,12 +97,6 @@ nxt_int_t nxt_router_conf_resolve(nxt_task_t *task,
 void nxt_router_schedules_apply(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf);
 
-/* Defined in src/nxt_router.c. */
-nxt_bool_t nxt_router_request_expire(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_request_rpc_data_t *req_rpc_data);
-void nxt_router_joint_release(nxt_task_t *task,
-    nxt_socket_conf_joint_t *joint);
-
 /* Exported for src/test/nxt_router_schedule_test.c. */
 nxt_int_t nxt_router_schedules_joint_init(nxt_task_t *task,
     nxt_router_conf_t *rtcf, nxt_router_schedules_t *sc,

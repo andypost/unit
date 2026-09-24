@@ -103,13 +103,6 @@ typedef struct {
 } nxt_router_schedule_conf_t;
 
 
-typedef struct {
-    uint8_t                  discard_unsafe_fields;
-    uint8_t                  log_route;
-    uint8_t                  server_version;
-} nxt_router_schedule_http_conf_t;
-
-
 static nxt_int_t nxt_router_schedules_create(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, nxt_conf_value_t *root);
 static nxt_int_t nxt_router_schedule_create(nxt_task_t *task,
@@ -199,27 +192,6 @@ static nxt_conf_map_t  nxt_router_schedule_conf[] = {
         nxt_string("headers"),
         NXT_CONF_MAP_PTR,
         offsetof(nxt_router_schedule_conf_t, headers),
-    },
-};
-
-
-static nxt_conf_map_t  nxt_router_schedule_http_conf[] = {
-    {
-        nxt_string("discard_unsafe_fields"),
-        NXT_CONF_MAP_INT8,
-        offsetof(nxt_router_schedule_http_conf_t, discard_unsafe_fields),
-    },
-
-    {
-        nxt_string("log_route"),
-        NXT_CONF_MAP_INT8,
-        offsetof(nxt_router_schedule_http_conf_t, log_route),
-    },
-
-    {
-        nxt_string("server_version"),
-        NXT_CONF_MAP_INT8,
-        offsetof(nxt_router_schedule_http_conf_t, server_version),
     },
 };
 
@@ -454,65 +426,27 @@ nxt_router_schedule_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
 
 /*
- * The internal socket configuration and joint (section 6.3).  A run's
- * request needs a real r->conf: nxt_http_request_header_send(), the close
- * handler, the access log and compression all dereference it without a
- * check.  The listener defaults are copied so that anything reading them
- * sees the value a listener would; only the "settings.http" members the
- * run can observe are mapped, because the rest concern a connection.
+ * The internal socket configuration and joint (section 6.3): a run's
+ * request needs a real r->conf, with what a listener would have.
  */
 
 nxt_int_t
 nxt_router_schedules_joint_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
     nxt_router_schedules_t *sc, nxt_conf_value_t *http)
 {
-    nxt_int_t                        ret;
-    nxt_socket_conf_t                *skcf;
-    nxt_socket_conf_joint_t          *joint;
-    nxt_router_schedule_http_conf_t  hcf;
+    nxt_socket_conf_t        *skcf;
+    nxt_socket_conf_joint_t  *joint;
 
     static nxt_str_t  remote = nxt_string("127.0.0.1");
     static nxt_str_t  local = nxt_string("127.0.0.1:80");
 
-    hcf.discard_unsafe_fields = 1;
-    hcf.log_route = 0;
-    hcf.server_version = 1;
-
-    if (http != NULL) {
-        ret = nxt_conf_map_object(rtcf->mem_pool, http,
-                                  nxt_router_schedule_http_conf,
-                                  nxt_nitems(nxt_router_schedule_http_conf),
-                                  &hcf);
-        if (nxt_slow_path(ret != NXT_OK)) {
-            return NXT_ERROR;
-        }
-    }
-
     skcf = &sc->skcf;
 
-    /* The defaults of a listener in nxt_router_conf_create(). */
-    skcf->header_buffer_size = 2048;
-    skcf->large_header_buffer_size = 8192;
-    skcf->large_header_buffers = 4;
-    skcf->body_buffer_size = 16 * 1024;
-    skcf->max_body_size = 8 * 1024 * 1024;
-    skcf->proxy_header_buffer_size = 64 * 1024;
-    skcf->proxy_buffer_size = 4096;
-    skcf->proxy_buffers = 256;
-    skcf->idle_timeout = 30 * 1000;
-    skcf->header_read_timeout = 30 * 1000;
-    skcf->body_read_timeout = 30 * 1000;
-    skcf->send_timeout = 30 * 1000;
-    skcf->proxy_timeout = 60 * 1000;
-    skcf->proxy_send_timeout = 30 * 1000;
-    skcf->proxy_read_timeout = 30 * 1000;
-    skcf->websocket_conf.max_frame_size = 1024 * 1024;
-    skcf->websocket_conf.read_timeout = 60 * 1000;
-    skcf->websocket_conf.keepalive_interval = 30 * 1000;
-
-    skcf->discard_unsafe_fields = hcf.discard_unsafe_fields;
-    skcf->log_route = hcf.log_route;
-    skcf->server_version = hcf.server_version;
+    if (nxt_slow_path(nxt_router_socket_conf_http(rtcf->mem_pool, skcf, http)
+                      != NXT_OK))
+    {
+        return NXT_ERROR;
+    }
 
     /*
      * nxt_router_conf_release() unlinks both nodes with nxt_queue_remove(),

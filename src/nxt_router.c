@@ -2600,6 +2600,47 @@ nxt_router_otel_conf_remember(nxt_str_t *endpoint, nxt_str_t *protocol,
 #endif
 
 
+
+/* A listener's HTTP settings: the defaults, then "settings/http". */
+
+nxt_int_t
+nxt_router_socket_conf_http(nxt_mp_t *mp, nxt_socket_conf_t *skcf,
+    nxt_conf_value_t *http)
+{
+    skcf->header_buffer_size = 2048;
+    skcf->large_header_buffer_size = 8192;
+    skcf->large_header_buffers = 4;
+    skcf->discard_unsafe_fields = 1;
+    skcf->body_buffer_size = 16 * 1024;
+    skcf->max_body_size = 8 * 1024 * 1024;
+    skcf->proxy_header_buffer_size = 64 * 1024;
+    skcf->proxy_buffer_size = 4096;
+    skcf->proxy_buffers = 256;
+    skcf->idle_timeout = 30 * 1000;
+    skcf->header_read_timeout = 30 * 1000;
+    skcf->body_read_timeout = 30 * 1000;
+    skcf->send_timeout = 30 * 1000;
+    skcf->proxy_timeout = 60 * 1000;
+    skcf->proxy_send_timeout = 30 * 1000;
+    skcf->proxy_read_timeout = 30 * 1000;
+
+    skcf->server_version = 1;
+    skcf->chunked_transform = 0;
+
+    skcf->websocket_conf.max_frame_size = 1024 * 1024;
+    skcf->websocket_conf.read_timeout = 60 * 1000;
+    skcf->websocket_conf.keepalive_interval = 30 * 1000;
+
+    nxt_str_null(&skcf->body_temp_path);
+
+    if (http == NULL) {
+        return NXT_OK;
+    }
+
+    return nxt_conf_map_object(mp, http, nxt_router_http_conf,
+                               nxt_nitems(nxt_router_http_conf), skcf);
+}
+
 static nxt_int_t
 nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     u_char *start, u_char *end)
@@ -3015,43 +3056,10 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
                 goto fail;
             }
 
-            // STUB, default values if http block is not defined.
-            skcf->header_buffer_size = 2048;
-            skcf->large_header_buffer_size = 8192;
-            skcf->large_header_buffers = 4;
-            skcf->discard_unsafe_fields = 1;
-            skcf->body_buffer_size = 16 * 1024;
-            skcf->max_body_size = 8 * 1024 * 1024;
-            skcf->proxy_header_buffer_size = 64 * 1024;
-            skcf->proxy_buffer_size = 4096;
-            skcf->proxy_buffers = 256;
-            skcf->idle_timeout = 30 * 1000;
-            skcf->header_read_timeout = 30 * 1000;
-            skcf->body_read_timeout = 30 * 1000;
-            skcf->send_timeout = 30 * 1000;
-            skcf->proxy_timeout = 60 * 1000;
-            skcf->proxy_send_timeout = 30 * 1000;
-            skcf->proxy_read_timeout = 30 * 1000;
-
-            skcf->server_version = 1;
-            skcf->chunked_transform = 0;
-
-            skcf->websocket_conf.max_frame_size = 1024 * 1024;
-            skcf->websocket_conf.read_timeout = 60 * 1000;
-            skcf->websocket_conf.keepalive_interval = 30 * 1000;
-
-            nxt_str_null(&skcf->body_temp_path);
-
-            if (http != NULL) {
-
-                ret = nxt_conf_map_object(mp, http, nxt_router_http_conf,
-                                          nxt_nitems(nxt_router_http_conf),
-                                          skcf);
-                if (ret != NXT_OK) {
-                    nxt_alert(task, "http map error");
-                    goto fail;
-                }
-
+            ret = nxt_router_socket_conf_http(mp, skcf, http);
+            if (ret != NXT_OK) {
+                nxt_alert(task, "http map error");
+                goto fail;
             }
 
             if (websocket != NULL) {

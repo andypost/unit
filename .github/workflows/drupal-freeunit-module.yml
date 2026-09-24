@@ -244,7 +244,7 @@ jobs:
         working-directory: ${{ env.SITE }}
         env:
           # Experiment: every variant in .github/scripts/drupal-bench.py.
-          BENCH_VARIANTS: all
+          BENCH_VARIANTS: v0-run6,v1-same-ini,v2-revalidate2,v4-threads2,v6-jit-off
         run: |
           # Reference stack: nginx + php-fpm on the same site and PHP.  The
           # script (re)starts php-fpm and reconfigures FreeUnit per variant.

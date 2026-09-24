@@ -57,29 +57,40 @@ BASE_INI = {
 
 DYNAMIC = {'max': 8, 'spare': 2, 'idle_timeout': 60}
 
+FAIR_INI = {**BASE_INI, 'opcache.revalidate_freq': '2'}
+
+# setup-php's conf.d, read after the -c / options.file ini, turns the tracing
+# JIT on with a 256M buffer, so both stacks run with it unless a variant turns
+# it off at runtime: "admin" is FreeUnit's options.admin and php-fpm's
+# php_admin_value, both applied after startup.
 VARIANTS = {
     # Run 6 as it was: FreeUnit with the example's options.admin on the CLI
     # php.ini, dynamic processes; php-fpm on the CLI php.ini, defaults.
-    'v0-run6': dict(ini=None, processes=DYNAMIC, threads=None),
+    'v0-run6': dict(ini=None, admin=None, processes=DYNAMIC, threads=None),
     # Same ini file on both, the example's values (revalidate_freq=0).
-    'v1-same-ini': dict(ini=BASE_INI, processes=DYNAMIC, threads=None),
+    'v1-same-ini': dict(ini=BASE_INI, admin=None, processes=DYNAMIC, threads=None),
     # ... with revalidate_freq=2 (PHP's default) on both.
-    'v2-revalidate2': dict(ini={**BASE_INI, 'opcache.revalidate_freq': '2'},
-                           processes=DYNAMIC, threads=None),
+    'v2-revalidate2': dict(ini=FAIR_INI, admin=None, processes=DYNAMIC, threads=None),
     # ... and FreeUnit static 8 processes, like pm=static 8.
-    'v3-static8': dict(ini={**BASE_INI, 'opcache.revalidate_freq': '2'},
-                       processes=8, threads=None),
+    'v3-static8': dict(ini=FAIR_INI, admin=None, processes=8, threads=None),
     # ... and 2 router threads, like nginx's 2 workers.
-    'v4-threads2': dict(ini={**BASE_INI, 'opcache.revalidate_freq': '2'},
-                        processes=8, threads=2),
+    'v4-threads2': dict(ini=FAIR_INI, admin=None, processes=8, threads=2),
     # ... 1 router thread.
-    'v5-threads1': dict(ini={**BASE_INI, 'opcache.revalidate_freq': '2'},
-                        processes=8, threads=1),
-    # v4 with the tracing JIT on both.
-    'v6-jit': dict(ini={**BASE_INI, 'opcache.revalidate_freq': '2',
-                        'opcache.jit': 'tracing', 'opcache.jit_buffer_size': '64M'},
-                   processes=8, threads=2),
+    'v5-threads1': dict(ini=FAIR_INI, admin=None, processes=8, threads=1),
+    # v4 with the JIT off on both.
+    'v6-jit-off': dict(ini=FAIR_INI, admin={'opcache.jit': 'disable'}, processes=8, threads=2),
 }
+
+# (scenario, path, header the response must carry, authenticated, stacks)
+SCENARIOS = [
+    ('page_cache hit', '/node/1', 'x-drupal-cache: hit', False, ('freeunit', 'nginx+fpm')),
+    ('page_cache hit /', '/', 'x-drupal-cache: hit', False, ('freeunit', 'nginx+fpm')),
+    # The same app on a listener that passes straight to it: no routes, no
+    # "share" lookups in front of PHP.
+    ('page_cache hit, no share', '/node/1', 'x-drupal-cache: hit', False, ('freeunit-direct',)),
+    ('authenticated', '/node/1', '200 ok', True, ('freeunit', 'nginx+fpm')),
+    ('trivial php', '/bench.php', '200 ok', False, ('freeunit', 'nginx+fpm')),
+]
 
 
 def sh(*a, **kw):
@@ -203,7 +214,7 @@ def measure(scenario, server, url, expect, cookie=None):
     med['busy_pct'] = round(statistics.median(r['cpu']['busy_pct'] for r in runs), 1)
     # Worker churn: PHP worker pids present at the end that were not there
     # before the measured runs.
-    grp = 'unit_php' if server == 'freeunit' else 'fpm'
+    grp = 'unit_php' if server.startswith('freeunit') else 'fpm'
     before = {p for p, (g, _) in pids0.items() if g == grp}
     after = set(runs[-1]['cpu']['_pids'][grp])
     med['workers'] = len(after)
@@ -225,7 +236,7 @@ def write_ini(name, ini):
     return path
 
 
-def fpm_restart(ini_path, admin_memory):
+def fpm_restart(ini_path, admin):
     try:
         os.kill(int(open(f'{RUN}/fpm.pid').read()), signal.SIGQUIT)
         for _ in range(100):
@@ -246,8 +257,8 @@ pm = static
 pm.max_children = 8
 pm.max_requests = 0
 """)
-        if admin_memory:
-            f.write('php_admin_value[memory_limit] = 1G\n')
+        for k, v in (admin or {}).items():
+            f.write(f'php_admin_value[{k}] = {v}\n')
     subprocess.run([f'php-fpm{FPM_VER}', '-c', ini_path, '-y', f'{RUN}/fpm.conf'], check=True)
     for _ in range(100):
         if os.path.exists(f'{RUN}/fpm.sock'):
@@ -262,6 +273,7 @@ def unit_apply(base, ini_path, admin, processes, threads):
     extra = {'match': {'uri': ['/bench.php', '/diag.php']},
              'action': {'pass': 'applications/drupal/direct'}}
     conf['routes']['drupal'].insert(0, extra)
+    conf['listeners']['127.0.0.1:8082'] = {'pass': 'applications/drupal/index'}
     app = conf['applications']['drupal']
     app['processes'] = processes
     app['options'] = {'file': ini_path}
@@ -304,7 +316,7 @@ def summarize_diag(d):
     return (f"sapi={s.get('sapi')} ini={s.get('ini_loaded')} opcache_enabled={o.get('opcache_enabled')} "
             f"hits={o.get('hits')} misses={o.get('misses')} scripts={o.get('num_cached_scripts')} "
             f"mem_used={o.get('used_memory')} mem_free={o.get('free_memory')} "
-            f"jit_on={j.get('on')} jit_buf={j.get('buffer_size')} "
+            f"jit={s.get('ini', {}).get('opcache.jit')} jit_on={j.get('on')} jit_buf={j.get('buffer_size')} "
             f"validate_ts={s.get('ini', {}).get('opcache.validate_timestamps')} "
             f"revalidate_freq={s.get('ini', {}).get('opcache.revalidate_freq')} "
             f"realpath={s.get('ini', {}).get('realpath_cache_size')}/{s.get('ini', {}).get('realpath_cache_ttl')} "
@@ -312,11 +324,62 @@ def summarize_diag(d):
             f"workers_seen={d['workers_seen']} shm_shared={d['shm_shared']}")
 
 
+def timed_get(url):
+    t = time.perf_counter()
+    try:
+        urllib.request.urlopen(url, timeout=30).read()
+    except Exception as e:  # noqa: BLE001
+        print(f'timed_get {url}: {e!r}', flush=True)
+    return round((time.perf_counter() - t) * 1000, 1)
+
+
+def unit_workers():
+    return sorted(p for p, (c, _) in procs().items() if group(c) == 'unit_php')
+
+
+def apply_variant(base, name, v):
+    if v['ini'] is None:
+        # Run 6: the CLI php.ini for both, the example's admin on FreeUnit,
+        # only memory_limit on php-fpm.
+        fpm_restart(PHP_INI, {'memory_limit': '1G'})
+        unit_apply(base, PHP_INI, EXAMPLE_ADMIN, v['processes'], v['threads'])
+        return PHP_INI
+    path = write_ini(name, v['ini'])
+    fpm_restart(path, v['admin'])
+    unit_apply(base, path, v['admin'], v['processes'], v['threads'])
+    return path
+
+
+def lazy_start(base, ini_path):
+    """First request after a (re)start, and after idle workers were reaped."""
+    out = []
+    for spare in (0, 1):
+        procs_conf = {'max': 8, 'spare': spare, 'idle_timeout': 1}
+        unit_apply(base, ini_path, None, procs_conf, 2)
+        cold = timed_get(UNIT + '/node/1')  # fresh prototype: OPcache is empty
+        subprocess.run([env['HEY'], '-z', '2s', '-c', '10', UNIT + '/node/1'], capture_output=True)
+        time.sleep(4)                        # idle_timeout reaps down to "spare"
+        idle = len(unit_workers())
+        first = timed_get(UNIT + '/node/1')  # OPcache warm, maybe no worker
+        second = timed_get(UNIT + '/node/1')
+        out.append({'processes': procs_conf, 'cold_after_apply_ms': cold,
+                    'idle_workers': idle, 'first_ms': first, 'second_ms': second})
+    fpm_restart(ini_path, None)
+    cold = timed_get(NGINX + '/node/1')
+    out.append({'processes': 'php-fpm static 8', 'cold_after_apply_ms': cold,
+                'idle_workers': 8, 'first_ms': timed_get(NGINX + '/node/1'),
+                'second_ms': timed_get(NGINX + '/node/1')})
+    for r in out:
+        print(f'[lazy] {r}', flush=True)
+    return out
+
+
 def main():
     base = json.load(open(f'{RUN}/site.json'))
     page, asset = '/node/1', '/core/misc/drupal.js'
     open(f'{SITE}/web/bench.php', 'w').write('<?php echo "x";\n')
     open(f'{SITE}/web/diag.php', 'w').write(DIAG_PHP)
+    bases = {'freeunit': UNIT, 'nginx+fpm': NGINX, 'freeunit-direct': 'http://127.0.0.1:8082'}
 
     names = env.get('BENCH_VARIANTS', 'all')
     names = list(VARIANTS) if names == 'all' else names.split(',')
@@ -325,44 +388,51 @@ def main():
     drush('config:set', 'freeunit.settings', 'static_cache.enabled', '0')
     drush('freeunit:cache-purge')
 
-    results, diags = [], {}
+    results, diags, ini_path = [], {}, PHP_INI
     for name in names:
         v = VARIANTS[name]
-        if v['ini'] is None:
-            fpm_restart(PHP_INI, admin_memory=True)
-            unit_apply(base, PHP_INI, EXAMPLE_ADMIN, v['processes'], v['threads'])
-        else:
-            path = write_ini(name, v['ini'])
-            fpm_restart(path, admin_memory=False)
-            unit_apply(base, path, None, v['processes'], v['threads'])
-        head(UNIT + page); head(NGINX + page)
-        for srv, b in (('freeunit', UNIT), ('nginx+fpm', NGINX)):
-            r = [measure('page_cache hit', srv, b + page, 'x-drupal-cache: hit'),
-                 measure('authenticated', srv, b + page, '200 ok', env['AUTH_COOKIE']),
-                 measure('trivial php', srv, b + '/bench.php', '200 ok')]
-            for x in r:
-                x['variant'] = name
-            results += r
-            diags[f'{name}/{srv}'] = diag(b)
+        ini_path = apply_variant(base, name, v)
+        for p in ('/node/1', '/'):
+            head(UNIT + p); head(NGINX + p)
+        n0 = len(results)
+        for sc, path, expect, auth, stacks in SCENARIOS:
+            for srv in stacks:
+                r = measure(sc, srv, bases[srv] + path, expect, env['AUTH_COOKIE'] if auth else None)
+                r['variant'] = name
+                results.append(r)
+        for srv in ('freeunit', 'nginx+fpm'):
+            diags[f'{name}/{srv}'] = diag(bases[srv])
             print(f'[{name}] {srv}: ' + summarize_diag(diags[f"{name}/{srv}"]), flush=True)
         a, b = diags[f'{name}/freeunit']['sample'], diags[f'{name}/nginx+fpm']['sample']
         keys = sorted(set(a.get('ini', {})) | {'extensions', 'zend_extensions'})
         va = {k: a['ini'].get(k) if k in a.get('ini', {}) else a.get(k) for k in keys}
         vb = {k: b['ini'].get(k) if k in b.get('ini', {}) else b.get(k) for k in keys}
-        diff = {k: (va[k], vb[k]) for k in keys if va[k] != vb[k]}
+        # The embed SAPI has no cgi-fcgi, fpm has no unit/pcntl: expected.
+        diff = {k: (va[k], vb[k]) for k in keys if va[k] != vb[k] and k != 'extensions'}
         diags[f'{name}/diff'] = diff
         print(f'[{name}] ini differences freeunit vs fpm: {diff}', flush=True)
-        for x in results[-6:]:
-            print(f"[{name}] {x['server']:9} {x['scenario']:15} {x['rps']:7.0f} req/s "
+        for x in results[n0:]:
+            print(f"[{name}] {x['server']:15} {x['scenario']:24} {x['rps']:7.0f} req/s "
+                  f"p50 {x['p50_ms']:.2f} p99 {x['p99_ms']:.2f} "
                   f"cpu/req {x['cpu_ms_per_req']} busy {x['busy_pct']}% "
                   f"workers {x['workers']} respawned {x['respawned']} errors {x['errors']}", flush=True)
 
+    lazy = lazy_start(base, ini_path) if env.get('BENCH_LAZY', '1') == '1' else []
+    # Back to the last variant for the router cache and the asset.
+    apply_variant(base, names[-1], VARIANTS[names[-1]])
+
     # The router-served static cache and a static asset, on the last variant.
+    # page_cache still holds the page, so empty it: the next MISS writes the file.
     drush('config:set', 'freeunit.settings', 'static_cache.enabled', '1')
-    head(UNIT + page); time.sleep(1)
+    drush('php:eval', "\\Drupal::cache('page')->deleteAll();")
+    head(UNIT + page)
+    for _ in range(50):
+        if os.path.exists(f'{SITE}/page-cache/http/127.0.0.1/node/1_.html'):
+            break
+        time.sleep(0.1)
     extra = [measure('static cache (router)', 'freeunit', UNIT + page, 'x-drupal-cache: hit-freeunit')]
-    for srv, b in (('freeunit', UNIT), ('nginx+fpm', NGINX)):
-        extra.append(measure('static asset', srv, b + asset, '200 ok'))
+    for srv in ('freeunit', 'nginx+fpm'):
+        extra.append(measure('static asset', srv, bases[srv] + asset, '200 ok'))
     for x in extra:
         x['variant'] = names[-1]
     results += extra
@@ -372,7 +442,7 @@ def main():
             'tool': f'hey -z {DURATION} -c 10 -disable-compression, warm-up + {RUNS} runs, median; errors summed',
             'cpus': os.cpu_count(), 'commit': env.get('GITHUB_SHA'),
             'variants': {n: VARIANTS[n] for n in names}}
-    json.dump({'meta': meta, 'results': results, 'diag': diags},
+    json.dump({'meta': meta, 'results': results, 'diag': diags, 'lazy_start': lazy},
               open('drupal-freeunit-metrics.json', 'w'), indent=2, default=str)
 
     with open(env.get('GITHUB_STEP_SUMMARY', '/dev/stdout'), 'a') as f:
@@ -383,16 +453,31 @@ def main():
                 '|---|---|---:|---:|---:|---|---|\n')
         by = {(r['variant'], r['scenario'], r['server']): r for r in results}
         for name in names:
-            for sc in ('page_cache hit', 'authenticated', 'trivial php'):
-                u, n = by[(name, sc, 'freeunit')], by[(name, sc, 'nginx+fpm')]
-                uc, nc = u['cpu_ms_per_req'], n['cpu_ms_per_req']
-                f.write(f"| {name} | {sc} | {u['rps']:.0f} | {n['rps']:.0f} | {u['rps'] / n['rps']:.2f} | "
-                        f"router {uc.get('unit_router', 0):.2f} + php {uc.get('unit_php', 0):.2f} | "
-                        f"nginx {nc.get('nginx', 0):.2f} + fpm {nc.get('fpm', 0):.2f} |\n")
+            for sc, _, _, _, stacks in SCENARIOS:
+                u = by.get((name, sc, 'freeunit')) or by.get((name, sc, 'freeunit-direct'))
+                n = by.get((name, sc, 'nginx+fpm'))
+                uc = u['cpu_ms_per_req']
+                row = (f"| {name} | {sc} | {u['rps']:.0f} | "
+                       f"{n['rps']:.0f} | {u['rps'] / n['rps']:.2f} | " if n else
+                       f"| {name} | {sc} | {u['rps']:.0f} | - | - | ")
+                row += f"router {uc.get('unit_router', 0):.2f} + php {uc.get('unit_php', 0):.2f} | "
+                if n:
+                    nc = n['cpu_ms_per_req']
+                    row += f"nginx {nc.get('nginx', 0):.2f} + fpm {nc.get('fpm', 0):.2f} |\n"
+                else:
+                    row += '- |\n'
+                f.write(row)
         f.write('\n| scenario | server | req/s | p50 ms | p99 ms | errors |\n|---|---|---:|---:|---:|---:|\n')
         for r in extra:
             f.write(f"| {r['scenario']} | {r['server']} | {r['rps']:.0f} | {r['p50_ms']:.2f} | "
                     f"{r['p99_ms']:.2f} | {r['errors']} |\n")
+        if lazy:
+            f.write('\nFirst request (/node/1, page_cache HIT), ms:\n\n'
+                    '| processes | after (re)start, cold OPcache | idle workers | first, warm OPcache | second |\n'
+                    '|---|---:|---:|---:|---:|\n')
+            for r in lazy:
+                f.write(f"| `{json.dumps(r['processes'])}` | {r['cold_after_apply_ms']} | "
+                        f"{r['idle_workers']} | {r['first_ms']} | {r['second_ms']} |\n")
         f.write('\nOPcache/ini as seen by each stack (diag.php):\n\n')
         for k, d in diags.items():
             if k.endswith('/diff'):

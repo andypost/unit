@@ -92,7 +92,7 @@ final class StaticCacheTest extends KernelTestBase {
 
     // Expiry through hook_cron.
     $this->terminate();
-    \Drupal::service('freeunit.static_cache.index')->record($this->file, ['node:1'], time() - 1);
+    \Drupal::service('freeunit.static_cache.index')->record($this->file, ['node:1'], \Drupal::time()->getRequestTime() - 1);
     \Drupal::moduleHandler()->invokeAll('cron');
     $this->assertFileDoesNotExist($this->file);
   }

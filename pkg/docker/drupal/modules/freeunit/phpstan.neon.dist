@@ -1,8 +1,12 @@
+# Run from the site root with the module in web/modules/custom/freeunit.
 parameters:
   level: 6
   paths:
     - .
   fileExtensions: [php, module, install, inc]
   treatPhpDocTypesAsCertain: false
+  # phpstan-drupal does not register core's test namespaces on 12.x.
+  scanDirectories:
+    - ../../../core/tests
   ignoreErrors:
     - identifier: missingType.iterableValue

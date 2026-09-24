@@ -96,7 +96,7 @@ jobs:
 
       - name: phpstan (mglaman/phpstan-drupal, level 6)
         working-directory: ${{ env.SITE }}
-        run: vendor/bin/phpstan analyse --no-progress -c web/modules/custom/freeunit/phpstan.neon.dist
+        run: vendor/bin/phpstan analyse --no-progress --memory-limit=2G -c web/modules/custom/freeunit/phpstan.neon.dist
 
       - name: PHPUnit unit and kernel tests
         working-directory: ${{ env.SITE }}

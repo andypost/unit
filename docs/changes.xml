@@ -10,6 +10,21 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="feature">
+<para>
+"PUT /certificates/&lt;name&gt;" replaces an existing bundle in place.  The
+bundle is written to a temporary file in the certificate store and renamed
+over the old one, so a crash never leaves a half-written certificate.  When
+the current configuration names the bundle, it is applied again before the
+answer: new handshakes get the new certificate, and connections already
+accepted finish with the old one.  An external ACME client can rotate a
+certificate with one request and no restart; see docs/acme.md.  The request
+waits for a reconfiguration in progress, as a configuration change does, and
+the bundle's description is saved only after the file is in place.  The router
+now opens certificates read-only.
+</para>
+</change>
+
 <change type="change">
 <para>
 a certificate bundle whose private key does not belong to its first

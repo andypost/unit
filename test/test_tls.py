@@ -1,4 +1,6 @@
 import io
+import os
+import shutil
 import ssl
 import subprocess
 import time
@@ -6,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import unit_run, unit_stop
 from unit.applications.tls import ApplicationTLS
 from unit.option import option
 
@@ -168,7 +171,6 @@ def test_tls_certificate_remove_nonexisting():
     ), 'remove nonexistings certificate'
 
 
-@pytest.mark.skip('not yet')
 def test_tls_certificate_update():
     client.load('empty')
 
@@ -178,11 +180,199 @@ def test_tls_certificate_update():
 
     cert_old = ssl.get_server_certificate(('127.0.0.1', 8080))
 
-    client.certificate()
+    # PUT on an existing name replaces the bundle in place.  The listener
+    # names it, so the configuration is applied again before the answer.
+    client.certificate('default', False)
+    resp = client.certificate_load('default')
+
+    assert resp.get('success') == 'Certificate chain updated.', 'replaced'
 
     assert cert_old != ssl.get_server_certificate(
         ('127.0.0.1', 8080)
     ), 'update certificate'
+
+    assert 'chain' in client.conf_get('/certificates/default'), 'listed'
+
+
+def test_tls_certificate_update_unused():
+    client.load('empty')
+
+    client.certificate()
+    client.certificate('unused')
+
+    add_tls()
+
+    # A bundle no listener names is stored without a reconfiguration.
+    client.certificate('unused', False)
+    resp = client.certificate_load('unused')
+
+    assert resp.get('success') == 'Certificate chain uploaded.', 'stored'
+
+
+def test_tls_certificate_update_keepalive():
+    client.load('empty')
+
+    client.certificate()
+
+    add_tls()
+
+    (resp, sock) = client.get_ssl(
+        headers={'Host': 'localhost', 'Connection': 'keep-alive'},
+        start=True,
+        read_timeout=1,
+    )
+
+    assert resp['status'] == 200, 'keepalive 1'
+
+    cert_old = sock.getpeercert(True)
+
+    client.certificate('default', False)
+    assert 'success' in client.certificate_load('default'), 'replaced'
+
+    # The accepted connection keeps the context it was accepted with.
+    (resp, sock) = client.get_ssl(
+        headers={'Host': 'localhost', 'Connection': 'close'},
+        sock=sock,
+        start=True,
+    )
+
+    assert resp['status'] == 200, 'keepalive 2'
+    assert sock.getpeercert(True) == cert_old, 'old connection, old cert'
+    sock.close()
+
+    (resp, sock) = client.get_ssl(
+        headers={'Host': 'localhost', 'Connection': 'close'}, start=True
+    )
+
+    assert resp['status'] == 200, 'new connection'
+    assert sock.getpeercert(True) != cert_old, 'new connection, new cert'
+
+
+def test_tls_certificate_update_inflight():
+    client.load('empty')
+
+    client.certificate()
+
+    add_tls()
+
+    # Half of the request is sent before the replacement, the rest after.
+    sock = client.http(
+        b'GET / HTTP/1.1\r\nHost: localhost\r\n',
+        raw=True,
+        no_recv=True,
+        wrapper=client._default_context.wrap_socket,
+    )
+
+    cert_old = sock.getpeercert(True)
+
+    client.certificate('default', False)
+    assert 'success' in client.certificate_load('default'), 'replaced'
+
+    resp = client.http(b'Connection: close\r\n\r\n', raw=True, sock=sock)
+
+    assert resp['status'] == 200, 'in-flight request'
+    assert cert_old != ssl.get_server_certificate(
+        ('127.0.0.1', 8080)
+    ), 'new handshake, new cert'
+
+
+def test_tls_certificate_update_mismatch(skip_alert):
+    skip_alert(r'certificate and private key do not match')
+
+    client.load('empty')
+
+    client.certificate()
+
+    add_tls()
+
+    cert_old = ssl.get_server_certificate(('127.0.0.1', 8080))
+
+    # A bundle with the wrong key is refused, and nothing changes.
+    client.certificate('other', False)
+
+    assert 'error' in client.certificate_load('default', 'other'), 'refused'
+
+    assert cert_old == ssl.get_server_certificate(
+        ('127.0.0.1', 8080)
+    ), 'old certificate still served'
+
+    assert 'chain' in client.conf_get('/certificates/default'), 'still listed'
+
+
+def test_tls_certificate_update_sni():
+    client.load('empty')
+
+    client.certificate('default')
+    client.certificate('localhost')
+
+    add_tls(cert=['default', 'localhost'])
+
+    def peer_cert(host):
+        (resp, sock) = client.get_ssl(
+            headers={'Host': host, 'Connection': 'close'}, start=True
+        )
+
+        assert resp['status'] == 200, host
+        return sock.getpeercert(True)
+
+    default_old = peer_cert('default')
+    localhost_old = peer_cert('localhost')
+
+    assert default_old != localhost_old, 'sni selects the bundle'
+
+    # Replace one element of the array; the other one is untouched.
+    client.certificate('localhost', False)
+    resp = client.certificate_load('localhost')
+
+    assert resp.get('success') == 'Certificate chain updated.', 'replaced'
+
+    assert peer_cert('default') == default_old, 'other element untouched'
+    assert peer_cert('localhost') != localhost_old, 'element replaced'
+
+
+def test_tls_certificate_update_restart():
+    client.certificate()
+
+    # No application: unit_run() expects a restarted instance to report none.
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {"pass": "routes", "tls": {"certificate": "default"}}
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    )
+
+    client.certificate('default', False)
+    assert 'success' in client.certificate_load('default'), 'replaced'
+
+    cert_new = ssl.get_server_certificate(('127.0.0.1', 8080))
+
+    temp_dir_old = option.temp_dir
+    statedir = f'{temp_dir_old}/state'
+
+    # The bundle was renamed into place and nothing is left beside it.
+    assert [
+        name for name in os.listdir(f'{statedir}/certs') if name[0] == '.'
+    ] == [], 'no temporary left'
+
+    unit_stop()
+
+    try:
+        # The fixture owns the new instance from here: it stops it, checks
+        # its log and removes its temp dir.  Only the old one is ours.
+        unit_run(state_dir=statedir)
+
+        assert cert_new == ssl.get_server_certificate(
+            ('127.0.0.1', 8080)
+        ), 'replaced bundle survives a restart'
+
+        assert 'chain' in client.conf_get('/certificates/default'), 'listed'
+
+    finally:
+        unit_stop()
+        shutil.rmtree(temp_dir_old, ignore_errors=True)
 
 
 def test_tls_certificate_key_incorrect(skip_alert):

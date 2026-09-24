@@ -112,14 +112,26 @@ paths:
 
     put:
       operationId: putCertBundle
-      summary: "Create or overwrite the actual certificate bundle"
-      description: "Creates or overwrites the [stored certificate bundle]
-        (https://unit.nginx.org/certificates/) in Unit.  The body is a PEM
-        bundle: the server certificate first, then its chain, then the
-        private key.  A bundle whose key does not belong to the first
-        certificate is refused with 400 `Invalid certificate.`; a name that
-        starts with `.` is reserved and refused with 400
-        `Invalid certificate name.`."
+      summary: "Create or replace the actual certificate bundle"
+      description: "Creates the [stored certificate bundle]
+        (https://unit.nginx.org/certificates/) in Unit, or replaces it in
+        place when the name exists.  The body is a PEM bundle: the server
+        certificate first, then its chain, then the private key.  The
+        bundle is written to a temporary file and renamed over the old
+        one.  When the current configuration names the bundle, the
+        configuration is applied again before the answer, so new
+        handshakes get the new certificate; connections already accepted
+        finish with the old one.  The answer is then
+        `Certificate chain updated.`, otherwise
+        `Certificate chain uploaded.`.  A bundle whose key does not belong
+        to the first certificate is refused with 400
+        `Invalid certificate.`, and the old bundle stays in use; a name
+        that starts with `.` is reserved and refused with 400
+        `Invalid certificate name.`.  500
+        `Certificate stored but not applied.` means the bundle is on disk
+        but the router refused the configuration with it and keeps the old
+        certificate; upload a working bundle again.  Like a configuration
+        change, the request waits for a reconfiguration in progress."
 
       tags:
         - certificates

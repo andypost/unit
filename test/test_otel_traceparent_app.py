@@ -24,7 +24,10 @@ halves are exercised here:
     configured against a throwaway OTLP endpoint, no inbound
     traceparent -- the app must see a freshly generated, valid one.
   - test_traceparent_inherited_with_otel: telemetry configured, inbound
-    traceparent present -- the app must see the same trace id.
+    traceparent present -- the app must see the same trace id, but with
+    FreeUnit's own span id as parent-id (not the inbound parent-id), so
+    that the app's spans become children of FreeUnit's span rather than
+    siblings of it.
 
 The otel-dependent tests skip cleanly (never fail) when the binary was
 not built with --otel, exactly like test_otel.py's own tests.
@@ -142,7 +145,11 @@ def test_traceparent_generated_when_missing_with_otel():
 
 def test_traceparent_inherited_with_otel():
     """Telemetry configured, inbound traceparent present: the app must see
-    the same trace id it was sent (span continuation, not a new trace)."""
+    the same trace id it was sent (span continuation, not a new trace), but
+    with FreeUnit's own span id as parent-id rather than the client's
+    original parent-id -- otherwise the app's spans (e.g. Drupal/Gander,
+    the OTel PHP SDK) become siblings of FreeUnit's span instead of its
+    children."""
     client.load('traceparent')
     _configure_telemetry_or_skip()
 
@@ -157,3 +164,7 @@ def test_traceparent_inherited_with_otel():
     assert seen, 'app must see a traceparent header at all'
     assert TRACEPARENT_RE.match(seen), f'not a valid traceparent: {seen!r}'
     assert TRACE_ID in seen, 'trace id must be inherited, not replaced'
+    assert PARENT_ID not in seen, (
+        'the app must see FreeUnit\'s own span id as parent-id, not the '
+        'client-supplied parent-id it sent in'
+    )

@@ -213,7 +213,6 @@ def run(request):
 
     option.skip_alerts = [
         r'read signalfd\(4\) failed',
-        r'sendmsg.+failed',
         r'recvmsg.+failed',
     ]
     option.skip_sanitizer = False

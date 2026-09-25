@@ -1,6 +1,14 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Feature: a "match" rule can require that a header, cookie or
+       argument is absent. In "headers", "cookies" and "arguments", the
+       value null matches only a request that has no field with this name;
+       a field with an empty value is present. A pattern, including a
+       negated one, still never matches an absent field, so existing
+       configurations behave as before. For "absent or not X", use an
+       array of objects: [{"Name": null}, {"Name": "!X"}].
+
     *) Bugfix: an application worker that served a WebSocket upgrade never
        became idle again. The router counts a session on the worker and
        keeps a worker with a session out of the idle queues, but nothing

@@ -19,6 +19,9 @@ nxt_conf_value_t *nxt_cert_info_get(nxt_str_t *name);
 nxt_conf_value_t *nxt_cert_info_get_all(nxt_mp_t *mp);
 nxt_int_t nxt_cert_info_delete(nxt_str_t *name);
 
+/* A stored bundle is a chain plus a key; 1 MiB holds hundreds of them. */
+#define NXT_CERT_STORE_MAX_SIZE  (1024 * 1024)
+
 nxt_array_t *nxt_cert_store_load(nxt_task_t *task, nxt_mp_t *mem_pool);
 void nxt_cert_store_release(nxt_array_t *certs);
 

@@ -23,9 +23,6 @@
 /* The buffer X509_NAME_get_text_by_NID() used to be given, less the NUL. */
 #define NXT_CERT_NAME_TEXT_MAX  255
 
-/* A stored bundle is a chain plus a key; 1 MiB holds hundreds of them. */
-#define NXT_CERT_STORE_MAX_SIZE  (1024 * 1024)
-
 /*
  * The X509 name accessors were constified in stages, and not together:
  * X509_NAME_get_entry() and X509_NAME_ENTRY_get_data() took const arguments
@@ -1428,14 +1425,12 @@ fail:
 void
 nxt_cert_store_put_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
-    void                 *mem;
     size_t               size, used;
-    u_char               *p, *path;
+    u_char               *p, *path, *mem;
     nxt_str_t            name;
     nxt_file_t           file;
     nxt_port_t           *port;
     nxt_runtime_t        *rt;
-    nxt_file_info_t      fi;
     nxt_port_msg_type_t  type;
 
     port = nxt_runtime_port_find(task->thread->runtime,
@@ -1452,8 +1447,7 @@ nxt_cert_store_put_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     rt = task->thread->runtime;
 
     path = NULL;
-    mem = MAP_FAILED;
-    size = 0;
+    mem = NULL;
     type = NXT_PORT_MSG_RPC_ERROR;
 
     if (nxt_slow_path(rt->certs.start == NULL)) {
@@ -1487,21 +1481,27 @@ nxt_cert_store_put_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     nxt_memcpy(&size, p + 1, sizeof(size_t));
 
-    /* Never map past the segment: a short one would raise SIGBUS in main. */
-
-    nxt_memzero(&file, sizeof(nxt_file_t));
-    file.fd = msg->fd[0];
-
-    if (nxt_slow_path(size == 0 || size > NXT_CERT_STORE_MAX_SIZE
-                      || nxt_file_info(&file, &fi) != NXT_OK
-                      || (nxt_off_t) size > nxt_file_size(&fi)))
-    {
+    if (nxt_slow_path(size == 0 || size > NXT_CERT_STORE_MAX_SIZE)) {
         nxt_alert(task, "cert_store_handler: invalid bundle size %uz", size);
         goto done;
     }
 
-    mem = nxt_mem_mmap(NULL, size, PROT_READ, MAP_SHARED, msg->fd[0], 0);
-    if (nxt_slow_path(mem == MAP_FAILED)) {
+    /*
+     * A copy, not a mapping: the controller keeps the segment and could
+     * shrink it under a mapping, and a read past its end would be SIGBUS
+     * in main.  pread() only fails.  The size is capped above.
+     */
+
+    mem = nxt_malloc(size);
+    if (nxt_slow_path(mem == NULL)) {
+        goto done;
+    }
+
+    nxt_memzero(&file, sizeof(nxt_file_t));
+    file.fd = msg->fd[0];
+
+    if (nxt_slow_path(nxt_file_read(&file, mem, size, 0) != (ssize_t) size)) {
+        nxt_alert(task, "cert_store_handler: short bundle read");
         goto done;
     }
 
@@ -1536,10 +1536,7 @@ done:
     (void) nxt_port_socket_write(task, port, type, -1, msg->port_msg.stream,
                                  0, NULL);
 
-    if (mem != MAP_FAILED) {
-        nxt_mem_munmap(mem, size);
-    }
-
+    nxt_free(mem);
     nxt_free(path);
     nxt_port_recv_msg_close_fds(msg);
 }

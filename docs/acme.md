@@ -8,8 +8,7 @@ the bundle in place, and a listener that names it is applied again.
 Connections already accepted finish with the old certificate; new
 handshakes get the new one.
 
-The design rationale is in [ADR 0006](adr/0006-acme.md); this page is the
-operator-facing recipe.
+This page is the operator-facing recipe.
 
 ## What the control API does
 

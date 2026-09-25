@@ -21,7 +21,8 @@ accepted finish with the old one.  An external ACME client can rotate a
 certificate with one request and no restart; see docs/acme.md.  The request
 waits for a reconfiguration in progress, as a configuration change does, and
 the bundle's description is saved only after the file is in place.  The router
-now opens certificates read-only.
+now opens certificates read-only.  A bundle over 1 MiB is refused with
+413.
 </para>
 </change>
 

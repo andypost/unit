@@ -21,7 +21,6 @@ struct nxt_port_handlers_s {
     nxt_port_handler_t  conf_store;
     nxt_port_handler_t  cert_get;
     nxt_port_handler_t  cert_delete;
-    nxt_port_handler_t  cert_store;
     nxt_port_handler_t  script_get;
     nxt_port_handler_t  script_delete;
     nxt_port_handler_t  access_log;
@@ -72,6 +71,9 @@ struct nxt_port_handlers_s {
      * inserting or reordering a slot renumbers the wire protocol.
      */
     nxt_port_handler_t  detached;
+
+    /* A certificate bundle for main to store; appended, see above. */
+    nxt_port_handler_t  cert_store;
 };
 
 
@@ -98,7 +100,6 @@ typedef enum {
     _NXT_PORT_MSG_CONF_STORE      = nxt_port_handler_idx(conf_store),
     _NXT_PORT_MSG_CERT_GET        = nxt_port_handler_idx(cert_get),
     _NXT_PORT_MSG_CERT_DELETE     = nxt_port_handler_idx(cert_delete),
-    _NXT_PORT_MSG_CERT_STORE      = nxt_port_handler_idx(cert_store),
     _NXT_PORT_MSG_SCRIPT_GET      = nxt_port_handler_idx(script_get),
     _NXT_PORT_MSG_SCRIPT_DELETE   = nxt_port_handler_idx(script_delete),
     _NXT_PORT_MSG_ACCESS_LOG      = nxt_port_handler_idx(access_log),
@@ -131,6 +132,7 @@ typedef enum {
     _NXT_PORT_MSG_READ_SOCKET     = nxt_port_handler_idx(read_socket),
 
     _NXT_PORT_MSG_DETACHED        = nxt_port_handler_idx(detached),
+    _NXT_PORT_MSG_CERT_STORE      = nxt_port_handler_idx(cert_store),
 
     NXT_PORT_MSG_MAX              = sizeof(nxt_port_handlers_t)
                                     / sizeof(nxt_port_handler_t),
@@ -145,7 +147,6 @@ typedef enum {
     NXT_PORT_MSG_CONF_STORE       = nxt_msg_last(_NXT_PORT_MSG_CONF_STORE),
     NXT_PORT_MSG_CERT_GET         = nxt_msg_last(_NXT_PORT_MSG_CERT_GET),
     NXT_PORT_MSG_CERT_DELETE      = nxt_msg_last(_NXT_PORT_MSG_CERT_DELETE),
-    NXT_PORT_MSG_CERT_STORE       = nxt_msg_last(_NXT_PORT_MSG_CERT_STORE),
     NXT_PORT_MSG_SCRIPT_GET       = nxt_msg_last(_NXT_PORT_MSG_SCRIPT_GET),
     NXT_PORT_MSG_SCRIPT_DELETE    = nxt_msg_last(_NXT_PORT_MSG_SCRIPT_DELETE),
     NXT_PORT_MSG_ACCESS_LOG       = nxt_msg_last(_NXT_PORT_MSG_ACCESS_LOG),
@@ -178,6 +179,7 @@ typedef enum {
     NXT_PORT_MSG_READ_QUEUE       = _NXT_PORT_MSG_READ_QUEUE,
     NXT_PORT_MSG_READ_SOCKET      = _NXT_PORT_MSG_READ_SOCKET,
     NXT_PORT_MSG_DETACHED         = nxt_msg_last(_NXT_PORT_MSG_DETACHED),
+    NXT_PORT_MSG_CERT_STORE       = nxt_msg_last(_NXT_PORT_MSG_CERT_STORE),
 } nxt_port_msg_type_t;
 
 

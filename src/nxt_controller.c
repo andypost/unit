@@ -1948,6 +1948,11 @@ nxt_controller_process_cert(nxt_task_t *task,
     }
 
     if (nxt_str_eq(&req->parser.method, "PUT", 3)) {
+        /* Main refuses more than this; say so here instead of a 500. */
+        if (nxt_buf_mem_used_size(&c->read->mem) > NXT_CERT_STORE_MAX_SIZE) {
+            goto too_large;
+        }
+
         cert = nxt_cert_mem(task, &c->read->mem);
         if (cert == NULL) {
             goto invalid_cert;
@@ -2010,6 +2015,15 @@ invalid_cert:
 
     resp.status = 400;
     resp.title = (u_char *) "Invalid certificate.";
+    resp.offset = -1;
+
+    nxt_controller_response(task, req, &resp);
+    return;
+
+too_large:
+
+    resp.status = 413;
+    resp.title = (u_char *) "Certificate bundle is too large.";
     resp.offset = -1;
 
     nxt_controller_response(task, req, &resp);
@@ -2811,6 +2825,10 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
 
     case 405:
         nxt_str_set(&status_line, "405 Method Not Allowed");
+        break;
+
+    case 413:
+        nxt_str_set(&status_line, "413 Payload Too Large");
         break;
 
     default:

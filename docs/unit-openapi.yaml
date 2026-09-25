@@ -127,7 +127,8 @@ paths:
         to the first certificate is refused with 400
         `Invalid certificate.`, and the old bundle stays in use; a name
         that starts with `.` is reserved and refused with 400
-        `Invalid certificate name.`.  500
+        `Invalid certificate name.`; a bundle over 1 MiB is refused with
+        413 `Certificate bundle is too large.`.  500
         `Certificate stored but not applied.` means the bundle is on disk
         but the router refused the configuration with it and keeps the old
         certificate; upload a working bundle again.  Like a configuration

@@ -375,6 +375,20 @@ def test_tls_certificate_update_restart():
         shutil.rmtree(temp_dir_old, ignore_errors=True)
 
 
+def test_tls_certificate_too_large():
+    client.load('empty')
+
+    # Over the store's 1 MiB cap: refused by the controller, not by main.
+    resp = client.put(
+        **client._get_args('/certificates/big', b'-' * (1024 * 1024 + 1))
+    )
+
+    assert resp['status'] == 413, resp['body']
+    assert 'too large' in resp['body'], 'too large message'
+
+    assert 'error' in client.conf_get('/certificates/big'), 'not stored'
+
+
 def test_tls_certificate_key_incorrect(skip_alert):
     skip_alert(r'certificate and private key do not match')
 

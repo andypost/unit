@@ -1,0 +1,35 @@
+static_cache:
+  enabled: false
+  directory: /var/lib/drupal-freeunit/page-cache
+  # Host names the FreeUnit route serves from the cache; nothing is written
+  # for any other Host header.
+  hosts: []
+  # Scheme the router sees for those hosts (http behind a TLS-terminating
+  # proxy); the file tree is <directory>/<scheme>/<host>.
+  scheme: http
+  gzip: true
+  max_bytes: 2097152
+  # The response headers the route sends with every cached page, exactly as
+  # Drupal sends them for an anonymous page.  A page whose response has any
+  # other value for one of them, or any header not listed here and not in
+  # StaticCacheWriter::DROPPED, is not written.  Cache-Control must match
+  # system.performance cache.page.max_age; Content-Language the default
+  # language.
+  headers:
+    cache-control: 'max-age=300, public'
+    content-language: en
+    content-type: 'text/html; charset=utf-8'
+    expires: 'Sun, 19 Nov 1978 05:00:00 GMT'
+    vary: Cookie
+    x-content-type-options: nosniff
+    x-frame-options: SAMEORIGIN
+control:
+  socket: /var/run/control.unit.sock
+  application: drupal
+  target: index
+cron:
+  schedule_name: drupal-cron
+  interval: 300
+  jitter: 30
+  timeout: 240
+  host: ''

@@ -1,0 +1,56 @@
+<?php
+
+/**
+ * @file
+ * Install and uninstall functions for freeunit.
+ *
+ * UNVERIFIED PROTOTYPE: never installed on a Drupal site.  The status report
+ * rows are in src/Hook/FreeUnitHooks.php (hook_runtime_requirements).
+ */
+
+declare(strict_types=1);
+
+/**
+ * Implements hook_schema().
+ */
+function freeunit_schema(): array {
+  return [
+    'freeunit_static_cache' => [
+      'description' => 'Cache tags of the files in the FreeUnit static page cache.',
+      'fields' => [
+        'file' => [
+          'type' => 'varchar',
+          'length' => 1024,
+          'not null' => TRUE,
+          'description' => 'Absolute path of the cached page (the .gz variant is implied).',
+        ],
+        'tag' => [
+          'type' => 'varchar_ascii',
+          'length' => 255,
+          'not null' => TRUE,
+        ],
+        'expire' => [
+          'type' => 'int',
+          'not null' => TRUE,
+          'default' => 0,
+          'description' => 'Unix time after which cron deletes the file; 0 = until invalidated.',
+        ],
+      ],
+      'indexes' => [
+        'tag' => ['tag'],
+        'file' => [['file', 191]],
+        'expire' => ['expire'],
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_uninstall().
+ *
+ * Without this the router would keep serving the files, never invalidated,
+ * until someone deletes them by hand.
+ */
+function freeunit_uninstall(): void {
+  \Drupal::service('freeunit.static_cache.invalidator')->uninstall();
+}

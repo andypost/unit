@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<ruleset name="freeunit">
+  <description>Drupal coding standards, minus docblock completeness: the code comments why, not what every parameter is.</description>
+  <file>.</file>
+  <arg name="extensions" value="php,module,inc,install,info,yml,md"/>
+  <rule ref="Drupal">
+    <exclude name="Drupal.Commenting.FunctionComment.Missing"/>
+    <exclude name="Drupal.Commenting.FunctionComment.MissingParamComment"/>
+    <exclude name="Drupal.Commenting.FunctionComment.MissingReturnComment"/>
+    <exclude name="Drupal.Commenting.FunctionComment.ParamMissingDefinition"/>
+    <exclude name="Drupal.Commenting.VariableComment.Missing"/>
+    <exclude name="Drupal.Commenting.DocComment.MissingShort"/>
+    <exclude name="Drupal.Commenting.DocComment.ShortSingleLine"/>
+    <exclude name="Drupal.Files.TxtFileLineLength.TooLong"/>
+  </rule>
+  <rule ref="DrupalPractice">
+    <!-- /freeunit/cron: CronController answers 404 unless keyed and loopback. -->
+    <exclude name="DrupalPractice.Yaml.RoutingAccess.OpenCallback"/>
+  </rule>
+</ruleset>

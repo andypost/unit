@@ -1381,7 +1381,17 @@ nxt_h2p_on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
     switch (frame->hd.type) {
 
     case NGHTTP2_HEADERS:
-        nxt_h2p_conn_progress(h2c);
+        /*
+         * A complete request header block, or trailers that end the
+         * stream: each can come only once per stream.  nghttp2 resets a
+         * stream on trailers without END_STREAM before this callback, so
+         * a HEADERS frame cannot refresh the timer again and again.
+         */
+        if (frame->headers.cat == NGHTTP2_HCAT_REQUEST
+            || (frame->hd.flags & NGHTTP2_FLAG_END_STREAM))
+        {
+            nxt_h2p_conn_progress(h2c);
+        }
 
         stream = nghttp2_session_get_stream_user_data(session,
                                                       frame->hd.stream_id);
@@ -1410,7 +1420,13 @@ nxt_h2p_on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
         break;
 
     case NGHTTP2_DATA:
-        nxt_h2p_conn_progress(h2c);
+        /*
+         * Only payload is progress, and nxt_h2p_on_data_chunk_recv()
+         * records it as it arrives.  An empty or padding-only DATA frame
+         * does not move the body on, so it must not refresh the timer:
+         * else a client could hold an incomplete body forever with one
+         * such frame before each body_read_timeout.
+         */
 
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
             stream = nghttp2_session_get_stream_user_data(session,
@@ -1594,6 +1610,7 @@ nxt_h2p_on_data_chunk_recv(nghttp2_session *session, uint8_t flags,
     nxt_h2p_stream_t    *stream;
     nxt_http_request_t  *r;
 
+    /* nghttp2 calls this only for payload bytes, never for padding. */
     nxt_h2p_conn_progress(user_data);
 
     stream = nghttp2_session_get_stream_user_data(session, stream_id);

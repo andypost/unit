@@ -527,7 +527,10 @@ nxt_http_var_response_connection(nxt_task_t *task, nxt_str_t *str, void *ctx,
 
     r = ctx;
 
-    /* Only h1 has a connection; a schedule's request has none. */
+    /*
+     * Only h1 has a connection; a schedule's request has none, and
+     * HTTP/2 has no "Connection" field (RFC 9113, 8.2.2).
+     */
     if (r->protocol != NXT_HTTP_PROTO_H1) {
         nxt_str_null(str);
         return NXT_OK;
@@ -603,6 +606,7 @@ nxt_http_var_response_transfer_encoding(nxt_task_t *task, nxt_str_t *str,
 
     r = ctx;
 
+    /* HTTP/2 frames the body itself and sends no "Transfer-Encoding". */
     if (r->protocol == NXT_HTTP_PROTO_H1 && r->proto.h1->chunked) {
         nxt_str_set(str, "chunked");
 

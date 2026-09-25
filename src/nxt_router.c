@@ -15,6 +15,9 @@
 #include <nxt_script.h>
 #endif
 #include <nxt_http.h>
+#if (NXT_HAVE_NGHTTP2)
+#include <nxt_h2proto.h>
+#endif
 #include <nxt_port_memory_int.h>
 #include <nxt_unit_request.h>
 #include <nxt_unit_response.h>
@@ -2666,6 +2669,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     static const nxt_str_t  conf_timeout_path =
                                 nxt_string("/tls/session/timeout");
     static const nxt_str_t  conf_tickets = nxt_string("/tls/session/tickets");
+    static const nxt_str_t  conf_http2 = nxt_string("/tls/http2");
 #endif
 #if (NXT_HAVE_NJS)
     static const nxt_str_t  js_module_path = nxt_string("/settings/js_module");
@@ -3094,6 +3098,10 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
                 tls_init->tickets_conf = nxt_conf_get_path(listener,
                                                            &conf_tickets);
+
+                value = nxt_conf_get_path(listener, &conf_http2);
+                tls_init->http2 = (value != NULL
+                                   && nxt_conf_get_boolean(value));
 
                 n = nxt_conf_array_elements_count_or_1(certificate);
 
@@ -4060,6 +4068,7 @@ nxt_router_tls_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 
     tls->tls_init->conf = tlscf;
+    tlscf->http2 = tls->tls_init->http2;
 
     bundle = nxt_mp_get(mp, sizeof(nxt_tls_bundle_conf_t));
     if (nxt_slow_path(bundle == NULL)) {
@@ -4901,6 +4910,11 @@ nxt_router_listen_socket_update(nxt_task_t *task, void *obj, void *data)
     lev->socket.data = joint;
     lev->listen = joint->socket_conf->listen;
 
+#if (NXT_HAVE_NGHTTP2)
+    /* HTTP/2 connections leave the old configuration with GOAWAY. */
+    nxt_h2p_conns_drain(&engine->task, engine);
+#endif
+
     nxt_router_conf_wait_post(job);
 
     /*
@@ -4954,6 +4968,10 @@ nxt_router_worker_thread_quit(nxt_task_t *task, void *obj, void *data)
     engine = task->thread->engine;
 
     engine->shutdown = 1;
+
+#if (NXT_HAVE_NGHTTP2)
+    nxt_h2p_conns_drain(&engine->task, engine);
+#endif
 
     /*
      * Give the reference nxt_router_engine_quit() took back.  The task this
@@ -5046,6 +5064,10 @@ nxt_router_listen_socket_close(nxt_task_t *task, void *obj, void *data)
         if (nxt_fd_event_is_active(lev->socket.read)) {
             nxt_fd_event_disable_read(engine, &lev->socket);
         }
+
+#if (NXT_HAVE_NGHTTP2)
+        nxt_h2p_conns_drain(&engine->task, engine);
+#endif
     }
 
     /*

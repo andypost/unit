@@ -1,8 +1,12 @@
 id: narrowing-to-proto
 valid:
   - |
-    void f(nxt_buf_t *b, uint32_t *out) {
-        nxt_size_to_uint32(b->len, out);
+    nxt_int_t f(nxt_buf_t *b, uint32_t *out) {
+        if (b->len > UINT32_MAX) {
+            return NXT_ERROR;
+        }
+        *out = b->len;
+        return NXT_OK;
     }
 invalid:
   - |

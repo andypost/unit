@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check_baseline import new_violations  # noqa: E402
+from check_baseline import new_violations, stale_entries  # noqa: E402
 
 
 def entry(line, text='memcpy(a, b, n)', rule='memcpy-computed-size'):
@@ -29,6 +29,14 @@ def test_second_copy_of_known_violation_is_new():
 def test_two_copies_need_two_entries():
     assert new_violations([entry(10), entry(20)],
                           [entry(12), entry(22)]) == []
+
+
+def test_matched_entries_are_not_stale():
+    assert stale_entries([entry(10)], [entry(12)]) == []
+
+
+def test_fixed_violation_leaves_a_stale_entry():
+    assert stale_entries([entry(10)], [entry(12), entry(22)]) == [entry(22)]
 
 
 if __name__ == '__main__':

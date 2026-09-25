@@ -10,7 +10,7 @@
 set -eu
 
 BENCH="${1:-build}/queue_bench"
-shift 2>/dev/null || true
+[ $# -gt 0 ] && shift
 
 if [ ! -x "$BENCH" ]; then
     echo "error: $BENCH not found; ./configure --tests && make tests" >&2

@@ -129,7 +129,7 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
 
     qi = (nxt_app_queue_item_t *) &q->items[i];
 
-    NXT_USDT(queue__dequeue, i);
+    NXT_USDT(queue__dequeue, i, qi->tracking);
 
     /*
      * qi lives in shared memory that the peer can write.  Cap qi->size at

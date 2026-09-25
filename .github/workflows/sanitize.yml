@@ -30,6 +30,7 @@ on:
       - '.github/workflows/sanitize.yml'
       - '.github/scripts/check-sanitizer-reports.sh'
       - '.github/sanitizer-allowlist.txt'
+      - '.github/lsan-h2-leak.supp'
   push:
     # master is the release/default branch; pre-* are the release-prep
     # integration branches (e.g. pre-1.35.6) where the hardening actually
@@ -52,6 +53,7 @@ on:
       - '.github/workflows/sanitize.yml'
       - '.github/scripts/check-sanitizer-reports.sh'
       - '.github/sanitizer-allowlist.txt'
+      - '.github/lsan-h2-leak.supp'
 
 concurrency:
   # Cancel superseded runs for the same pull request.  Non-PR events fall back
@@ -345,6 +347,39 @@ jobs:
           fi
           python3 -m pytest -v --save-log ${{ matrix.pytest_opts }} \
             ${{ matrix.tests }} | tee "${RUNNER_TEMP}/pytest.out"
+
+      # test_http2_fail_before_body_leak finds a leaked request pool that
+      # only LeakSanitizer sees, at process exit, and it skips itself unless
+      # ASAN_OPTIONS has detect_leaks=1.  The run above has detect_leaks=0,
+      # so this step runs that one test again with leak detection on.
+      #   TMPDIR
+      #     its own directory: the other processes still report their own
+      #     leaks at the test's unit_stop(), which the test ignores, and the
+      #     "Fail on sanitizer reports" step below must not scan them.
+      #   LSAN_OPTIONS
+      #     .github/lsan-h2-leak.supp waives a leak that every unitd process
+      #     has at exit; see that file for why each entry is there.
+      #   PASSED
+      #     a skip exits 0, and a skipped test proves nothing.
+      - name: Run the HTTP/2 leak regression with leak detection
+        if: contains(matrix.core_opts, '--h2')
+        env:
+          ASAN_OPTIONS: "detect_leaks=1"
+          LSAN_OPTIONS: "suppressions=${{ github.workspace }}/.github/lsan-h2-leak.supp"
+          UBSAN_OPTIONS: "print_stacktrace=1"
+          TMPDIR: ${{ runner.temp }}/h2-leak
+        run: |
+          set -o pipefail
+          mkdir -p "$TMPDIR"
+          out="${RUNNER_TEMP}/pytest-h2-leak.out"
+          python3 -m pytest -v --save-log --restart \
+            -k test_http2_fail_before_body_leak test/test_http2.py \
+            | tee "$out"
+          if ! grep -qE 'test_http2_fail_before_body_leak PASSED' "$out"; then
+            echo "::error::test_http2_fail_before_body_leak did not pass;" \
+                 "it must run, not skip, with detect_leaks=1."
+            exit 1
+          fi
 
       # A leg in which every test skipped exits 0, writes clean logs, and is
       # therefore green -- indistinguishable from one that ran and passed.

@@ -118,11 +118,37 @@ nxt_h2p_fuzz_drain_wq(nxt_work_queue_t *wq)
 
 
 /*
+ * Fires whatever timer is due right now -- and only that one: nxt_conn_
+ * close_handler() arms c->write_timer with a 0ms delay when nxt_fd_event_
+ * close() reports the fd's epoll registration is not torn down yet (real
+ * with a real socket, once nxt_h2p_conn_read()'s tail nxt_conn_read() has
+ * armed it for a future read -- unlike a connection nxt_h2p_conn_leaving()
+ * drains at once, which never gets that far).  Without processing this
+ * timer, that close never reaches nxt_h1p_conn_free() and the connection
+ * -- and the joint reference nxt_h2p_conn_cleanup() would have released --
+ * leaks for real.  nxt_timer_find() returns the minimum enabled timer's
+ * delay without advancing engine->timers.now; only ever expiring a delay
+ * of exactly 0 here means idle_timeout, send_timeout and the progress
+ * timer (all armed well in the future) are never force-fired -- this
+ * harness still does not drive wall-clock timeouts.
+ */
+
+static void
+nxt_h2p_fuzz_drain_timers(nxt_event_engine_t *engine)
+{
+    if (nxt_timer_find(engine) == 0) {
+        nxt_timer_expire(engine, engine->timers.now);
+    }
+}
+
+
+/*
  * Drains every engine work queue this harness can reach, repeatedly: one
  * pass can requeue onto another queue (a write completion re-arming a read,
- * say), so this keeps going until a full pass moves nothing.  Capped
- * generously against a harness bug turning into a hang rather than a slow
- * finding; the real state machine converges in a handful of rounds.
+ * or nxt_h2p_fuzz_drain_timers() queuing a due timer's handler, say), so
+ * this keeps going until a full pass moves nothing.  Capped generously
+ * against a harness bug turning into a hang rather than a slow finding;
+ * the real state machine converges in a handful of rounds.
  */
 
 static void
@@ -134,6 +160,7 @@ nxt_h2p_fuzz_drain_engine(nxt_event_engine_t *engine)
     for (round = 0; round < 64; round++) {
         before = engine->connections + engine->closed_conns_cnt;
 
+        nxt_h2p_fuzz_drain_timers(engine);
         nxt_h2p_fuzz_drain_wq(&engine->fast_work_queue);
         nxt_h2p_fuzz_drain_wq(&engine->read_work_queue);
         nxt_h2p_fuzz_drain_wq(&engine->write_work_queue);
@@ -145,6 +172,15 @@ nxt_h2p_fuzz_drain_engine(nxt_event_engine_t *engine)
 
         after = engine->connections + engine->closed_conns_cnt;
 
+        /*
+         * A round that only armed a 0ms timer (nxt_conn_close_handler(),
+         * once its socket and timer housekeeping leaves events or timers
+         * pending) moves nothing on this pass -- every queue empty,
+         * before == after -- but has real work waiting for the very next
+         * round's nxt_h2p_fuzz_drain_timers() call.  Declaring convergence
+         * here would leave it stranded, and the connection (and the joint
+         * reference tied to it) would leak for real.
+         */
         if (engine->fast_work_queue.head == NULL
             && engine->read_work_queue.head == NULL
             && engine->write_work_queue.head == NULL
@@ -153,7 +189,8 @@ nxt_h2p_fuzz_drain_engine(nxt_event_engine_t *engine)
             && engine->close_work_queue.head == NULL
             && engine->accept_work_queue.head == NULL
             && engine->connect_work_queue.head == NULL
-            && before == after)
+            && before == after
+            && nxt_timer_find(engine) != 0)
         {
             return;
         }
@@ -223,17 +260,20 @@ LLVMFuzzerInitialize(int *argc, char ***argv)
      * iteration -- the fields nxt_h2proto.c actually reads (limits,
      * timeouts, the temp path) do not change between inputs.
      *
-     * joint.count is pinned at 1 for the harness's own lifetime.  Production
-     * increments it once per stream (nxt_h2p_on_begin_headers()) and drops
-     * it back on close (nxt_h2p_request_close(), via
-     * nxt_router_conf_release()): starting at 1 means every request this
-     * fuzzer drives to completion returns it to exactly 1, and count never
-     * reaches 0 -- nxt_router_conf_release()'s branch below that point
-     * reaches into a real nxt_router_conf_t/nxt_router_t this harness does
-     * not have.  A leaked stream (a harness bug, not a target bug) would
-     * show up as later iterations' requests never reaching action/error
-     * handling, not as a crash -- which is why LLVMFuzzerTestOneInput()
-     * aborts if the count is not back to 1 once an iteration is done.
+     * joint.count is pinned at 1 at rest, between iterations.  Production
+     * takes two more references and drops each back: one per connection
+     * (nxt_h2p_conn_init(), dropped by nxt_h2p_conn_cleanup() when
+     * c->mem_pool is destroyed -- see LLVMFuzzerTestOneInput()) and one per
+     * stream (nxt_h2p_on_begin_headers(), dropped by
+     * nxt_h2p_request_close(), both via nxt_router_conf_release()).
+     * Starting at 1 means every iteration this fuzzer drives to completion
+     * returns it to exactly 1, and count never reaches 0 --
+     * nxt_router_conf_release()'s branch below that point reaches into a
+     * real nxt_router_conf_t/nxt_router_t this harness does not have.  A
+     * leaked reference (a harness bug, not a target bug) would show up as
+     * later iterations' requests never reaching action/error handling, not
+     * as a crash -- which is why LLVMFuzzerTestOneInput() aborts if the
+     * count is not back to 1 once an iteration is done.
      */
     nxt_memzero(&nxt_h2p_fuzz_skcf, sizeof(nxt_socket_conf_t));
     nxt_memzero(&nxt_h2p_fuzz_joint, sizeof(nxt_socket_conf_joint_t));
@@ -413,13 +453,54 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     nxt_queue_init(&h2c->streams);
 
     /*
+     * h2c->joint stands in for nxt_h2p_conn_init()'s own joint = c->listen->
+     * socket.data: nxt_h2p_conn_leaving() (drain) compares the two, and
+     * nxt_h2p_conn_cleanup() (registered right below, exactly as
+     * nxt_h2p_conn_init() does) releases this same reference through
+     * nxt_router_conf_release() when c->mem_pool is destroyed -- from
+     * nxt_h2p_fuzz_conn_abandon()'s nxt_conn_free() on every early-failure
+     * path below, or from the real close chain's nxt_conn_free() on the
+     * normal path.  Without h2c->joint set, it stays NULL from nxt_mp_zget(),
+     * always differs from c->listen->socket.data, and nxt_h2p_conn_leaving()
+     * is true from the first read: every connection would drain immediately,
+     * skipping most of nxt_h2proto.c's request-handling code.
+     */
+    h2c->joint = &nxt_h2p_fuzz_joint;
+
+    if (nxt_mp_cleanup(c->mem_pool, nxt_h2p_conn_cleanup, &engine->task, h2c,
+                       NULL)
+        != NXT_OK)
+    {
+        h2c->joint = NULL;
+        close(sv[0]);
+        close(sv[1]);
+        nxt_h2p_fuzz_conn_abandon(engine, c);
+        return 0;
+    }
+
+    /*
+     * Paired with nxt_h2p_conn_cleanup()'s nxt_router_conf_release() above:
+     * nxt_h2p_conn_init() increments joint->count immediately after
+     * registering that same cleanup, before anything that can fail, so
+     * every path from here on (this harness's early-failure gotos included)
+     * reaches the cleanup with the increment already done.  See the
+     * LLVMFuzzerTestOneInput()-top comment on nxt_h2p_fuzz_joint.count for
+     * why it never reaches 0.
+     */
+    nxt_h2p_fuzz_joint.count++;
+
+    /*
      * A session_create() failure past nghttp2_session_server_new2() leaks
      * h2c->session unless the caller deletes it -- nxt_h2p_conn_init() does
-     * exactly this in its own fail: label, which this mirrors.
+     * exactly this in its own fail: label.  h2c->session = NULL afterwards
+     * matters now that nxt_h2p_conn_cleanup() is registered: it deletes the
+     * session too if this harness has not already, and would double-free
+     * it otherwise once c->mem_pool is destroyed below.
      */
     if (nxt_h2p_session_create(&c->task, h2c, &nxt_h2p_fuzz_skcf) != NXT_OK) {
         if (h2c->session != NULL) {
             nghttp2_session_del(h2c->session);
+            h2c->session = NULL;
         }
 
         close(sv[1]);
@@ -432,6 +513,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     b = nxt_buf_mem_alloc(c->mem_pool, NXT_H2P_READ_BUFFER_SIZE, 0);
     if (b == NULL) {
         nghttp2_session_del(h2c->session);
+        h2c->session = NULL;
         close(sv[1]);
         c->socket.fd = -1;
         close(sv[0]);

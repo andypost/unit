@@ -2358,7 +2358,11 @@ nxt_h2p_stream_drain(nxt_task_t *task, nxt_h2p_stream_t *stream)
  * The nghttp2 data provider: copies the response chain into a DATA frame.
  * A drained buffer is completed through the work queue, so a static file
  * refill or a memory buffer release runs after nghttp2 returns.  The last
- * (sync) buffer ends the stream; its completion ends the request.
+ * (sync) buffer ends the stream; its completion ends the request.  Empty
+ * and sync buffers after the data are taken in the same call even when the
+ * data fill "length": nghttp2 does not call the provider while the window
+ * is 0, so a response that fills the window exactly would otherwise wait
+ * for a WINDOW_UPDATE only to send END_STREAM.
  */
 
 static ssize_t
@@ -2380,14 +2384,20 @@ nxt_h2p_data_read(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
 
     copied = 0;
 
-    while (copied < length) {
+    for ( ;; ) {
         b = stream->out;
 
         if (b == NULL) {
             break;
         }
 
-        if (!nxt_buf_is_sync(b) && nxt_buf_is_mem(b)) {
+        if (!nxt_buf_is_sync(b) && nxt_buf_is_mem(b)
+            && nxt_buf_mem_used_size(&b->mem) != 0)
+        {
+            if (copied == length) {
+                break;
+            }
+
             size = nxt_min(length - copied,
                            (size_t) nxt_buf_mem_used_size(&b->mem));
 

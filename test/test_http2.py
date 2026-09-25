@@ -604,12 +604,15 @@ class RawH2:
     """HTTP/2 frames written and read one by one, for what the h2 package
     refuses to send: stalls, floods, and limits the server announces."""
 
-    def __init__(self, port=8080, ack_settings=True):
+    def __init__(
+        self, port=8080, ack_settings=True, settings=None, window_update=True
+    ):
         raw = socket.create_connection(('127.0.0.1', port), timeout=10)
         self.sock = ssl_context().wrap_socket(raw, server_hostname='localhost')
         assert self.sock.selected_alpn_protocol() == 'h2'
 
         self.ack_settings = ack_settings
+        self.window_update = window_update
         self.encoder = hpack.Encoder()
         self.decoder = hpack.Decoder()
 
@@ -625,7 +628,9 @@ class RawH2:
         self.server_settings = {}
         self.server_settings_seen = False
 
-        self.sock.sendall(PREFACE + SettingsFrame(0).serialize())
+        self.sock.sendall(
+            PREFACE + SettingsFrame(0, settings=settings or {}).serialize()
+        )
 
         # Settle the SETTINGS exchange first: a SETTINGS ACK sent later
         # could land inside a header block a test leaves open.
@@ -717,7 +722,7 @@ class RawH2:
         elif isinstance(frame, DataFrame):
             self.data[sid] = self.data.get(sid, b'') + frame.data
 
-            if frame.flow_controlled_length:
+            if frame.flow_controlled_length and self.window_update:
                 self.send(
                     WindowUpdateFrame(
                         0, window_increment=frame.flow_controlled_length
@@ -1571,4 +1576,52 @@ def test_http2_shutdown_streams():
     unit_stop()
 
     assert c.wait_closed(5)
+    c.close()
+
+
+def load_big(settings):
+    """Static files, big.txt over the connection window of 65535."""
+
+    share = load_share()
+
+    assert 'success' in client.conf({'http': settings}, 'settings')
+
+    with open(f'{share}/big.txt', 'rb') as f:
+        return f.read()
+
+
+def test_http2_window_update_resumes():
+    need_h2()
+    big = load_big({'send_timeout': 2})
+
+    # The response waits for window twice for 1.5 s, 3 s in all.
+    step = 100000
+    c = RawH2(settings={0x4: step})
+
+    c.request(1, path='/big.txt')
+    credit = step
+
+    # big.txt is 300000 bytes: the data fill the third window exactly, and
+    # END_STREAM goes with them.
+    assert len(big) == 3 * step
+
+    for _ in range(5):
+        assert c.wait(
+            lambda: len(c.data.get(1, b'')) >= min(credit, len(big))
+            or 1 in c.ended
+            or 1 in c.rst
+        )
+        assert 1 not in c.rst
+
+        if 1 in c.ended:
+            break
+
+        time.sleep(1.5)
+        c.send(WindowUpdateFrame(1, window_increment=step))
+        credit += step
+
+    assert 1 in c.ended
+    assert credit == 3 * step
+    assert c.data[1] == big
+    assert not c.closed
     c.close()

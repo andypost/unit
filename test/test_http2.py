@@ -1,8 +1,10 @@
 import os
 import re
 import shutil
+import signal
 import socket
 import ssl
+import struct
 import subprocess
 import time
 
@@ -1719,3 +1721,246 @@ def test_http2_window_update_resumes():
     assert c.data[1] == big
     assert not c.closed
     c.close()
+
+
+# The error matrix.  Each case must end without a router alert and, under
+# ASan and UBSan, without a sanitizer report (the fixture checks both and
+# the descriptors), with the router still serving.
+
+
+def load_matrix(processes=4):
+    """"/slow" is the "delayed" application (x-delay, x-parts), "/mirror"
+    the "mirror" one; the router itself answers 200 to anything else."""
+
+    delayed = python_app('delayed')
+    delayed['processes'] = processes
+
+    load_conf(
+        {
+            'listeners': {'*:8080': {'pass': 'routes'}},
+            'routes': [
+                {
+                    'match': {'uri': '/slow'},
+                    'action': {'pass': 'applications/delayed'},
+                },
+                {
+                    'match': {'uri': '/mirror'},
+                    'action': {'pass': 'applications/mirror'},
+                },
+                {'action': {'return': 200}},
+            ],
+            'applications': {
+                'delayed': delayed,
+                'mirror': python_app('mirror'),
+            },
+        }
+    )
+
+
+def app_pids(name):
+    out = subprocess.check_output(['ps', 'ax']).decode()
+
+    return [
+        int(pid)
+        for pid in re.findall(
+            rf'^\s*(\d+).*unit: "{name}" application', out, re.M
+        )
+    ]
+
+
+def test_http2_matrix_rst_mid_body():
+    need_h2()
+    load_matrix()
+
+    c = RawH2()
+
+    # The request body stops half way and the client resets the stream.
+    c.request(
+        1,
+        end_stream=False,
+        method='POST',
+        path='/mirror',
+        headers=[('content-length', '100')],
+    )
+    c.send(c.data_frame(1, b'x' * 50), RstStreamFrame(1, error_code=CANCEL))
+
+    c.request(3, method='POST', path='/mirror', end_stream=False)
+    c.send(c.data_frame(3, b'abc', end_stream=True))
+    assert c.wait_response(3) == 200
+    assert c.data[3] == b'abc'
+    assert 1 not in c.status
+    assert c.goaway is None
+    c.close()
+
+    assert_serves()
+
+
+def test_http2_matrix_rst_after_headers():
+    need_h2()
+    load_matrix()
+
+    c = RawH2()
+
+    # The response header and the first of 5 parts are out; the rest comes
+    # one part a second.
+    c.request(
+        1,
+        end_stream=False,
+        method='POST',
+        path='/slow',
+        headers=[
+            ('x-parts', '5'),
+            ('x-delay', '1'),
+            ('content-length', '10'),
+        ],
+    )
+    c.send(c.data_frame(1, b'0123456789', end_stream=True))
+
+    assert c.wait(lambda: c.data.get(1))
+    assert c.status[1] == 200
+
+    c.send(RstStreamFrame(1, error_code=CANCEL))
+
+    # The application writes the other parts to a request that is gone.
+    c.request(3)
+    assert c.wait_response(3) == 200
+
+    time.sleep(5)
+    assert 1 not in c.ended
+    assert len(c.data[1]) < 10
+
+    c.request(5, path='/slow')
+    assert c.wait_response(5) == 200
+    assert c.goaway is None
+    c.close()
+
+
+def test_http2_matrix_client_goaway():
+    need_h2()
+    load_matrix()
+
+    c = RawH2()
+
+    for sid in (1, 3, 5):
+        c.request(sid, path='/slow', headers=[('x-delay', '1')])
+
+    time.sleep(0.3)
+
+    # The client leaves; the streams it has opened are still answered, and
+    # the server closes after the last one.
+    c.send(GoAwayFrame(0, last_stream_id=0, error_code=NO_ERROR))
+
+    for sid in (1, 3, 5):
+        assert c.wait_response(sid) == 200
+
+    assert c.wait_closed(5)
+    c.close()
+
+    assert_serves()
+
+
+def test_http2_matrix_app_crash(skip_alert):
+    need_h2()
+    load_matrix()
+
+    skip_alert(r'process \d+ exited on signal 9')
+
+    c = RawH2()
+    sids = [1, 3, 5, 7, 9, 11]
+
+    # 6 streams: 4 with an application process, 2 queued.
+    for sid in sids:
+        c.request(sid, path='/slow', headers=[('x-delay', '5')])
+
+    time.sleep(1.5)
+    pids = app_pids('delayed')
+    assert pids
+
+    for pid in pids:
+        os.kill(pid, signal.SIGKILL)
+
+    # Every stream ends, with an error response or a reset, and the
+    # connection stays.
+    assert c.wait(lambda: all(s in c.ended or s in c.rst for s in sids), 15)
+
+    for sid in sids:
+        if sid in c.ended and c.status.get(sid) is not None:
+            assert c.status[sid] in (200, 502, 503), sid
+
+    c.request(13)
+    assert c.wait_response(13) == 200
+    assert c.goaway is None
+    c.close()
+
+    assert_serves()
+
+
+def test_http2_matrix_tls_abort():
+    need_h2()
+    load_matrix()
+
+    c = RawH2()
+
+    for sid in (1, 3, 5, 7):
+        c.request(sid, path='/slow', headers=[('x-delay', '2')])
+
+    c.request(
+        9,
+        end_stream=False,
+        method='POST',
+        path='/mirror',
+        headers=[('content-length', '100')],
+    )
+    c.send(c.data_frame(9, b'x' * 50))
+
+    time.sleep(0.5)
+
+    # No close_notify and no FIN: a TCP reset under the TLS session.
+    c.sock.setsockopt(
+        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0)
+    )
+    c.sock.close()
+
+    assert_serves()
+
+    # The applications answer requests that are gone.
+    time.sleep(3)
+
+    assert_serves()
+
+
+def test_http2_matrix_request_cap_in_flight():
+    need_h2()
+    load_matrix()
+
+    c = RawH2()
+
+    # 997 requests, in batches under SETTINGS_MAX_CONCURRENT_STREAMS.
+    sids = list(range(1, 1995, 2))
+
+    for i in range(0, len(sids), 100):
+        batch = sids[i : i + 100]
+        c.send(*[c.headers(sid, c.block()) for sid in batch])
+        assert c.wait(lambda: set(batch) <= c.ended)
+
+    # Requests 998 to 1000 (streams 1995 to 1999) go to the application;
+    # the 1000th brings the GOAWAY while all three are in flight.
+    slow = [1995, 1997, 1999]
+    c.send(
+        *[
+            c.headers(sid, c.block(path='/slow', headers=[('x-delay', '2')]))
+            for sid in slow
+        ]
+    )
+
+    assert c.wait(lambda: c.goaway is not None, 5)
+    assert c.goaway == (NO_ERROR, 1999)
+    assert not any(sid in c.ended for sid in slow)
+
+    for sid in slow:
+        assert c.wait_response(sid) == 200
+
+    assert c.wait_closed(5)
+    c.close()
+
+    assert_serves()

@@ -29,6 +29,9 @@ jobs:
         with:
           tool: ast-grep
 
+      - name: Test the rules
+        run: ast-grep test -c tools/ast-grep/sgconfig.yml
+
       - name: Check for new violations
         run: |
           python3 tools/ast-grep/check_baseline_test.py

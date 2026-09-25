@@ -183,6 +183,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_http_validate_host_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_conf_json_depth_test(thr) != NXT_OK) {
         return 1;
     }

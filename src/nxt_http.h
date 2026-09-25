@@ -452,6 +452,7 @@ void nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data);
 
 nxt_int_t nxt_http_request_host(void *ctx, nxt_http_field_t *field,
     uintptr_t data);
+nxt_int_t nxt_http_validate_host(nxt_str_t *host, nxt_mp_t *mp);
 nxt_int_t nxt_http_request_field(void *ctx, nxt_http_field_t *field,
     uintptr_t offset);
 nxt_int_t nxt_http_request_content_length(void *ctx, nxt_http_field_t *field,

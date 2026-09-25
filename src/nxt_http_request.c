@@ -9,7 +9,6 @@
 #include <nxt_otel.h>
 
 
-static nxt_int_t nxt_http_validate_host(nxt_str_t *host, nxt_mp_t *mp);
 static void nxt_http_request_start(nxt_task_t *task, void *obj, void *data);
 static nxt_int_t nxt_http_request_forward(nxt_task_t *task,
     nxt_http_request_t *r, nxt_http_forward_t *forward);
@@ -108,7 +107,7 @@ nxt_http_request_host(void *ctx, nxt_http_field_t *field, uintptr_t data)
 }
 
 
-static nxt_int_t
+nxt_int_t
 nxt_http_validate_host(nxt_str_t *host, nxt_mp_t *mp)
 {
     u_char      *h, ch;

@@ -15,6 +15,9 @@
 #include <nxt_script.h>
 #endif
 #include <nxt_http.h>
+#if (NXT_HAVE_NGHTTP2)
+#include <nxt_h2proto.h>
+#endif
 #include <nxt_port_memory_int.h>
 #include <nxt_unit_request.h>
 #include <nxt_unit_response.h>
@@ -22,6 +25,8 @@
 #include <nxt_app_queue.h>
 #include <nxt_port_queue.h>
 #include <nxt_http_compression.h>
+#include <nxt_router_schedule.h>
+#include <nxt_usdt.h>
 
 #if (NXT_HAVE_OTEL)
 #define NXT_OTEL_BATCH_DEFAULT     128
@@ -380,7 +385,8 @@ static void nxt_router_http_request_done(nxt_task_t *task, void *obj,
 static void nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data);
 static nxt_buf_t *nxt_router_prepare_msg(nxt_task_t *task,
-    nxt_http_request_t *r, nxt_app_t *app, const nxt_str_t *prefix);
+    nxt_http_request_t *r, nxt_app_t *app, const nxt_str_t *prefix,
+    nxt_http_status_t *status);
 
 static void nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data);
 static void nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj,
@@ -546,9 +552,11 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
     size_t                    size;
     uint32_t                  stream;
     nxt_fd_t                  port_fd, queue_fd;
+    nxt_err_t                 err;
     nxt_int_t                 ret;
     nxt_app_t                 *app;
     nxt_buf_t                 *b;
+    nxt_bool_t                proto_gone;
     nxt_port_t                *dport;
     nxt_runtime_t             *rt;
     nxt_app_joint_rpc_t       *app_joint_rpc;
@@ -557,6 +565,7 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
     app = data;
 
     st = NULL;
+    proto_gone = 0;
 
     nxt_thread_mutex_lock(&app->mutex);
 
@@ -627,6 +636,30 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
     if (nxt_slow_path(ret != NXT_OK)) {
         nxt_port_rpc_cancel(task, port, stream);
 
+        /*
+         * A worker start goes to the prototype, and the prototype can exit
+         * without the router asking for it.  On shutdown main sends QUIT to
+         * every process directly, and the prototype reports the exit of its
+         * workers to the router before it exits itself.  The router may
+         * handle such a REMOVE_PID before its own QUIT, start a replacement
+         * worker in nxt_router_app_port_close(), and find the prototype's
+         * socket already closed.  A prototype that crashes is the same case.
+         * The router cannot know it in advance: it clears ->proto_port only
+         * when the prototype's own REMOVE_PID arrives, or when it sends the
+         * QUIT itself.
+         *
+         * Nothing was sent, so nothing was forked, and the slot goes back
+         * below in the usual way.  Only the log level differs.  A
+         * prototype start goes to main, which is never expected to be gone,
+         * so it keeps the alert.
+         */
+
+        err = dport->socket.error;
+
+        proto_gone = (b == NULL
+                      && (err == NXT_EPIPE || err == NXT_ECONNRESET
+                          || err == NXT_ECONNREFUSED));
+
         goto failed;
     }
 
@@ -679,7 +712,13 @@ failed:
      * nxt_router_app_port_error() does for the attempts that do get that far.
      */
 
-    nxt_alert(task, "app '%V' failed to start a process", &app->name);
+    if (proto_gone) {
+        nxt_debug(task, "app '%V' start attempt cancelled: prototype %PI "
+                  "is gone", &app->name, dport->pid);
+
+    } else {
+        nxt_alert(task, "app '%V' failed to start a process", &app->name);
+    }
 
     if (st != NULL) {
         /*
@@ -1696,15 +1735,16 @@ fail:
 static void
 nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
-    u_char               *p;
-    size_t               alloc;
-    nxt_app_t            *app;
-    nxt_buf_t            *b;
-    nxt_uint_t           type;
-    nxt_port_t           *port;
-    nxt_status_app_t     *app_stat;
-    nxt_event_engine_t   *engine;
-    nxt_status_report_t  *report;
+    u_char                  *p;
+    size_t                  alloc;
+    nxt_uint_t              nsched;
+    nxt_app_t               *app;
+    nxt_buf_t               *b;
+    nxt_uint_t              type;
+    nxt_port_t              *port;
+    nxt_status_app_t        *app_stat;
+    nxt_event_engine_t      *engine;
+    nxt_status_report_t     *report;
 
     port = nxt_runtime_port_find(task->thread->runtime,
                                  msg->port_msg.pid,
@@ -1721,6 +1761,8 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         alloc += sizeof(nxt_status_app_t) + app->name.length;
 
     } nxt_queue_loop;
+
+    alloc += nxt_router_schedules_status_size(&nsched);
 
     b = nxt_buf_mem_alloc(port->mem_pool, alloc, 0);
     if (nxt_slow_path(b == NULL)) {
@@ -1777,6 +1819,10 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         report->apps_count++;
         app_stat++;
     } nxt_queue_loop;
+
+    report->schedules_count = nsched;
+    nxt_router_schedules_status(nxt_status_report_schedules(report), p,
+                                b->mem.pos);
 
     type = NXT_PORT_MSG_RPC_READY_LAST;
 
@@ -2059,6 +2105,8 @@ nxt_router_conf_apply(nxt_task_t *task, void *obj, void *data)
     nxt_router_apps_hash_use(task, rtcf, 1);
 
     nxt_router_engines_post(router, tmcf);
+
+    nxt_router_schedules_apply(task, tmcf);
 
     nxt_queue_add(&router->sockets, &updating_sockets);
     nxt_queue_add(&router->sockets, &creating_sockets);
@@ -2524,6 +2572,47 @@ nxt_router_otel_conf_remember(nxt_str_t *endpoint, nxt_str_t *protocol,
 #endif
 
 
+
+/* A listener's HTTP settings: the defaults, then "settings/http". */
+
+nxt_int_t
+nxt_router_socket_conf_http(nxt_mp_t *mp, nxt_socket_conf_t *skcf,
+    nxt_conf_value_t *http)
+{
+    skcf->header_buffer_size = 2048;
+    skcf->large_header_buffer_size = 8192;
+    skcf->large_header_buffers = 4;
+    skcf->discard_unsafe_fields = 1;
+    skcf->body_buffer_size = 16 * 1024;
+    skcf->max_body_size = 8 * 1024 * 1024;
+    skcf->proxy_header_buffer_size = 64 * 1024;
+    skcf->proxy_buffer_size = 4096;
+    skcf->proxy_buffers = 256;
+    skcf->idle_timeout = 30 * 1000;
+    skcf->header_read_timeout = 30 * 1000;
+    skcf->body_read_timeout = 30 * 1000;
+    skcf->send_timeout = 30 * 1000;
+    skcf->proxy_timeout = 60 * 1000;
+    skcf->proxy_send_timeout = 30 * 1000;
+    skcf->proxy_read_timeout = 30 * 1000;
+
+    skcf->server_version = 1;
+    skcf->chunked_transform = 0;
+
+    skcf->websocket_conf.max_frame_size = 1024 * 1024;
+    skcf->websocket_conf.read_timeout = 60 * 1000;
+    skcf->websocket_conf.keepalive_interval = 30 * 1000;
+
+    nxt_str_null(&skcf->body_temp_path);
+
+    if (http == NULL) {
+        return NXT_OK;
+    }
+
+    return nxt_conf_map_object(mp, http, nxt_router_http_conf,
+                               nxt_nitems(nxt_router_http_conf), skcf);
+}
+
 static nxt_int_t
 nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     u_char *start, u_char *end)
@@ -2580,6 +2669,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     static const nxt_str_t  conf_timeout_path =
                                 nxt_string("/tls/session/timeout");
     static const nxt_str_t  conf_tickets = nxt_string("/tls/session/tickets");
+    static const nxt_str_t  conf_http2 = nxt_string("/tls/http2");
 #endif
 #if (NXT_HAVE_NJS)
     static const nxt_str_t  js_module_path = nxt_string("/settings/js_module");
@@ -2939,43 +3029,10 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
                 goto fail;
             }
 
-            // STUB, default values if http block is not defined.
-            skcf->header_buffer_size = 2048;
-            skcf->large_header_buffer_size = 8192;
-            skcf->large_header_buffers = 4;
-            skcf->discard_unsafe_fields = 1;
-            skcf->body_buffer_size = 16 * 1024;
-            skcf->max_body_size = 8 * 1024 * 1024;
-            skcf->proxy_header_buffer_size = 64 * 1024;
-            skcf->proxy_buffer_size = 4096;
-            skcf->proxy_buffers = 256;
-            skcf->idle_timeout = 30 * 1000;
-            skcf->header_read_timeout = 30 * 1000;
-            skcf->body_read_timeout = 30 * 1000;
-            skcf->send_timeout = 30 * 1000;
-            skcf->proxy_timeout = 60 * 1000;
-            skcf->proxy_send_timeout = 30 * 1000;
-            skcf->proxy_read_timeout = 30 * 1000;
-
-            skcf->server_version = 1;
-            skcf->chunked_transform = 0;
-
-            skcf->websocket_conf.max_frame_size = 1024 * 1024;
-            skcf->websocket_conf.read_timeout = 60 * 1000;
-            skcf->websocket_conf.keepalive_interval = 30 * 1000;
-
-            nxt_str_null(&skcf->body_temp_path);
-
-            if (http != NULL) {
-
-                ret = nxt_conf_map_object(mp, http, nxt_router_http_conf,
-                                          nxt_nitems(nxt_router_http_conf),
-                                          skcf);
-                if (ret != NXT_OK) {
-                    nxt_alert(task, "http map error");
-                    goto fail;
-                }
-
+            ret = nxt_router_socket_conf_http(mp, skcf, http);
+            if (ret != NXT_OK) {
+                nxt_alert(task, "http map error");
+                goto fail;
             }
 
             if (websocket != NULL) {
@@ -3042,6 +3099,10 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
                 tls_init->tickets_conf = nxt_conf_get_path(listener,
                                                            &conf_tickets);
 
+                value = nxt_conf_get_path(listener, &conf_http2);
+                tls_init->http2 = (value != NULL
+                                   && nxt_conf_get_boolean(value));
+
                 n = nxt_conf_array_elements_count_or_1(certificate);
 
                 for (i = 0; i < n; i++) {
@@ -3077,7 +3138,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
         }
     }
 
-    ret = nxt_http_routes_resolve(task, tmcf);
+    ret = nxt_router_conf_resolve(task, tmcf, root);
     if (nxt_slow_path(ret != NXT_OK)) {
         goto fail;
     }
@@ -3603,7 +3664,7 @@ nxt_router_apps_hash_add(nxt_router_conf_t *rtcf, nxt_app_t *app)
     case NXT_DECLINED:
         nxt_thread_log_alert("router app hash adding failed: "
                              "\"%V\" is already in hash", &lhq.key);
-        /* Fall through. */
+        nxt_fallthrough;
     default:
         return NXT_ERROR;
     }
@@ -4007,6 +4068,7 @@ nxt_router_tls_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 
     tls->tls_init->conf = tlscf;
+    tlscf->http2 = tls->tls_init->http2;
 
     bundle = nxt_mp_get(mp, sizeof(nxt_tls_bundle_conf_t));
     if (nxt_slow_path(bundle == NULL)) {
@@ -4848,6 +4910,11 @@ nxt_router_listen_socket_update(nxt_task_t *task, void *obj, void *data)
     lev->socket.data = joint;
     lev->listen = joint->socket_conf->listen;
 
+#if (NXT_HAVE_NGHTTP2)
+    /* HTTP/2 connections leave the old configuration with GOAWAY. */
+    nxt_h2p_conns_drain(&engine->task, engine);
+#endif
+
     nxt_router_conf_wait_post(job);
 
     /*
@@ -4901,6 +4968,10 @@ nxt_router_worker_thread_quit(nxt_task_t *task, void *obj, void *data)
     engine = task->thread->engine;
 
     engine->shutdown = 1;
+
+#if (NXT_HAVE_NGHTTP2)
+    nxt_h2p_conns_drain(&engine->task, engine);
+#endif
 
     /*
      * Give the reference nxt_router_engine_quit() took back.  The task this
@@ -4993,6 +5064,10 @@ nxt_router_listen_socket_close(nxt_task_t *task, void *obj, void *data)
         if (nxt_fd_event_is_active(lev->socket.read)) {
             nxt_fd_event_disable_read(engine, &lev->socket);
         }
+
+#if (NXT_HAVE_NGHTTP2)
+        nxt_h2p_conns_drain(&engine->task, engine);
+#endif
     }
 
     /*
@@ -5292,6 +5367,28 @@ nxt_router_conf_release(nxt_task_t *task, nxt_socket_conf_joint_t *joint)
 }
 
 
+/*
+ * Release a joint from its own engine, and let a worker engine that is
+ * quitting exit once no joint holds it, as a connection's release does in
+ * nxt_router_listen_event_release().  For the internal requests of
+ * src/nxt_router_schedule.c.  Does not return if the engine exits.
+ */
+
+void
+nxt_router_joint_release(nxt_task_t *task, nxt_socket_conf_joint_t *joint)
+{
+    nxt_event_engine_t  *engine;
+
+    engine = task->thread->engine;
+
+    nxt_router_conf_release(task, joint);
+
+    if (engine->shutdown && nxt_queue_is_empty(&engine->joints)) {
+        nxt_router_worker_thread_exit(task);
+    }
+}
+
+
 static void
 nxt_router_thread_exit_handler(nxt_task_t *task, void *obj, void *data)
 {
@@ -5338,19 +5435,152 @@ nxt_router_thread_exit_handler(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * Parses the nxt_unit_response_t an application handed back in "b": the
+ * fixed header, the field array and the piggybacked body.  The buffer is
+ * shared memory the application keeps mapped writable, so every value is
+ * read once, through volatile into a local, and checked before use:
+ * fields_count against the buffer size, each sptr and its length by
+ * nxt_unit_sptr_in_buf().
+ *
+ * Kept as its own function so a harness can drive it with a synthetic
+ * buffer and a bare nxt_http_request_t, without a router or a live app
+ * connection: see fuzzing/nxt_router_app_response_fuzz.c.
+ */
+
+static nxt_int_t
+nxt_router_response_header_parse(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_buf_t *b)
+{
+    size_t                b_size, count;
+    u_char                *p;
+    uint32_t              piggyback_length;
+    nxt_int_t             ret;
+    nxt_unit_field_t      *f, uf;
+    nxt_http_field_t      *field;
+    nxt_unit_response_t   *resp;
+
+    b_size = nxt_buf_is_mem(b) ? nxt_buf_mem_used_size(&b->mem) : 0;
+
+    if (nxt_slow_path(b_size < sizeof(nxt_unit_response_t)
+                       || b_size > UINT32_MAX))
+    {
+        nxt_alert(task, "response buffer too small: %z", b_size);
+        return NXT_ERROR;
+    }
+
+    resp = (void *) b->mem.pos;
+    count = *(volatile uint32_t *) &resp->fields_count;
+
+    if (nxt_slow_path(count > (b_size - sizeof(nxt_unit_response_t))
+                              / sizeof(nxt_unit_field_t)))
+    {
+        nxt_alert(task, "response buffer too small for fields count: %uz",
+                  count);
+        return NXT_ERROR;
+    }
+
+    for (f = resp->fields; f < resp->fields + count; f++) {
+        uf = *(volatile nxt_unit_field_t *) f;
+
+        if (uf.skip) {
+            continue;
+        }
+
+        field = nxt_http_resp_field_add(&r->resp, r->mem_pool);
+
+        if (nxt_slow_path(field == NULL)) {
+            return NXT_ERROR;
+        }
+
+        field->hash = uf.hash;
+        field->skip = 0;
+        field->hopbyhop = 0;
+
+        field->name_length = uf.name_length;
+        field->value_length = uf.value_length;
+        field->name = nxt_unit_sptr_in_buf(&f->name, uf.name_length,
+                                           b->mem.pos, b_size);
+        field->value = nxt_unit_sptr_in_buf(&f->value, uf.value_length,
+                                            b->mem.pos, b_size);
+
+        if (nxt_slow_path(field->name == NULL || field->value == NULL)) {
+            nxt_alert(task, "response field sptr out of bounds");
+            return NXT_ERROR;
+        }
+
+        ret = nxt_http_field_process(field, &nxt_response_fields_hash, r);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NXT_ERROR;
+        }
+
+        nxt_debug(task, "header%s: %*s: %*s",
+                  (field->skip ? " skipped" : ""),
+                  (size_t) field->name_length, field->name,
+                  (size_t) field->value_length, field->value);
+
+        if (field->skip) {
+            if (r->resp.num_inline_fields > 0
+                && field == &r->resp.inline_fields[r->resp.num_inline_fields - 1])
+            {
+                r->resp.num_inline_fields--;
+            } else if (r->resp.fields != NULL && r->resp.fields->last != NULL) {
+                r->resp.fields->last->nelts--;
+            }
+        }
+    }
+
+    r->status = resp->status;
+
+    piggyback_length =
+        *(volatile uint32_t *) &resp->piggyback_content_length;
+
+    if (piggyback_length != 0) {
+        p = nxt_unit_sptr_in_buf(&resp->piggyback_content, piggyback_length,
+                                 b->mem.pos, b_size);
+        if (nxt_slow_path(p == NULL)) {
+            nxt_alert(task, "response piggyback content out of bounds");
+            return NXT_ERROR;
+        }
+
+        b->mem.pos = p;
+        b->mem.free = p + piggyback_length;
+
+    } else {
+        b->mem.pos = b->mem.free;
+    }
+
+    return NXT_OK;
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_response_parse_test.c: the function is static. */
+
+nxt_int_t nxt_router_test_response_header_parse(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_buf_t *b);
+
+
+nxt_int_t
+nxt_router_test_response_header_parse(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_buf_t *b)
+{
+    return nxt_router_response_header_parse(task, r, b);
+}
+
+#endif
+
+
 static void
 nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
-    size_t                  b_size, count;
     nxt_int_t               ret;
     nxt_app_t               *app;
     nxt_buf_t               *b, *next, *out, *last_b, *owned_b;
     nxt_port_t              *app_port;
-    nxt_unit_field_t        *f;
-    nxt_http_field_t        *field;
     nxt_http_request_t      *r;
-    nxt_unit_response_t     *resp;
     nxt_request_rpc_data_t  *req_rpc_data;
 
     /*
@@ -5415,7 +5645,12 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         nxt_request_rpc_data_unlink(task, req_rpc_data);
 
     } else {
-        if (app->timeout != 0) {
+        /*
+         * The deadline bounds the worker's answer, and an upgraded
+         * WebSocket has had its answer: the frames that follow are a
+         * session, however quiet (#422).
+         */
+        if (app->timeout != 0 && r->state != &nxt_http_websocket) {
             r->timer.handler = nxt_router_app_timeout;
             r->timer_data = req_rpc_data;
             nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
@@ -5449,74 +5684,9 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
         nxt_http_request_send_body(task, r, NULL);
     } else {
-        b_size = nxt_buf_is_mem(b) ? nxt_buf_mem_used_size(&b->mem) : 0;
-
-        if (nxt_slow_path(b_size < sizeof(nxt_unit_response_t))) {
-            nxt_alert(task, "response buffer too small: %z", b_size);
+        ret = nxt_router_response_header_parse(task, r, b);
+        if (nxt_slow_path(ret != NXT_OK)) {
             goto fail;
-        }
-
-        resp = (void *) b->mem.pos;
-        count = (b_size - sizeof(nxt_unit_response_t))
-                    / sizeof(nxt_unit_field_t);
-
-        if (nxt_slow_path(count < resp->fields_count)) {
-            nxt_alert(task, "response buffer too small for fields count: %D",
-                      resp->fields_count);
-            goto fail;
-        }
-
-        field = NULL;
-
-        for (f = resp->fields; f < resp->fields + resp->fields_count; f++) {
-            if (f->skip) {
-                continue;
-            }
-
-            field = nxt_http_resp_field_add(&r->resp, r->mem_pool);
-
-            if (nxt_slow_path(field == NULL)) {
-                goto fail;
-            }
-
-            field->hash = f->hash;
-            field->skip = 0;
-            field->hopbyhop = 0;
-
-            field->name_length = f->name_length;
-            field->value_length = f->value_length;
-            field->name = nxt_unit_sptr_get(&f->name);
-            field->value = nxt_unit_sptr_get(&f->value);
-
-            ret = nxt_http_field_process(field, &nxt_response_fields_hash, r);
-            if (nxt_slow_path(ret != NXT_OK)) {
-                goto fail;
-            }
-
-            nxt_debug(task, "header%s: %*s: %*s",
-                      (field->skip ? " skipped" : ""),
-                      (size_t) field->name_length, field->name,
-                      (size_t) field->value_length, field->value);
-
-            if (field->skip) {
-                if (r->resp.num_inline_fields > 0
-                    && field == &r->resp.inline_fields[r->resp.num_inline_fields - 1])
-                {
-                    r->resp.num_inline_fields--;
-                } else if (r->resp.fields != NULL && r->resp.fields->last != NULL) {
-                    r->resp.fields->last->nelts--;
-                }
-            }
-        }
-
-        r->status = resp->status;
-
-        if (resp->piggyback_content_length != 0) {
-            b->mem.pos = nxt_unit_sptr_get(&resp->piggyback_content);
-            b->mem.free = b->mem.pos + resp->piggyback_content_length;
-
-        } else {
-            b->mem.pos = b->mem.free;
         }
 
         if (nxt_buf_mem_used_size(&b->mem) == 0) {
@@ -5590,6 +5760,13 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
             nxt_debug(task, "stream #%uD upgrade", req_rpc_data->stream);
 
             r->state = &nxt_http_websocket;
+
+            /*
+             * The 101 arrived as a non-last message, which re-armed the
+             * request deadline above; the upgrade ends the request, so the
+             * deadline goes with it (#422).
+             */
+            nxt_timer_disable(task->thread->engine, &r->timer);
 
         } else {
             r->state = &nxt_http_request_send_state;
@@ -6168,11 +6345,12 @@ nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
      *
      * NXT_LOG_ERR rather than nxt_alert(), which the early-failure path
      * in nxt_router_start_app_process_handler() uses.  That one can only
-     * be Unit's own fault; this one is usually the application's -- a
-     * module that fails to import, a worker that exits during startup --
-     * and Unit is working exactly as designed when it reports one.
-     * [error] is emitted at the default log level, which is the whole
-     * point of the change.
+     * be Unit's own fault (a prototype that is already gone is not an
+     * alert there, see the write failure); this one is usually the
+     * application's -- a module that fails to import, a worker that exits
+     * during startup -- and Unit is working exactly as designed when it
+     * reports one.  [error] is emitted at the default log level, which is
+     * the whole point of the change.
      *
      * A different sentence from that alert, deliberately, even though
      * the two describe the same disappointment.  The test suite skips
@@ -7503,6 +7681,7 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_buf_t         *buf, *body;
     nxt_int_t         res;
     nxt_port_t        *port, *reply_port;
+    nxt_http_status_t  status;
 
     int                   notify;
     struct {
@@ -7523,13 +7702,14 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     reply_port = task->thread->engine->port;
 
     buf = nxt_router_prepare_msg(task, req_rpc_data->request, app,
-                                 nxt_app_msg_prefix[app->type]);
+                                 nxt_app_msg_prefix[app->type], &status);
     if (nxt_slow_path(buf == NULL)) {
-        nxt_alert(task, "stream #%uD, app '%V': failed to prepare app message",
-                  req_rpc_data->stream, &app->name);
+        if (status == NXT_HTTP_INTERNAL_SERVER_ERROR) {
+            nxt_alert(task, "stream #%uD, app '%V': failed to prepare app "
+                      "message", req_rpc_data->stream, &app->name);
+        }
 
-        nxt_http_request_error(task, req_rpc_data->request,
-                               NXT_HTTP_INTERNAL_SERVER_ERROR);
+        nxt_http_request_error(task, req_rpc_data->request, status);
 
         return;
     }
@@ -7597,9 +7777,32 @@ nxt_router_app_prepare_request(nxt_task_t *task,
 
 
 
+/*
+ * Builds the nxt_unit_request_t for the application in shared memory.
+ *
+ * Every length that lands in a narrow field of the libunit protocol is
+ * checked before the buffer is allocated, and the request is refused rather
+ * than having the field truncated: a truncated length makes the application
+ * see a different string from the one that was copied (a 256-byte method
+ * arrived as an empty one), with the NUL terminator somewhere else.
+ *
+ *   - method_length is uint8_t, and the HTTP parser does not bound a method
+ *     (it is limited only by the header buffer): 501.
+ *   - a field's name_length is uint8_t.  nxt_http_parse_field_name() caps a
+ *     name at 255 bytes (NXT_HTTP_MAX_FIELD_NAME), which fits alone, but the
+ *     PHP/Perl/Ruby prefix "HTTP_" is added on top: names of 251..255 bytes
+ *     wrapped to 0..4.  431.
+ *   - version, the address and port texts are uint8_t as well but produced
+ *     by Unit itself; they are checked all the same, and fail with 500.
+ *   - the uint32_t lengths (server name, target, path, query, values) are
+ *     bounded by req_size <= PORT_MMAP_DATA_SIZE.
+ *
+ * On failure NULL is returned and *status says what to answer.
+ */
+
 static nxt_buf_t *
 nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_app_t *app, const nxt_str_t *prefix)
+    nxt_app_t *app, const nxt_str_t *prefix, nxt_http_status_t *status)
 {
     void                *target_pos, *query_pos;
     u_char              *pos, *end, *p, c;
@@ -7611,6 +7814,29 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     nxt_unit_field_t        *dst_field;
     nxt_http_fields_iter_t  iter, dup_iter;
     nxt_unit_request_t      *req;
+
+    *status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+
+    if (nxt_slow_path(r->method->length > UINT8_MAX)) {
+        nxt_log(task, NXT_LOG_INFO, "request method of %uz bytes is too long "
+                "for the application protocol", r->method->length);
+
+        *status = NXT_HTTP_NOT_IMPLEMENTED;
+        return NULL;
+    }
+
+    if (nxt_slow_path(r->version.length > UINT8_MAX
+                      || r->remote->address_length > UINT8_MAX
+                      || r->local->address_length > UINT8_MAX
+                      || nxt_sockaddr_port_length(r->local) > UINT8_MAX))
+    {
+        nxt_alert(task, "request version or address too long for the "
+                  "application protocol");
+
+        return NULL;
+    }
+
+    /* Every length is of data the request holds, so the sum cannot wrap. */
 
     req_size = sizeof(nxt_unit_request_t)
                + r->method->length + 1
@@ -7630,6 +7856,15 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     {
         fields_count++;
 
+        if (nxt_slow_path(field->name_length + prefix->length > UINT8_MAX)) {
+            nxt_log(task, NXT_LOG_INFO, "header field name of %d bytes is "
+                    "too long for the application protocol with prefix "
+                    "\"%V\"", (int) field->name_length, prefix);
+
+            *status = NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE;
+            return NULL;
+        }
+
         req_size += field->name_length + prefix->length + 1
                     + field->value_length + 1;
     } nxt_http_fields_loop;
@@ -7637,8 +7872,8 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     req_size += fields_count * sizeof(nxt_unit_field_t);
 
     if (nxt_slow_path(req_size > PORT_MMAP_DATA_SIZE)) {
-        nxt_alert(task, "headers to big to fit in shared memory (%d)",
-                  (int) req_size);
+        nxt_alert(task, "headers too big to fit in shared memory (%uz)",
+                  req_size);
 
         return NULL;
     }
@@ -7648,6 +7883,7 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     if (nxt_slow_path(out == NULL)) {
         return NULL;
     }
+    NXT_USDT(mmap__chunk__get, req_size + content_length);
 
     req = (nxt_unit_request_t *) out->mem.free;
     out->mem.free += req_size;
@@ -7740,6 +7976,7 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 
         dst_field->hash = field->hash;
         dst_field->skip = 0;
+        /* Checked to fit uint8_t when req_size was summed. */
         dst_field->name_length = field->name_length + prefix->length;
         dst_field->value_length = field->value_length;
 
@@ -7881,20 +8118,55 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 }
 
 
+#if (NXT_TESTS)
+
+/*
+ * For src/test/nxt_router_prepare_msg_test.c, which repeats this prototype:
+ * nxt_router.h cannot name nxt_http_status_t.
+ */
+
+nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status);
+
+
+nxt_buf_t *
+nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status)
+{
+    return nxt_router_prepare_msg(task, r, app,
+                                  use_http_prefix ? &http_prefix
+                                                  : &empty_prefix,
+                                  status);
+}
+
+#endif
+
+
 static void
 nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
 {
-    nxt_timer_t              *timer;
-    nxt_msg_info_t           *msg_info;
-    nxt_http_request_t       *r;
-    nxt_request_rpc_data_t   *req_rpc_data;
-
-    timer = obj;
+    nxt_http_request_t  *r;
 
     nxt_debug(task, "router app timeout");
 
-    r = nxt_timer_data(timer, nxt_http_request_t, timer);
-    req_rpc_data = r->timer_data;
+    r = nxt_timer_data(obj, nxt_http_request_t, timer);
+
+    (void) nxt_router_request_expire(task, r, r->timer_data);
+}
+
+
+/*
+ * The request deadline, shared by "limits": {"timeout"} above and a
+ * schedule's own "timeout" (src/nxt_router_schedule.c).  Returns 0 when the
+ * request was left alone because a worker claimed it and has not
+ * acknowledged it yet; the caller decides when to look again.
+ */
+
+nxt_bool_t
+nxt_router_request_expire(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_msg_info_t  *msg_info;
 
     msg_info = &req_rpc_data->msg_info;
 
@@ -7932,7 +8204,7 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
         nxt_debug(task, "stream #%uD: claimed, waiting for the ack",
                   req_rpc_data->stream);
 
-        return;
+        return 0;
     }
 
     /*
@@ -7967,6 +8239,8 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
     nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
 
     nxt_request_rpc_data_unlink(task, req_rpc_data);
+
+    return 1;
 }
 
 

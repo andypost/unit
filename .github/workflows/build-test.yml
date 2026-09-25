@@ -11,6 +11,7 @@ on:
       - 'pkg/contrib/**'
       - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
+      - '.github/scripts/h2load-smoke.sh'
   push:
     branches: master
     paths:
@@ -22,6 +23,7 @@ on:
       - 'pkg/contrib/**'
       - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
+      - '.github/scripts/h2load-smoke.sh'
 
 env:
   # OpenSSL patch version built from source (see "Build OpenSSL" step). Only the
@@ -702,9 +704,10 @@ jobs:
           ./configure wasm-wasi-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
 
+      # bindgen picks clang up from PATH.  The libclang-drift check against
+      # new distribution compilers lives in build-distros.yml.
       - name: Make wasm-wasi-component
         run: |
-          CLANG_PATH=/usr/bin/clang-15 \
           BINDGEN_EXTRA_CLANG_ARGS="-I../../njs/src -I../../njs/build" \
           make wasm-wasi-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
@@ -851,6 +854,147 @@ jobs:
 
       - name: Run libunit port_recv fd-ownership test
         run: ./build/unit_port_recv_test
+
+  # Same C unit-test suite as c-tests above, built with AddressSanitizer and
+  # run with LeakSanitizer's default ASAN_OPTIONS (detect_leaks is on unless
+  # something turns it off). Separate from sanitize.yml: that workflow runs
+  # unitd itself, a fork-heavy daemon where leak detection is noisy enough
+  # that it is turned off there deliberately (see its "Configure unit"
+  # comment); build/tests is a single non-forking process exercising
+  # nxt_lvlhsh, nxt_mp, the port/IPC fixtures, etc. directly, so a leak here
+  # is a real one in that fixture's own teardown, not daemon-lifecycle noise.
+  # No suppressions file: every known leak was fixed at its allocation site
+  # (test fixtures freeing what they allocated -- lvlhsh buckets, ports,
+  # runtime processes).
+  c-tests-asan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
+
+      - name: Configure unit (ASan+LSan, --tests)
+        run: |
+          ./configure \
+            --cc=clang \
+            --debug \
+            --tests \
+            --cc-opt="-fsanitize=address -fno-omit-frame-pointer -g" \
+            --ld-opt="-fsanitize=address"
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      # sudo for the same reason as c-tests above: the clone creds cases
+      # need real root. Running as root does not disable LeakSanitizer --
+      # this repo's own sandboxed reproduction ran as root throughout.
+      - name: Run C tests
+        run: sudo ./build/tests
+
+  # HTTP/2 (--h2).  The core build above has no --h2, so test_http2.py skips
+  # itself in every leg of the test matrix.  This leg builds unitd with
+  # nghttp2 and the python module, runs that file, and runs an h2load smoke
+  # test against a static file.  The other legs stay as they are.
+  http2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # libnghttp2-dev for --h2; nghttp2-client for h2load and for the nghttp
+      # fallback in test_http2.py.
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
+                                  libnghttp2-dev nghttp2-client \
+                                  python3-dev python3-pip curl
+
+      # The pytest that runs as root below must import "h2": install the
+      # test requirements for the system python3 that sudo runs.
+      - name: Install test requirements
+        run: |
+          sudo python3 -m pip install --break-system-packages \
+            -r test/requirements.txt
+          sudo python3 -c 'import h2, hpack, hyperframe, pytest'
+
+      # configure exits with an error when --h2 finds no usable nghttp2.
+      - name: Configure unit (--h2)
+        run: |
+          ./configure --openssl --h2 --tests
+          grep -q '#define NXT_HAVE_NGHTTP2' build/include/nxt_auto_config.h
+
+      - name: Configure python3
+        run: ./configure python --config=python3-config
+
+      - name: Make unit
+        run: make -j"$(nproc)"
+
+      - name: Build C tests
+        run: make -j"$(nproc)" tests
+
+      - name: Run C tests
+        run: sudo ./build/tests
+
+      # unitd runs as root here, and its discovery process, which loads the
+      # language modules, drops to an unprivileged user.  That user must be
+      # able to reach build/ under /home/runner, or no module is found and
+      # every test skips.  The language legs above do the same.
+      - name: Make /home/runner traversable
+        run: sudo chmod -R +x /home/runner
+
+      # --restart is for the process shutdown tests, which stop unitd and
+      # skip themselves without it.
+      - name: Run HTTP/2 tests
+        run: |
+          set -o pipefail
+          sudo -E python3 -m pytest --print-log test/test_http2.py \
+            2>&1 | tee "$RUNNER_TEMP/pytest.out"
+          sudo -E python3 -m pytest --print-log --restart \
+            -k 'shutdown' test/test_http2.py \
+            2>&1 | tee -a "$RUNNER_TEMP/pytest.out"
+
+      # The file skips as a whole when the http2 feature or the h2 package is
+      # missing, which exits 0.  A leg that skipped everything is not green.
+      - name: Fail if the HTTP/2 tests skipped
+        if: ${{ !cancelled() }}
+        run: |
+          for t in test_http2_python_get test_http2_drain_reconfigure \
+                   test_http2_window_stall_stream test_http2_shutdown_idle
+          do
+            grep -qE "test_http2\.py::${t} PASSED" "$RUNNER_TEMP/pytest.out" || {
+              echo "::error::${t} did not pass; the HTTP/2 tests skipped:" >&2
+              grep -E 'SKIPPED|skipped' "$RUNNER_TEMP/pytest.out" >&2 || true
+              exit 1
+            }
+          done
+
+      - name: h2load smoke test
+        run: sudo .github/scripts/h2load-smoke.sh 2000 8 16
+
+      # h2spec 2.6.0 is the last release.  The checksum is of the release
+      # tarball; update both together.
+      - name: Install h2spec
+        env:
+          H2SPEC_VERSION: 2.6.0
+          H2SPEC_SHA256: 157ee0de702e01ad40e752dbf074b366027e550c8e7504f9450da2809e279318
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/h2spec.tar.gz" \
+            "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz"
+          echo "${H2SPEC_SHA256}  $RUNNER_TEMP/h2spec.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/h2spec.tar.gz" -C "$RUNNER_TEMP" h2spec
+          sudo install -m 755 "$RUNNER_TEMP/h2spec" /usr/local/bin/h2spec
+          h2spec --version
+
+      # Fails on a case that is not in .github/scripts/h2spec-excludes.txt.
+      - name: h2spec conformance test
+        run: sudo .github/scripts/h2spec.sh
 
   # OpenSSL 4.0 compile gate.  4.0 removed nothing Unit uses, but it deprecated
   # more of what Unit still calls, and 5.0 is where the deprecated symbols

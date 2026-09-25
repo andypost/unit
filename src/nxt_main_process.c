@@ -62,8 +62,6 @@ static void nxt_main_process_whoami_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_main_port_conf_store_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
-static nxt_int_t nxt_main_file_store(nxt_task_t *task, const char *dir,
-    const char *tmp_name, const char *name, u_char *buf, size_t size);
 static nxt_int_t nxt_main_file_store_inherit(nxt_task_t *task,
     nxt_file_t *tmp, const char *name);
 static void nxt_main_port_access_log_handler(nxt_task_t *task,
@@ -744,20 +742,6 @@ nxt_main_test_run_start_process_handler(nxt_task_t *task,
     nxt_main_start_process_handler(task, msg);
 }
 
-
-/*
- * Public wrapper that lets src/test/nxt_main_file_store_test.c drive the
- * static nxt_main_file_store() against a scratch directory -- used to
- * verify that the store is atomic and never damages the existing file
- * (issue #215).
- */
-nxt_int_t
-nxt_main_test_run_file_store(nxt_task_t *task, const char *dir,
-    const char *tmp_name, const char *name, u_char *buf, size_t size)
-{
-    return nxt_main_file_store(task, dir, tmp_name, name, buf, size);
-}
-
 #endif
 
 
@@ -845,6 +829,7 @@ static nxt_port_handlers_t  nxt_main_process_port_handlers = {
 #if (NXT_TLS)
     .cert_get         = nxt_cert_store_get_handler,
     .cert_delete      = nxt_cert_store_delete_handler,
+    .cert_store       = nxt_cert_store_put_handler,
 #endif
 #if (NXT_HAVE_NJS)
     .script_get       = nxt_script_store_get_handler,
@@ -1986,7 +1971,7 @@ cleanup:
  * exists, its mode and ownership are carried over to the replacement, so a
  * state file an administrator has re-permissioned keeps its settings.
  */
-static nxt_int_t
+nxt_int_t
 nxt_main_file_store(nxt_task_t *task, const char *dir, const char *tmp_name,
     const char *name, u_char *buf, size_t size)
 {

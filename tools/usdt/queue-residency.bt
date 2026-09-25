@@ -1,0 +1,40 @@
+#!/usr/bin/env bpftrace
+/*
+ * Copyright (C) FreeUnit contributors.
+ *
+ * App-queue message residency (enqueue -> dequeue) and depth, keyed by
+ * (slot, tracking id): a slot index alone repeats across app queues.
+ * The dequeue probe fires in the application process.
+ *   bpftrace tools/usdt/queue-residency.bt -p <pid>
+ * Needs a --usdt build: docs/observability/usdt.md.
+ */
+
+BEGIN
+{
+    printf("Tracing freeunit app-queue enqueue -> dequeue residency. Ctrl-C to stop.\n");
+    @depth = 0;
+}
+
+usdt:/usr/sbin/unitd:freeunit:queue__enqueue
+{
+    @qstart[arg0, arg1] = nsecs;
+    @depth++;
+}
+
+usdt:*:freeunit:queue__dequeue
+/@qstart[arg0, arg1]/
+{
+    @queue_residency_ns = hist(nsecs - @qstart[arg0, arg1]);
+    delete(@qstart[arg0, arg1]);
+    @depth--;
+}
+
+interval:s:5
+{
+    print(@depth);
+}
+
+END
+{
+    clear(@qstart);
+}

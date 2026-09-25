@@ -10,7 +10,8 @@
 #   fuzzing/run-ci.sh [-t SECONDS] [TARGET ...]
 #
 #   -t SECONDS   libFuzzer budget per target (default 60)
-#   TARGET ...   fuzzer names; default is all five
+#   TARGET ...   fuzzer names; default is every target the build produced:
+#                all ten, plus fuzz_http_h2p when configure had --h2
 #
 # Expects the fuzzers to be built already:
 #   CC=clang CXX=clang++ \
@@ -42,25 +43,55 @@ case "$BUDGET" in
     ''|*[!0-9]*) die "budget must be a whole number of seconds, got '$BUDGET'" ;;
 esac
 
-# Seed corpus and dictionary per target.  fuzz_http_* share the HTTP corpus.
+# Seed corpus and dictionary per target.  The fuzz_http_* targets that take a
+# request share the HTTP corpus; the others have one of their own.
+# fuzz_http_h2p is matched before fuzz_http_* since it is a fuzz_http_* name
+# too, but has its own corpus (fuzz_h2p_seed_corpus) and dictionary
+# (fuzz_h2.dict) -- nghttp2's frame/HPACK bytes are not useful to the h1
+# targets or vice versa.
 corpus_for() {
     case "$1" in
         fuzz_basic)     echo fuzz_basic_seed_corpus ;;
         fuzz_json)      echo fuzz_json_seed_corpus ;;
+        fuzz_unit_msg)  echo fuzz_unit_msg_seed_corpus ;;
+        fuzz_router_app_response)
+                        echo fuzz_router_app_response_seed_corpus ;;
+        fuzz_http_h2p)  echo fuzz_h2p_seed_corpus ;;
+        fuzz_http_chunk | fuzz_http_h1p_peer_response | fuzz_http_ws_utf8)
+                        echo "$1_seed_corpus" ;;
         fuzz_http_*)    echo fuzz_http_seed_corpus ;;
         *)              die "unknown target: $1" ;;
     esac
 }
 
+# fuzz_http.dict is request words; it helps the upstream response header too,
+# but not a chunked body or WebSocket text.
 dict_for() {
     case "$1" in
+        fuzz_http_h2p)  echo fuzz_h2.dict ;;
+        fuzz_http_chunk | fuzz_http_ws_utf8)
+                        echo "" ;;
         fuzz_http_*)    echo fuzz_http.dict ;;
         *)              echo "" ;;
     esac
 }
 
-[ $# -gt 0 ] || set -- fuzz_basic fuzz_json fuzz_http_controller \
-                       fuzz_http_h1p fuzz_http_h1p_peer
+if [ $# -eq 0 ]; then
+    set -- fuzz_basic fuzz_json fuzz_http_controller \
+           fuzz_http_h1p fuzz_http_h1p_peer \
+           fuzz_http_h1p_peer_response fuzz_http_chunk \
+           fuzz_http_ws_utf8 \
+           fuzz_router_app_response fuzz_unit_msg
+
+    # fuzz_http_h2p only exists when configure had --h2 (nghttp2); the other
+    # ten targets do not depend on it, so a build without it must still run
+    # them rather than fail outright.  A target named explicitly on the
+    # command line, in contrast, is expected to exist -- the "no fuzzer at"
+    # check below catches that plainly instead.
+    if [ -x "$BUILD/fuzz_http_h2p" ]; then
+        set -- "$@" fuzz_http_h2p
+    fi
+fi
 
 # Freeze the list: the loop below rebuilds "$@" to hold each target's libFuzzer
 # arguments, so it cannot also be the list being iterated.

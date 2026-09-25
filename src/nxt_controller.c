@@ -29,6 +29,15 @@ typedef struct {
 } nxt_controller_request_t;
 
 
+#if (NXT_TLS)
+typedef struct {
+    nxt_str_t                 name;
+    nxt_cert_t                *cert;
+    nxt_controller_request_t  *req;
+} nxt_controller_cert_store_t;
+#endif
+
+
 typedef struct {
     nxt_uint_t        status;
     nxt_conf_value_t  *conf;
@@ -98,7 +107,9 @@ static void nxt_controller_status_response(nxt_task_t *task,
 #if (NXT_TLS)
 static void nxt_controller_process_cert(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_str_t *path);
-static void nxt_controller_process_cert_save(nxt_task_t *task,
+static void nxt_controller_cert_store_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static void nxt_controller_cert_apply_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 static nxt_bool_t nxt_controller_cert_in_use(nxt_str_t *name);
 static void nxt_controller_cert_cleanup(nxt_task_t *task, void *obj,
@@ -1866,13 +1877,13 @@ static void
 nxt_controller_process_cert(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_str_t *path)
 {
-    u_char                     *p;
-    nxt_str_t                  name;
-    nxt_int_t                  ret;
-    nxt_conn_t                 *c;
-    nxt_cert_t                 *cert;
-    nxt_conf_value_t           *value;
-    nxt_controller_response_t  resp;
+    u_char                       *p;
+    nxt_str_t                    name;
+    nxt_conn_t                   *c;
+    nxt_cert_t                   *cert;
+    nxt_conf_value_t             *value;
+    nxt_controller_response_t    resp;
+    nxt_controller_cert_store_t  *store;
 
     name.length = path->length - 1;
     name.start = path->start + 1;
@@ -1922,14 +1933,24 @@ nxt_controller_process_cert(nxt_task_t *task,
         return;
     }
 
-    if (name.length == 0 || path != NULL) {
+    /* Names starting with "." are reserved for the store's own files. */
+    if (name.length == 0 || path != NULL || name.start[0] == '.') {
         goto invalid_name;
     }
 
+    /*
+     * A store or a delete must not interleave with a reconfiguration that
+     * is still in flight: the router reads the bundles while it applies.
+     */
+    if (nxt_controller_check_postpone_request(task)) {
+        nxt_queue_insert_tail(&nxt_controller_waiting_requests, &req->link);
+        return;
+    }
+
     if (nxt_str_eq(&req->parser.method, "PUT", 3)) {
-        value = nxt_cert_info_get(&name);
-        if (value != NULL) {
-            goto exists_cert;
+        /* Main refuses more than this; say so here instead of a 500. */
+        if (nxt_buf_mem_used_size(&c->read->mem) > NXT_CERT_STORE_MAX_SIZE) {
+            goto too_large;
         }
 
         cert = nxt_cert_mem(task, &c->read->mem);
@@ -1937,16 +1958,21 @@ nxt_controller_process_cert(nxt_task_t *task,
             goto invalid_cert;
         }
 
-        ret = nxt_cert_info_save(&name, cert);
-
-        nxt_cert_destroy(cert);
-
-        if (nxt_slow_path(ret != NXT_OK)) {
+        store = nxt_mp_get(c->mem_pool, sizeof(nxt_controller_cert_store_t));
+        if (nxt_slow_path(store == NULL)) {
+            nxt_cert_destroy(cert);
             goto alloc_fail;
         }
 
-        nxt_cert_store_get(task, &name, c->mem_pool,
-                           nxt_controller_process_cert_save, req);
+        store->name = name;
+        store->cert = cert;
+        store->req = req;
+
+        /* Holds every other change back until main has answered. */
+        nxt_queue_insert_head(&nxt_controller_waiting_requests, &req->link);
+
+        nxt_cert_store_put(task, &name, &c->read->mem, c->mem_pool,
+                           nxt_controller_cert_store_handler, store);
         return;
     }
 
@@ -1994,10 +2020,10 @@ invalid_cert:
     nxt_controller_response(task, req, &resp);
     return;
 
-exists_cert:
+too_large:
 
-    resp.status = 400;
-    resp.title = (u_char *) "Certificate already exists.";
+    resp.status = 413;
+    resp.title = (u_char *) "Certificate bundle is too large.";
     resp.offset = -1;
 
     nxt_controller_response(task, req, &resp);
@@ -2041,42 +2067,113 @@ alloc_fail:
 }
 
 
+/*
+ * Main has stored the bundle, or failed to.  The metadata is saved only
+ * now, so a failed store leaves no phantom certificate behind.  When the
+ * current configuration names the bundle, it is sent to the router again:
+ * the router reads every bundle on a reconfiguration, so new handshakes
+ * get the new certificate, and the connections already accepted keep the
+ * context they were accepted with.
+ */
 static void
-nxt_controller_process_cert_save(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+nxt_controller_cert_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
-    nxt_conn_t                *c;
-    nxt_buf_mem_t             *mbuf;
-    nxt_controller_request_t  *req;
-    nxt_controller_response_t  resp;
+    nxt_int_t                    rc;
+    nxt_runtime_t                *rt;
+    nxt_controller_request_t     *req;
+    nxt_controller_response_t    resp;
+    nxt_controller_cert_store_t  *store;
 
-    req = data;
+    store = data;
+    req = store->req;
+
+    nxt_queue_remove(&req->link);
 
     nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
     if (msg == NULL || msg->port_msg.type == _NXT_PORT_MSG_RPC_ERROR) {
+        nxt_cert_destroy(store->cert);
+
         resp.status = 500;
         resp.title = (u_char *) "Failed to store certificate.";
-
-        nxt_controller_response(task, req, &resp);
-        return;
+        resp.offset = -1;
+        goto done;
     }
 
-    c = req->conn;
+    rc = nxt_cert_info_save(&store->name, store->cert);
 
-    mbuf = &c->read->mem;
+    nxt_cert_destroy(store->cert);
 
-    nxt_fd_write(msg->fd[0], mbuf->pos, nxt_buf_mem_used_size(mbuf));
+    if (nxt_slow_path(rc != NXT_OK)) {
+        resp.status = 500;
+        resp.title = (u_char *) "Memory allocation failed.";
+        resp.offset = -1;
+        goto done;
+    }
 
-    nxt_fd_close(msg->fd[0]);
-    msg->fd[0] = -1;
+    rt = task->thread->runtime;
 
-    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+    /* Without a router, the next one loads the new bundle on its own. */
+
+    if (nxt_controller_cert_in_use(&store->name)
+        && nxt_controller_router_ready
+        && rt->port_by_type[NXT_PROCESS_ROUTER] != NULL)
+    {
+        rc = nxt_controller_conf_send(task, req->conn->mem_pool,
+                                      nxt_controller_conf.root,
+                                      nxt_controller_cert_apply_handler, req);
+
+        if (nxt_fast_path(rc == NXT_OK)) {
+            nxt_queue_insert_head(&nxt_controller_waiting_requests,
+                                  &req->link);
+            return;
+        }
+
+        resp.status = 500;
+        resp.title = (u_char *) "Certificate stored but not applied.";
+        resp.offset = -1;
+        goto done;
+    }
 
     resp.status = 200;
     resp.title = (u_char *) "Certificate chain uploaded.";
 
+done:
+
     nxt_controller_response(task, req, &resp);
+
+    nxt_controller_flush_requests(task);
+}
+
+
+static void
+nxt_controller_cert_apply_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_controller_request_t   *req;
+    nxt_controller_response_t  resp;
+
+    req = data;
+
+    nxt_queue_remove(&req->link);
+
+    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+
+    if (msg->port_msg.type == NXT_PORT_MSG_RPC_READY) {
+        resp.status = 200;
+        resp.title = (u_char *) "Certificate chain updated.";
+
+    } else {
+        /* The router kept the old configuration and the old contexts. */
+        resp.status = 500;
+        resp.title = (u_char *) "Certificate stored but not applied.";
+        resp.offset = -1;
+    }
+
+    nxt_controller_response(task, req, &resp);
+
+    nxt_controller_flush_requests(task);
 }
 
 
@@ -2728,6 +2825,10 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
 
     case 405:
         nxt_str_set(&status_line, "405 Method Not Allowed");
+        break;
+
+    case 413:
+        nxt_str_set(&status_line, "413 Payload Too Large");
         break;
 
     default:

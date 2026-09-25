@@ -8,6 +8,7 @@
 
 
 #include <nxt_app_nncq.h>
+#include <nxt_usdt.h>
 
 
 /* Using Numeric Naive Circular Queue as a backend. */
@@ -75,7 +76,14 @@ nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
     qi->tracking = tracking;
     *cookie = i;
 
-    nxt_app_nncq_enqueue(&q->queue, i);
+    if (nxt_slow_path(nxt_app_nncq_enqueue(&q->queue, i) != NXT_OK)) {
+        /* The slot is not lost with the message. */
+        (void) nxt_app_nncq_enqueue(&q->free_items, i);
+
+        return NXT_ERROR;
+    }
+
+    NXT_USDT(queue__enqueue, i, tracking);
 
     n = nxt_atomic_cmp_set(&q->notified, 0, 1);
 
@@ -121,6 +129,8 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
 
     qi = (nxt_app_queue_item_t *) &q->items[i];
 
+    NXT_USDT(queue__dequeue, i, qi->tracking);
+
     /*
      * qi lives in shared memory that the peer can write.  Cap qi->size at
      * the slot's data bound (NXT_APP_QUEUE_MSG_SIZE) before the memcpy so
@@ -138,7 +148,7 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
     nxt_memcpy(p, qi->data, size);
     *cookie = i;
 
-    nxt_app_nncq_enqueue(&q->free_items, i);
+    (void) nxt_app_nncq_enqueue(&q->free_items, i);
 
     return size;
 }

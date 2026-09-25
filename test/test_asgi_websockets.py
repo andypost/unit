@@ -1453,6 +1453,105 @@ def test_asgi_websockets_10_1_1():
     close_connection(sock)
 
 
+def check_mirror(sock, opcode, payload):
+    # A refusal is a CLOSE; name its code rather than fail to decode it.
+    frame = ws.frame_read(sock)
+
+    assert frame['opcode'] != ws.OP_CLOSE, f"closed with {frame.get('code')}"
+
+    check_frame(frame, True, opcode, payload)
+
+
+def mirror(max_frame_size=None):
+    client.load('websockets/mirror')
+
+    if max_frame_size is not None:
+        websocket = {'max_frame_size': max_frame_size, 'keepalive_interval': 0}
+        assert 'success' in client.conf(
+            {'http': {'websocket': websocket}}, 'settings'
+        ), 'increase max_frame_size'
+
+    return ws.upgrade()[1]
+
+
+# The module's own accumulation limit is 10 MiB per message; a default
+# max_frame_size frame carries 2**20 - 14 bytes of payload.
+F_SIZE = 2**20 - 14
+
+
+@pytest.mark.parametrize(
+    'size, fragment',
+    [
+        (2 * 2**20, 64 * 2**10),  # used to be capped at 1 MiB per message
+        (10 * F_SIZE, F_SIZE),  # just under 10 MiB
+    ],
+)
+def test_asgi_websockets_fragmented_message(size, fragment):
+    sock = mirror()
+
+    ws.message(sock, ws.OP_TEXT, '*' * size, fragmention_size=fragment)
+    check_mirror(sock, ws.OP_TEXT, '*' * size)
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_message_after_fragmented_message():
+    sock = mirror()
+
+    payload = '*' * (1000 * 2**10)
+    ws.message(sock, ws.OP_TEXT, payload, fragmention_size=300 * 2**10)
+    check_mirror(sock, ws.OP_TEXT, payload)
+
+    # The per-frame counter used to keep the 900 KiB of the message above
+    # when it went straight to a waiting receive(); rerun on a 1009, do not
+    # add a sleep.
+    payload = '*' * 512 * 2**10
+    ws.frame_write(sock, ws.OP_TEXT, payload)
+    check_mirror(sock, ws.OP_TEXT, payload)
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_frame_over_buffer_limit():
+    # The limit's floor admits one bigger frame; covered only here outside
+    # --unsafe.
+    sock = mirror(16777216)
+
+    payload = '*' * 11 * 2**20
+    ws.frame_write(sock, ws.OP_TEXT, payload)
+    check_mirror(sock, ws.OP_TEXT, payload)
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_message_over_buffer_limit():
+    sock = mirror()
+
+    ws.message(sock, ws.OP_TEXT, '*' * 11 * F_SIZE, fragmention_size=F_SIZE)
+
+    check_close(sock, 1009)  # 1009 - CLOSE_TOO_LARGE
+
+
+@pytest.mark.parametrize(
+    'opcode, payload, code',
+    [
+        # The floor admits one over-limit frame into an empty queue only.
+        ('OP_CONT', '*', 1009),
+        # CLOSE is exempt from the limit.
+        ('OP_CLOSE', None, 1000),
+    ],
+)
+def test_asgi_websockets_after_frame_over_buffer_limit(opcode, payload, code):
+    sock = mirror(33554432)
+
+    ws.frame_write(sock, ws.OP_TEXT, '*' * 12 * 2**20, fin=False)
+    time.sleep(2)
+
+    ws.frame_write(sock, getattr(ws, opcode), payload or ws.serialize_close())
+
+    check_close(sock, code)
+
+
 # settings
 
 

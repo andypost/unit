@@ -79,9 +79,11 @@ NXT_LIB_SRCS=" \
     src/nxt_controller.c \
     src/nxt_router.c \
     src/nxt_router_access_log.c \
+    src/nxt_router_schedule.c \
     src/nxt_h1proto.c \
     src/nxt_status.c \
     src/nxt_http_request.c \
+    src/nxt_http_devnull.c \
     src/nxt_http_response.c \
     src/nxt_http_error.c \
     src/nxt_http_route.c \
@@ -145,6 +147,8 @@ NXT_TEST_BUILD_SRCS="src/nxt_test_build.c"
 
 NXT_TEST_DEPS="src/test/nxt_tests.h \
     src/test/nxt_rbtree1.h \
+    src/nxt_checked.h \
+    src/nxt_span.h \
 "
 
 NXT_TEST_SRCS=" \
@@ -162,18 +166,25 @@ NXT_TEST_SRCS=" \
     src/test/nxt_utf8_sanitize_test.c \
     src/test/nxt_rbtree1_test.c \
     src/test/nxt_http_parse_test.c \
+    src/test/nxt_http_request_fields_test.c \
     src/test/nxt_strverscmp_test.c \
     src/test/nxt_base64_test.c \
     src/test/nxt_string_test.c \
+    src/test/nxt_buf_test.c \
     src/test/nxt_http_chunk_parse_test.c \
+    src/test/nxt_http_validate_host_test.c \
+    src/test/nxt_http_request_body_alloc_test.c \
     src/test/nxt_conf_parse_test.c \
     src/test/nxt_port_fail_test.c \
+    src/test/nxt_fd_event_change_test.c \
     src/test/nxt_port_use_unless_zero_test.c \
     src/test/nxt_port_mmap_range_test.c \
+    src/test/nxt_port_mmap_read_test.c \
     src/test/nxt_port_ready_test.c \
     src/test/nxt_router_new_port_test.c \
     src/test/nxt_router_start_fail_test.c \
     src/test/nxt_router_start_fail_soak_test.c \
+    src/test/nxt_router_start_proto_gone_test.c \
     src/test/nxt_router_proto_wedge_test.c \
     src/test/nxt_router_proto_death_test.c \
     src/test/nxt_router_start_timeout_test.c \
@@ -189,6 +200,14 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_fd_test.c \
     src/test/nxt_port_rpc_fd_test.c \
     src/test/nxt_port_queued_fd_test.c \
+    src/test/nxt_nncq_bound_test.c \
+    src/test/nxt_checked_test.c \
+    src/test/nxt_router_schedule_test.c \
+    src/test/nxt_router_prepare_msg_test.c \
+    src/test/nxt_router_response_parse_test.c \
+    src/test/nxt_port_frag_test.c \
+    src/test/nxt_port_release_test.c \
+    src/test/nxt_usdt_test.c \
 "
 
 
@@ -214,6 +233,11 @@ fi
 
 if [ $NXT_OPENSSL = YES ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_OPENSSL_SRCS"
+fi
+
+
+if [ "$NXT_HAVE_NGHTTP2" = "YES" ]; then
+    NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_h2proto.c"
 fi
 
 
@@ -328,13 +352,30 @@ if [ $NXT_TESTS = YES ]; then
 fi
 
 
+# libunit's message-feeding hook is compiled in for the fuzz targets too.
+if [ -n "$NXT_FUZZ" ]; then
+    nxt_have=NXT_FUZZ_BUILD . auto/have
+fi
+
+
 NXT_FUZZ_SRCS=" \
     fuzzing/nxt_basic_fuzz.c \
+    fuzzing/nxt_http_chunk_fuzz.c \
     fuzzing/nxt_http_controller_fuzz.c \
     fuzzing/nxt_http_h1p_fuzz.c \
     fuzzing/nxt_http_h1p_peer_fuzz.c \
+    fuzzing/nxt_http_h1p_peer_response_fuzz.c \
+    fuzzing/nxt_http_ws_utf8_fuzz.c \
     fuzzing/nxt_json_fuzz.c \
+    fuzzing/nxt_router_app_response_fuzz.c \
+    fuzzing/nxt_unit_msg_fuzz.c \
 "
+
+# fuzz_http_h2p #includes nxt_h2proto.c to reach its real nghttp2 callbacks
+# (ADR 0005), so it only builds where nxt_h2proto.c itself does.
+if [ "$NXT_HAVE_NGHTTP2" = "YES" ]; then
+    NXT_FUZZ_SRCS="$NXT_FUZZ_SRCS fuzzing/nxt_http_h2p_fuzz.c "
+fi
 
 
 NXT_SRCS=" \

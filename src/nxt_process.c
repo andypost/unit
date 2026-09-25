@@ -5,6 +5,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_usdt.h>
 
 #include <nxt_application.h>
 #include <nxt_cgroup.h>
@@ -674,6 +675,9 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
         }
     }
 #endif
+
+    /* After the pid namespace dance: this is the child's global pid. */
+    NXT_USDT(process__spawn, pid);
 
     process->pid = pid;
     process->isolated_pid = pid;
@@ -1356,10 +1360,26 @@ nxt_nanosleep(nxt_nsec_t ns)
 }
 
 
+/*
+ * The only way a port is linked into a process's port list.  ->process,
+ * ->link and the reference the port holds on the process are set together
+ * here and dropped together by nxt_port_release(), so they cannot diverge
+ * (#425).  A port that is already paired is refused rather than linked a
+ * second time, in every build: a second insert corrupts the list, and an
+ * nxt_assert() would compile out of a release build.
+ */
+
 void
 nxt_process_port_add(nxt_task_t *task, nxt_process_t *process, nxt_port_t *port)
 {
-    nxt_assert(port->process == NULL);
+    /* A double add is a bug: trap it in a debug build, refuse it in any. */
+    nxt_assert(port->process == NULL && port->link.next == NULL);
+
+    if (nxt_slow_path(port->process != NULL || port->link.next != NULL)) {
+        nxt_alert(task, "port %p %d:%d is already paired with a process",
+                  port, port->pid, port->id);
+        return;
+    }
 
     port->process = process;
     nxt_queue_insert_tail(&process->ports, &port->link);

@@ -235,9 +235,45 @@ nxt_port_release(nxt_task_t *task, nxt_port_t *port)
 
     port->app = NULL;
 
-    if (port->link.next != NULL) {
-        nxt_assert(port->process != NULL);
+    /*
+     * port->socket is embedded in the port, so it dies with the memory pool
+     * released at the end of this function.  A change queued for it is held
+     * by pointer in the engine's change batch and is dereferenced when that
+     * batch is committed, which happens at the top of the next poll at the
+     * latest -- after this release.  nxt_port_rearm_now() queues exactly such
+     * a change, and nxt_port_write_msgs() calls it immediately before the
+     * nxt_port_use() that can bring the count to zero and reach here.
+     *
+     * Unlike a connection, a port has no close handler to defer its own
+     * teardown behind the next poll (nxt_conn_close_handler() does that with
+     * a zero timer), and it never deletes its event from the engine.  So the
+     * pending change is dropped instead.
+     *
+     * A port with an engine is released on that engine's thread: the only
+     * other path through nxt_port_use() carries the last drop across with a
+     * work item.  A port that never reached nxt_port_read_enable() or
+     * nxt_port_write_enable() has no engine and has queued nothing.
+     *
+     * ->socket.changing is the engines' own "a change may be buffered" bit.
+     * On kqueue it is only ever a maybe -- set when a change is queued and
+     * cleared only by the cancel, never by a flush -- so the test here can
+     * ask for a scan that finds nothing, but it never skips a cancel that
+     * was needed.
+     *
+     * port->engine is read as the engine the change was queued on, which it
+     * is everywhere but one path: nxt_router_thread_exit_handler() points a
+     * departed worker's port at the router's own engine before it drops the
+     * last reference.  A change left in the departed engine's batch is not
+     * found by the scan below, and is not committed either -- that engine is
+     * never polled again and nxt_event_engine_free() releases it, batch and
+     * all, a few lines further on.
+     */
 
+    if (port->engine != NULL && port->socket.changing) {
+        nxt_fd_event_cancel_changes(port->engine, &port->socket);
+    }
+
+    if (port->link.next != NULL) {
         rt = task->thread->runtime;
 
         /*
@@ -259,7 +295,22 @@ nxt_port_release(nxt_task_t *task, nxt_port_t *port)
 
         nxt_thread_mutex_unlock(&rt->processes_mutex);
 
-        nxt_process_use(task, port->process, -1);
+        /*
+         * nxt_process_port_add() is the only production path that links a
+         * port, and it sets ->process and takes the reference with it.  A
+         * port linked any other way (#425) has no reference to drop: this
+         * used to be an nxt_assert(), which release builds compile out, and
+         * nxt_process_use() then dereferenced NULL.  The unlink above still
+         * has to happen -- the list would otherwise point into the pool
+         * freed below.
+         */
+        if (nxt_fast_path(port->process != NULL)) {
+            nxt_process_use(task, port->process, -1);
+
+        } else {
+            nxt_alert(task, "port %p %d:%d was linked to a process without "
+                      "a process reference", port, port->pid, port->id);
+        }
     }
 
     nxt_mp_release(port->mem_pool);

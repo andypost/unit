@@ -1,0 +1,153 @@
+
+# Copyright (C) FreeUnit contributors.
+
+
+# --hardening=[off|default|strict] (auto/options).  "off" is the default
+# and leaves NXT_CFLAGS/NXT_LD_OPT exactly as auto/cc/test left them, so
+# an existing build that never passes the option is unaffected.
+#
+# Every flag below is probed by actually compiling (and, for the linker
+# flags, linking) a trivial program with it under -Werror before it is
+# added: an older compiler, a different target, or a libc without a given
+# protection just does not get that one flag instead of failing the
+# build.  This mirrors auto/feature's "try it and see" approach without
+# dragging in its value/run reporting, which none of these flags need.
+
+case "$NXT_HARDENING" in
+    off | default | strict)
+    ;;
+
+    *)
+        $echo
+        $echo $0: error: invalid value \"$NXT_HARDENING\" for --hardening.
+        $echo Valid values are: off, default, strict.
+        $echo
+        exit 1
+    ;;
+esac
+
+
+if [ $NXT_HARDENING != off ]; then
+
+# The flags are in the order auto/make uses them: the flag under test lands
+# in NXT_CFLAGS, and CFLAGS from the environment comes last, so a -O0
+# there wins over the built-in -O in the probe as in the build.  The libc
+# header lets glibc's own #warning (a _FORTIFY_SOURCE level it treats as a
+# lower one) fail the probe instead of the real sources.  $2 is extra
+# source for the probe.
+nxt_hardening_try_cflag()
+{
+    nxt_flag=$1
+
+    $echo -n "checking for $nxt_flag ..."
+
+    cat << END > $NXT_AUTOTEST.c
+#include <string.h>
+${2-}
+int main(void) { return 0; }
+END
+
+    if /bin/sh -c "($CC $NXT_CFLAGS $nxt_flag $NXT_CC_OPT $CFLAGS -Werror \
+                    -o $NXT_AUTOTEST $NXT_AUTOTEST.c)" \
+        >> $NXT_AUTOCONF_ERR 2>&1
+    then
+        $echo " found"
+        NXT_CFLAGS="$NXT_CFLAGS $nxt_flag"
+        nxt_ret=0
+    else
+        $echo " not found"
+        nxt_ret=1
+    fi
+
+    rm -rf $NXT_AUTOTEST $NXT_AUTOTEST.c
+
+    return $nxt_ret
+}
+
+
+# Links a trivial program with the given linker flags; the exit status
+# says whether that worked.  Nothing is added to NXT_LD_OPT here.
+nxt_hardening_link()
+{
+    cat << END > $NXT_AUTOTEST.c
+int main(void) { return 0; }
+END
+
+    /bin/sh -c "($CC $CFLAGS $NXT_CFLAGS $NXT_CC_OPT \
+                -o $NXT_AUTOTEST $NXT_AUTOTEST.c $NXT_LD_OPT $*)" \
+        >> $NXT_AUTOCONF_ERR 2>&1
+    nxt_ret=$?
+
+    rm -rf $NXT_AUTOTEST $NXT_AUTOTEST.c
+
+    return $nxt_ret
+}
+
+
+# GNU ld only warns about a -z keyword it does not know and links anyway,
+# so a plain probe would "find" every -z flag.  The probes below run with
+# linker warnings made fatal when the linker takes that flag; macOS ld
+# does not, and there they run without it.
+nxt_hardening_ld_fatal=
+
+nxt_hardening_try_ldflag()
+{
+    nxt_flag=$1
+
+    $echo -n "checking for $nxt_flag ..."
+
+    if nxt_hardening_link $nxt_hardening_ld_fatal $nxt_flag; then
+        $echo " found"
+        NXT_LD_OPT="$NXT_LD_OPT $nxt_flag"
+    else
+        $echo " not found"
+    fi
+}
+
+
+# Stop on error exit status again once the probes below are done, same as
+# auto/cc/test: a probe failing to compile is expected and handled, it
+# must not abort the whole configure run.
+set +e
+
+nxt_hardening_try_cflag -fstack-protector-strong
+nxt_hardening_try_cflag -fstack-clash-protection
+
+# Each compiler rejects the flag for a target it does not apply to
+# (x86 and arm64 respectively), so the probe alone picks the right one.
+nxt_hardening_try_cflag -fcf-protection
+nxt_hardening_try_cflag -mbranch-protection=standard
+
+# _FORTIFY_SOURCE does nothing without optimization, and not every libc
+# says so: check the effective level here.  A level the libc treats as a
+# lower one is a warning, so try the lower one then.
+nxt_fortify_check='#ifndef __OPTIMIZE__
+#error _FORTIFY_SOURCE needs an optimizing build
+#endif'
+
+nxt_hardening_try_cflag -D_FORTIFY_SOURCE=3 "$nxt_fortify_check" \
+    || nxt_hardening_try_cflag -D_FORTIFY_SOURCE=2 "$nxt_fortify_check"
+
+$echo -n "checking for -Wl,--fatal-warnings ..."
+
+if nxt_hardening_link -Wl,--fatal-warnings; then
+    $echo " found"
+    nxt_hardening_ld_fatal=-Wl,--fatal-warnings
+else
+    $echo " not found"
+fi
+
+nxt_hardening_try_ldflag -Wl,-z,relro
+nxt_hardening_try_ldflag -Wl,-z,now
+nxt_hardening_try_ldflag -Wl,-z,noexecstack
+
+if [ $NXT_HARDENING = strict ]; then
+    nxt_hardening_try_cflag -Wformat=2
+    nxt_hardening_try_cflag -Wvla
+    nxt_hardening_try_cflag -Wimplicit-fallthrough
+    nxt_hardening_try_cflag -ftrivial-auto-var-init=pattern
+fi
+
+set -e
+
+fi

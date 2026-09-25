@@ -121,6 +121,27 @@ Dockerfile.%: ../../version template.Dockerfile
 			-e 's,@@MODULE@@,$*,g' \
 			> $@
 
+# Hand-written dev-kit images.  They layer on a published variant instead of
+# building FreeUnit, so they are not generated from template.Dockerfile: the
+# empty rule keeps the Dockerfile.% pattern above from overwriting them, and
+# "clean" leaves them alone, as it does Dockerfile.builder-*.
+# Layer on a local base with e.g.
+#   make build-drupal-core-dev-php8.5 DEVKIT_BASE_drupal-core-dev-php8.5=unit:$(VERSION)-php-8.5
+DEVKITS = drupal-core-dev-php8.5
+DEVKIT_BASE_drupal-core-dev-php8.5 ?= ghcr.io/freeunitorg/freeunit:$(VERSION)-php-8.5
+
+$(addprefix Dockerfile., $(DEVKITS)): ;
+
+# What the image copies in, beyond its Dockerfile.
+build-drupal-core-dev-php8.5: drupal/drupal-dev.sh drupal/unit-drupal.json
+
+$(addprefix build-, $(DEVKITS)): build-%: Dockerfile.%
+	docker build -t unit:$(VERSION)-$* \
+		--build-arg FREEUNIT_VERSION=$(VERSION) \
+		--build-arg BASE_IMAGE=$(DEVKIT_BASE_$*) \
+		-f Dockerfile.$* .
+	touch $@
+
 build-%: Dockerfile.%
 	docker pull $(CONTAINER_$*)
 	docker build --no-cache -t unit:$(VERSION)-$* -f Dockerfile.$* .
@@ -168,8 +189,8 @@ diff-%:
 all: $(addprefix Dockerfile., $(MODVERSIONS))
 
 clean:
-	rm -f $(filter-out $(wildcard Dockerfile.builder-*), $(wildcard Dockerfile.*))
-	rm -f $(addprefix build-, $(MODVERSIONS))
+	rm -f $(filter-out $(wildcard Dockerfile.builder-*) $(addprefix Dockerfile., $(DEVKITS)), $(wildcard Dockerfile.*))
+	rm -f $(addprefix build-, $(MODVERSIONS) $(DEVKITS))
 	rm -rf build-logs
 
 .PHONY: default build dockerfiles clean

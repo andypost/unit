@@ -10,6 +10,62 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="feature">
+<para>
+a top-level "schedules" object: periodic internal requests FreeUnit issues to
+an application on its own, with no client and no sidecar process involved,
+such as a cron trigger for Drupal or another PHP application.  Each schedule
+names a "pass" ("applications/&lt;name&gt;", not a route or an upstream in
+v1), a "uri" sent as a "GET", an "interval" in seconds, and optional
+"jitter", "timeout", "overlap" ("skip"), extra
+"headers" and "run_on_start".  A run is an ordinary application request: it
+is counted in "/status" "requests.total", goes through "limits" and the
+application queue, and is recorded in the access log.  A schedule "timeout"
+abandons the run without stopping the application process, which keeps
+counting against "processes" until it answers.
+</para>
+</change>
+
+<change type="feature">
+<para>
+a "match" rule can require that a header, cookie or argument is absent.  In
+"headers", "cookies" and "arguments", the value null matches only a request
+that has no field with this name; a field with an empty value is present.
+A pattern, including a negated one, still never matches an absent field, so
+existing configurations behave as before.  For "absent or not X", use an array
+of objects: [{"Name": null}, {"Name": "!X"}].
+</para>
+</change>
+
+<change type="feature">
+<para>
+"PUT /certificates/&lt;name&gt;" replaces an existing bundle in place.  The
+bundle is written to a temporary file in the certificate store and renamed
+over the old one, so a crash never leaves a half-written certificate.  When
+the current configuration names the bundle, it is applied again before the
+answer: new handshakes get the new certificate, and connections already
+accepted finish with the old one.  An external ACME client can rotate a
+certificate with one request and no restart; see docs/acme.md.  The request
+waits for a reconfiguration in progress, as a configuration change does, and
+the bundle's description is saved only after the file is in place.  The router
+now opens certificates read-only.  A bundle over 1 MiB is refused with
+413.
+</para>
+</change>
+
+<change type="change">
+<para>
+a certificate bundle whose private key does not belong to its first
+certificate is now refused at upload with 400 "Invalid certificate.".  Before,
+the bundle was stored, and the mismatch broke the next reconfiguration of every
+listener that named it.  Certificate names that start with "." are reserved
+for the store's own files, and files with such names are ignored at startup.
+After an upgrade, a bundle already stored with a mismatched key is not loaded
+(an alert at startup) and leaves /certificates; its file stays in the state
+directory and cannot be deleted through the API, so remove it by hand.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 an application worker that served a WebSocket upgrade never became idle again.
@@ -90,6 +146,18 @@ never filled up will not deliver (#392).
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a port that was closed and freed could leave a pending epoll or kqueue change
+behind it.  The change is held by a pointer into the port, and is applied when
+the batch is committed -- at the top of the next poll at the latest, which is
+after the port's memory pool is released.  The commit then read freed memory,
+and could also name a descriptor number the kernel had already handed to
+somebody else.  A port now drops its pending changes before it is freed
+(#414).
+</para>
+</change>
+
 <change type="change">
 <para>
 upgrade contrib njs to 1.0.1.
@@ -102,6 +170,19 @@ removed the unused job cluster (nxt_job.c, nxt_job.h, and
 nxt_event_conn_job_sendfile.c).  The offload path they implemented had no
 caller anywhere in the tree and its thread pool handoff was structurally
 unreachable, since the connection field it read was never assigned.
+</para>
+</change>
+
+<change type="feature">
+<para>
+HTTP/2 over TLS.  It is off by default and needs a build with the new "--h2"
+configure option, which needs "--openssl" and a libnghttp2 that has
+nghttp2_option_set_max_continuations().  A listener with
+"tls": {"http2": true} offers "h2" and "http/1.1" in ALPN; other clients keep
+using HTTP/1.1.  The limits are fixed in this release: 128 concurrent streams
+and 1000 requests per connection, a 256 KiB stream window and a 1 MiB
+connection window.  HTTP/2 over cleartext (h2c) and server push are not
+supported, and response trailers are not sent yet.
 </para>
 </change>
 
@@ -502,6 +583,37 @@ It could not have compiled had the probe succeeded: it reads "async" and
 "nxt_php_extension_init()", which no file in the tree defines.  The probe, the
 "entrypoint" target key and the TrueAsync test suite are removed with it; a PHP
 application builds and behaves as before.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the Python ASGI module refused a WebSocket message larger than 1 MB whatever
+"max_frame_size" was set to.  The module carried a private 1 MB limit that no
+configuration ever wrote and charged the fragments of a message against it,
+while the configured value is checked by the router per frame: a 4 MB message
+was closed with 1009 where "max_frame_size" was 32 MB, and at the default size
+a client that split a larger message into small frames was refused as well.
+What a message may be is now decided by "max_frame_size" alone, bounded only by
+a 10 MB limit on how much of an undelivered message one connection may hold.
+A fragmented message also left a count behind that lowered the limit applied to
+the next message.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the java module split every outgoing WebSocket text message larger than 8 KiB
+into 8 KiB frames, whatever "max_frame_size" was set to.  A 64 KiB message
+arrived as eight frames and a 16 MiB one as about two thousand, each carrying
+its own frame header and costing its own message to the router, while every
+other language module sends a complete message as a single frame.  A complete
+text message is now encoded into a buffer of its own and sent as one frame; a
+message above "nginx.unit.websocket.MAX_SEND_BUFFER_SIZE", 16 MiB by default,
+still fragments.  A Writer from getSendWriter() still sends each chunk it
+flushes as a frame of its own, but that chunk is now one frame instead of up to
+three.  This does not make the module honour "max_frame_size", which remains an
+inbound limit only.
 </para>
 </change>
 

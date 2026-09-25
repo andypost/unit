@@ -1415,18 +1415,22 @@ def test_http2_long_method():
 
     method = 'A' * 300
 
-    # What HTTP/1 answers to the same method.
-    h1 = client.get_ssl(
-        method=method,
-        context=ssl_context(alpn=('http/1.1',)),
+    # What HTTP/1 answers to the same method.  get() always sends "GET", so
+    # the method goes in as the start of the request.
+    h1 = client.http(
+        method,
+        headers={'Host': 'localhost', 'Connection': 'close'},
+        wrapper=ssl_context(alpn=('http/1.1',)).wrap_socket,
     )['status']
 
     c = H2Client()
     resp = c.send(method, '/')
     resp = c.wait(resp)
 
-    # HTTP/1 takes a 300-byte method, so HTTP/2 does too.
-    assert h1 == 200
+    # The application protocol has one byte for the method length, so
+    # HTTP/1 refuses a 300-byte method with 501 (test_php_protocol_lengths),
+    # and HTTP/2 answers the same.
+    assert h1 == 501
     assert resp['status'] == h1
 
     assert c.get('/')['status'] == 200

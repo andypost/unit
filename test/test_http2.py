@@ -541,7 +541,9 @@ PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
 
 NO_ERROR = 0x0
 PROTOCOL_ERROR = 0x1
+INTERNAL_ERROR = 0x2
 REFUSED_STREAM = 0x7
+CANCEL = 0x8
 ENHANCE_YOUR_CALM = 0xB
 
 
@@ -1074,35 +1076,64 @@ def test_http2_max_concurrent_streams(ack_settings):
     c.close()
 
 
-def test_http2_rst_stream_flood():
-    need_h2()
-    load_return()
+def rst_flood(c, count):
+    """The "rapid reset" pattern: open a stream and cancel it at once."""
 
-    c = RawH2()
-
-    # The "rapid reset" pattern: open a stream and cancel it at once, 1100
-    # times.  Each stream is a request, and the connection serves 1000
-    # requests (NXT_H2P_MAX_REQUESTS), so the GOAWAY comes from that cap:
-    # NO_ERROR with the 1000th stream as the last one.  nghttp2's reset rate
-    # limit (a burst of 1000, NXT_H2P_RST_BURST) is not reached first.
     frames = []
-    for sid in range(1, 2201, 2):
+    for sid in range(1, 2 * count, 2):
         frames.append(c.headers(sid, c.block(), end_stream=False))
-        frames.append(RstStreamFrame(sid, error_code=0x8))
+        frames.append(RstStreamFrame(sid, error_code=CANCEL))
 
     try:
         c.send(*frames)
     except OSError:
         pass
 
-    assert c.wait(lambda: c.goaway is not None)
-    assert c.goaway == (NO_ERROR, 1999)
 
-    # Nothing above the last stream was served.
-    assert all(sid <= 1999 for sid in c.status)
+@pytest.mark.parametrize('count', [300, 1100])
+def test_http2_rst_stream_flood(count):
+    need_h2()
+    load_return()
+
+    c = RawH2()
+    start = time.monotonic()
+
+    # nghttp2's reset rate limit (a burst of 200, NXT_H2P_RST_BURST, then
+    # 33 a second) stops the flood long before the request cap of 1000
+    # (NXT_H2P_MAX_REQUESTS): GOAWAY, and no stream after its last one.
+    rst_flood(c, count)
+
+    assert c.wait(lambda: c.goaway is not None)
+    elapsed = time.monotonic() - start
+
+    code, last = c.goaway
+    assert code == INTERNAL_ERROR
+
+    # The 201st stream is stream 401; the rate adds some while it runs.
+    refill = int(elapsed * 33) + 1
+    assert 401 <= last <= 401 + 2 * refill, (last, elapsed)
+
+    assert all(sid <= last for sid in c.status)
+    assert c.wait_closed()
     c.close()
 
     assert_serves()
+
+
+def test_http2_rst_stream_burst():
+    need_h2()
+    load_return()
+
+    # 150 cancelled streams, within the burst, are no attack: the
+    # connection is kept and serves the next request.
+    c = RawH2()
+    rst_flood(c, 150)
+
+    c.request(301)
+    assert c.wait_response(301) == 200
+    assert c.goaway is None
+    assert not c.closed
+    c.close()
 
 
 def test_http2_continuation_flood():
@@ -1371,9 +1402,6 @@ def test_http2_proxy(proto):
 
 
 # Stage 3: drain, shutdown, flow control and the error matrix.
-
-INTERNAL_ERROR = 0x2
-CANCEL = 0x8
 
 # The last stream ID of a shutdown notice (RFC 9113, 6.8).
 NOTICE = (NO_ERROR, 2**31 - 1)

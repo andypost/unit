@@ -34,7 +34,17 @@
 #define NXT_H2P_CONN_WINDOW             (1024 * 1024)
 #define NXT_H2P_HEADER_TABLE_SIZE       4096
 #define NXT_H2P_MAX_REQUESTS            1000
-#define NXT_H2P_RST_BURST               1000
+
+/*
+ * nghttp2's limit of RST_STREAM frames from the client: a burst, then so
+ * many a second.  Over it nghttp2 sends GOAWAY and serves no new stream.
+ * The burst is well below NXT_H2P_MAX_REQUESTS: with a burst as large as
+ * the request cap, a "rapid reset" flood got 1000 requests into the router
+ * on every connection and the limit was never reached.  nghttp2 stops
+ * counting once any GOAWAY has been submitted, a shutdown notice too; the
+ * request cap and the drain timeout still bound such a connection.
+ */
+#define NXT_H2P_RST_BURST               200
 #define NXT_H2P_RST_RATE                33
 #define NXT_H2P_MAX_CONTINUATIONS       8
 #define NXT_H2P_MAX_SETTINGS            32

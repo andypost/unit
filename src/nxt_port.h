@@ -71,6 +71,9 @@ struct nxt_port_handlers_s {
      * inserting or reordering a slot renumbers the wire protocol.
      */
     nxt_port_handler_t  detached;
+
+    /* A certificate bundle for main to store; appended, see above. */
+    nxt_port_handler_t  cert_store;
 };
 
 
@@ -129,6 +132,7 @@ typedef enum {
     _NXT_PORT_MSG_READ_SOCKET     = nxt_port_handler_idx(read_socket),
 
     _NXT_PORT_MSG_DETACHED        = nxt_port_handler_idx(detached),
+    _NXT_PORT_MSG_CERT_STORE      = nxt_port_handler_idx(cert_store),
 
     NXT_PORT_MSG_MAX              = sizeof(nxt_port_handlers_t)
                                     / sizeof(nxt_port_handler_t),
@@ -175,6 +179,7 @@ typedef enum {
     NXT_PORT_MSG_READ_QUEUE       = _NXT_PORT_MSG_READ_QUEUE,
     NXT_PORT_MSG_READ_SOCKET      = _NXT_PORT_MSG_READ_SOCKET,
     NXT_PORT_MSG_DETACHED         = nxt_msg_last(_NXT_PORT_MSG_DETACHED),
+    NXT_PORT_MSG_CERT_STORE       = nxt_msg_last(_NXT_PORT_MSG_CERT_STORE),
 } nxt_port_msg_type_t;
 
 

@@ -7,6 +7,7 @@
 #include <nxt_main.h>
 #include <nxt_conf.h>
 #include <nxt_cert.h>
+#include <nxt_main_process.h>
 
 #include <dirent.h>
 
@@ -1274,7 +1275,7 @@ nxt_cert_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     if (nxt_slow_path(port->type != NXT_PROCESS_CONTROLLER
                       && port->type != NXT_PROCESS_ROUTER))
     {
-        nxt_alert(task, "process %PI cannot store certificates",
+        nxt_alert(task, "process %PI cannot read certificates",
                   nxt_recv_msg_cmsg_pid(msg));
         nxt_port_recv_msg_close_fds(msg);
         return;
@@ -1304,7 +1305,7 @@ nxt_cert_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     p = nxt_cpymem(file.name, rt->certs.start, rt->certs.length);
     p = nxt_cpymem(p, name.start, name.length + 1);
 
-    ret = nxt_file_open(task, &file, NXT_FILE_RDWR, NXT_FILE_CREATE_OR_OPEN,
+    ret = nxt_file_open(task, &file, NXT_FILE_RDONLY, NXT_FILE_OPEN,
                         NXT_FILE_OWNER_ACCESS);
 
     nxt_free(file.name);
@@ -1331,6 +1332,213 @@ error:
         nxt_fd_close(file.fd);
         file.fd = -1;
     }
+}
+
+
+/*
+ * Ask main to store "mbuf" as the bundle "name".  The bundle travels in a
+ * shared memory segment, as conf.json does; the port message carries the
+ * NUL-terminated name and then the size.  "handler" gets RPC_READY once the
+ * file is in place, or RPC_ERROR.
+ */
+void
+nxt_cert_store_put(nxt_task_t *task, nxt_str_t *name, nxt_buf_mem_t *mbuf,
+    nxt_mp_t *mp, nxt_port_rpc_handler_t handler, void *ctx)
+{
+    void           *mem;
+    size_t         size;
+    uint32_t       stream;
+    nxt_fd_t       fd;
+    nxt_int_t      ret;
+    nxt_buf_t      *b;
+    nxt_port_t     *main_port, *ctl_port;
+    nxt_runtime_t  *rt;
+
+    size = nxt_buf_mem_used_size(mbuf);
+
+    fd = nxt_shm_open(task, size);
+    if (nxt_slow_path(fd == -1)) {
+        goto fail;
+    }
+
+    mem = nxt_mem_mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (nxt_slow_path(mem == MAP_FAILED)) {
+        goto fail;
+    }
+
+    nxt_memcpy(mem, mbuf->pos, size);
+    nxt_mem_munmap(mem, size);
+
+    b = nxt_buf_mem_alloc(mp, name->length + 1 + sizeof(size_t), 0);
+    if (nxt_slow_path(b == NULL)) {
+        goto fail;
+    }
+
+    b->completion_handler = nxt_cert_buf_completion;
+
+    nxt_buf_cpystr(b, name);
+    *b->mem.free++ = '\0';
+    b->mem.free = nxt_cpymem(b->mem.free, &size, sizeof(size_t));
+
+    rt = task->thread->runtime;
+    main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+    ctl_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
+
+    stream = nxt_port_rpc_register_handler(task, ctl_port, handler, handler,
+                                           -1, ctx);
+    if (nxt_slow_path(stream == 0)) {
+        goto fail;
+    }
+
+    ret = nxt_port_socket_write(task, main_port,
+                                NXT_PORT_MSG_CERT_STORE | NXT_PORT_MSG_CLOSE_FD,
+                                fd, stream, ctl_port->id, b);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_rpc_cancel(task, ctl_port, stream);
+        goto fail;
+    }
+
+    /* See nxt_cert_store_get(). */
+    nxt_mp_retain(mp);
+
+    return;
+
+fail:
+
+    /* The port layer owns the descriptor only after a successful write. */
+    if (fd != -1) {
+        nxt_fd_close(fd);
+    }
+
+    handler(task, NULL, ctx);
+}
+
+
+/*
+ * Main's side of nxt_cert_store_put().  The bundle goes through
+ * nxt_main_file_store(): written to "certs/.<name>.tmp", flushed, then
+ * renamed over "certs/<name>", so a reader sees either the old bundle or
+ * the new one, never a torn file.  Only the controller may store, and the
+ * name is checked again here: the controller is unprivileged.
+ */
+void
+nxt_cert_store_put_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    size_t               size, used;
+    u_char               *p, *path, *mem;
+    nxt_str_t            name;
+    nxt_file_t           file;
+    nxt_port_t           *port;
+    nxt_runtime_t        *rt;
+    nxt_port_msg_type_t  type;
+
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_recv_msg_cmsg_pid(msg),
+                                 msg->port_msg.reply_port);
+
+    if (nxt_slow_path(port == NULL || port->type != NXT_PROCESS_CONTROLLER)) {
+        nxt_alert(task, "process %PI cannot store certificates",
+                  nxt_recv_msg_cmsg_pid(msg));
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    rt = task->thread->runtime;
+
+    path = NULL;
+    mem = NULL;
+    type = NXT_PORT_MSG_RPC_ERROR;
+
+    if (nxt_slow_path(rt->certs.start == NULL)) {
+        nxt_alert(task, "no certificates storage directory");
+        goto done;
+    }
+
+    if (nxt_slow_path(msg->fd[0] == -1)) {
+        nxt_alert(task, "cert_store_handler: invalid shm fd");
+        goto done;
+    }
+
+    /* The NUL-terminated name, then the size. */
+
+    used = nxt_buf_mem_used_size(&msg->buf->mem);
+
+    name.start = msg->buf->mem.pos;
+    p = memchr(name.start, '\0', used);
+
+    if (nxt_slow_path(p == NULL
+                      || (size_t) (p - name.start) + 1 + sizeof(size_t) != used
+                      || p == name.start
+                      || name.start[0] == '.'
+                      || memchr(name.start, '/', p - name.start) != NULL))
+    {
+        nxt_alert(task, "cert_store_handler: invalid certificate name");
+        goto done;
+    }
+
+    name.length = p - name.start;
+
+    nxt_memcpy(&size, p + 1, sizeof(size_t));
+
+    if (nxt_slow_path(size == 0 || size > NXT_CERT_STORE_MAX_SIZE)) {
+        nxt_alert(task, "cert_store_handler: invalid bundle size %uz", size);
+        goto done;
+    }
+
+    /*
+     * A copy, not a mapping: the controller keeps the segment and could
+     * shrink it under a mapping, and a read past its end would be SIGBUS
+     * in main.  pread() only fails.  The size is capped above.
+     */
+
+    mem = nxt_malloc(size);
+    if (nxt_slow_path(mem == NULL)) {
+        goto done;
+    }
+
+    nxt_memzero(&file, sizeof(nxt_file_t));
+    file.fd = msg->fd[0];
+
+    if (nxt_slow_path(nxt_file_read(&file, mem, size, 0) != (ssize_t) size)) {
+        nxt_alert(task, "cert_store_handler: short bundle read");
+        goto done;
+    }
+
+    /* "<certs>/<name>" and, after its NUL, "<certs>/.<name>.tmp". */
+
+    path = nxt_malloc(2 * (rt->certs.length + name.length + 1)
+                      + nxt_length(".tmp") + 1);
+    if (nxt_slow_path(path == NULL)) {
+        goto done;
+    }
+
+    p = nxt_cpymem(path, rt->certs.start, rt->certs.length);
+    p = nxt_cpymem(p, name.start, name.length + 1);
+    p = nxt_cpymem(p, rt->certs.start, rt->certs.length);
+    *p++ = '.';
+    p = nxt_cpymem(p, name.start, name.length);
+    nxt_memcpy(p, ".tmp", nxt_length(".tmp") + 1);
+
+    if (nxt_main_file_store(task, (char *) rt->certs.start,
+                            (char *) path + rt->certs.length + name.length + 1,
+                            (char *) path, mem, size)
+        == NXT_OK)
+    {
+        type = NXT_PORT_MSG_RPC_READY_LAST;
+
+    } else {
+        nxt_alert(task, "failed to store certificate \"%V\"", &name);
+    }
+
+done:
+
+    (void) nxt_port_socket_write(task, port, type, -1, msg->port_msg.stream,
+                                 0, NULL);
+
+    nxt_free(mem);
+    nxt_free(path);
+    nxt_port_recv_msg_close_fds(msg);
 }
 
 

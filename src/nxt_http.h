@@ -79,6 +79,7 @@ typedef struct {
 
 
 typedef struct nxt_h1proto_s        nxt_h1proto_t;
+typedef struct nxt_h2p_stream_s     nxt_h2p_stream_t;
 
 struct nxt_h1p_websocket_timer_s {
     nxt_timer_t                     timer;
@@ -90,6 +91,7 @@ struct nxt_h1p_websocket_timer_s {
 typedef union {
     void                            *any;
     nxt_h1proto_t                   *h1;
+    nxt_h2p_stream_t                *h2;
 } nxt_http_proto_t;
 
 

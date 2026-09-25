@@ -79,7 +79,11 @@ struct nxt_h2p_stream_s {
     nxt_off_t                   body_bytes_sent;
     size_t                      header_list_size;
 
-    /* engine->timers.now when the response began to wait for window. */
+    /*
+     * engine->timers.now when the stream's own flow-control window ran
+     * out with response data to send; the connection window has its own
+     * start time in nxt_h2proto_t.
+     */
     nxt_msec_t                  window_start;
 
     nxt_str_t                   authority;
@@ -137,6 +141,12 @@ struct nxt_h2proto_s {
     /* engine->timers.now when the shutdown notice was submitted. */
     nxt_msec_t                  drain_start;
 
+    /*
+     * engine->timers.now when the connection flow-control window ran out
+     * while some response had data to send.
+     */
+    nxt_msec_t                  conn_window_start;
+
     uint8_t                     busy;           /* 1 bit */
     uint8_t                     flush_pending;  /* 1 bit */
     uint8_t                     goaway_sent;    /* 1 bit */
@@ -145,6 +155,7 @@ struct nxt_h2proto_s {
     uint8_t                     close_pending;  /* 1 bit */
     uint8_t                     closed;         /* 1 bit */
     uint8_t                     draining;       /* 1 bit */
+    uint8_t                     window_wait;    /* 1 bit */
 };
 
 

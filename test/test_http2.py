@@ -1738,6 +1738,51 @@ def test_http2_window_stall_connection():
     assert_serves()
 
 
+def test_http2_window_stall_staggered():
+    need_h2()
+    big = load_big({'send_timeout': 2})
+
+    # Stream 1 waits for its own window (10 bytes, never updated) first;
+    # 1.5 s later stream 3 uses up the connection window, which the client
+    # never updates either.  The connection stall has its own start time:
+    # stream 1 is cancelled after its send_timeout, and the connection goes
+    # only send_timeout after its own window ran out.
+    c = RawH2(settings={0x4: 10}, window_update=False)
+
+    c.request(1, path='/big.txt')
+    assert c.wait(lambda: len(c.data.get(1, b'')) == 10)
+    start1 = time.monotonic()
+
+    time.sleep(1.5)
+
+    c.request(3, path='/big.txt')
+    c.send(WindowUpdateFrame(3, window_increment=100000))
+    assert c.wait(
+        lambda: len(c.data.get(1, b'')) + len(c.data.get(3, b'')) == 65535
+    )
+    start3 = time.monotonic()
+
+    assert c.wait(lambda: 1 in c.rst, 5)
+    assert 1.5 < time.monotonic() - start1 < 4, time.monotonic() - start1
+    assert c.rst[1] == CANCEL
+
+    # The old code closed here, with the stream 1 deadline.
+    assert not c.wait_closed(max(0, start3 + 1.2 - time.monotonic()))
+    assert c.goaway is None
+
+    assert c.wait_closed(10)
+    elapsed = time.monotonic() - start3
+
+    assert 1.5 < elapsed < 6, elapsed
+    assert c.goaway == (NO_ERROR, 3)
+    assert c.data[1] == big[:10]
+    assert c.data[3] == big[: 65535 - 10]
+    assert 3 not in c.ended
+    c.close()
+
+    assert_serves()
+
+
 def test_http2_window_update_resumes():
     need_h2()
     big = load_big({'send_timeout': 2})

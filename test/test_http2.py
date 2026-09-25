@@ -1964,3 +1964,29 @@ def test_http2_matrix_request_cap_in_flight():
     c.close()
 
     assert_serves()
+
+
+@pytest.mark.parametrize('path', ['/big.txt', '/nope'], ids=['file', 'error'])
+def test_http2_fail_before_body(path):
+    need_h2()
+    load_share()
+
+    c = RawH2()
+
+    # A request whose response the router starts at once (a static file,
+    # or an error page), and in the same read a connection error: DATA on
+    # an idle stream.  The response header is submitted and the body
+    # handler queued; then the connection fails the request before the body
+    # handler runs.  For the file, the static buffer completion then gave up
+    # the last reference to the request pool before it closed the file: the
+    # pool cleanup closed it first, the second close() failed with EBADF (an
+    # alert, which the fixture checks), and r was written after it was
+    # freed.
+    c.send(c.headers(1, c.block(path=path)), DataFrame(0x1000000, data=b''))
+
+    assert c.wait_closed()
+    assert c.goaway is not None
+    assert c.goaway[0] == PROTOCOL_ERROR
+    c.close()
+
+    assert_serves()

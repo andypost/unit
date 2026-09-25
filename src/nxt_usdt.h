@@ -9,7 +9,7 @@
 /*
  * Static USDT probes, provider "freeunit" (docs/observability/usdt.md).
  *
- *     NXT_USDT(port__send, stream, type);    probe "freeunit:port-send"
+ *     NXT_USDT(port__send, stream, type);    probe "freeunit:port__send"
  *
  * With --usdt a probe is a nop until traced; without, it is nothing.
  * Arguments are evaluated whenever built with --usdt, so they must be cheap:

@@ -295,9 +295,6 @@ nxt_http_request_create(nxt_task_t *task)
     }
 #endif
 
-    /* Last: a request that fails to be created never reaches request-done. */
-    NXT_USDT(request__start, (uintptr_t) r);
-
     return r;
 
 fail:
@@ -1067,8 +1064,6 @@ nxt_http_request_done(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "http request done");
 
-    NXT_USDT(request__done, (uintptr_t) r, (nxt_int_t) r->status);
-
     nxt_http_request_close_handler(task, r, r->proto.any);
 }
 
@@ -1122,6 +1117,13 @@ nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data)
     }
 
     nxt_debug(task, "http request close handler");
+
+    /*
+     * Every request ends here once, whether it was answered, failed or
+     * the client went away; the router's own done handler and a protocol
+     * error skip nxt_http_request_done().  Status 0: no response was sent.
+     */
+    NXT_USDT(request__done, (uintptr_t) r, (nxt_int_t) r->status);
 
     r->proto.any = NULL;
 

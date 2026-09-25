@@ -2,8 +2,9 @@
 /*
  * Copyright (C) FreeUnit contributors.
  *
- * App-queue slot residency (enqueue -> dequeue) and depth.  The
- * dequeue probe fires in the application process.
+ * App-queue message residency (enqueue -> dequeue) and depth, keyed by
+ * (slot, tracking id): a slot index alone repeats across app queues.
+ * The dequeue probe fires in the application process.
  *   bpftrace tools/usdt/queue-residency.bt -p <pid>
  * Needs a --usdt build: docs/observability/usdt.md.
  */
@@ -16,15 +17,15 @@ BEGIN
 
 usdt:/usr/sbin/unitd:freeunit:queue__enqueue
 {
-    @qstart[arg0] = nsecs;
+    @qstart[arg0, arg1] = nsecs;
     @depth++;
 }
 
 usdt:*:freeunit:queue__dequeue
-/@qstart[arg0]/
+/@qstart[arg0, arg1]/
 {
-    @queue_residency_ns = hist(nsecs - @qstart[arg0]);
-    delete(@qstart[arg0]);
+    @queue_residency_ns = hist(nsecs - @qstart[arg0, arg1]);
+    delete(@qstart[arg0, arg1]);
     @depth--;
 }
 

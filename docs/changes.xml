@@ -17,6 +17,9 @@ certificate is now refused at upload with 400 "Invalid certificate.".  Before,
 the bundle was stored, and the mismatch broke the next reconfiguration of every
 listener that named it.  Certificate names that start with "." are reserved
 for the store's own files, and files with such names are ignored at startup.
+After an upgrade, a bundle already stored with a mismatched key is not loaded
+(an alert at startup) and leaves /certificates; its file stays in the state
+directory and cannot be deleted through the API, so remove it by hand.
 </para>
 </change>
 

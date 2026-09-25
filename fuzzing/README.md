@@ -37,7 +37,10 @@ $ make fuzz -j$(nproc)
 `fuzz_http_h2p` (below) needs the h2 frontend built in: add `--openssl --h2`
 (the latter needs the former) to that `configure` line, and its own
 `libnghttp2` development package installed. Left out, `make fuzz` simply
-builds the other five targets, same as it always has.
+builds the other five targets, same as it always has. `build-fuzz.sh` and
+`oss-fuzz.sh` add them when `libnghttp2` is installed, and if that
+`configure` fails (no OpenSSL development files, or an nghttp2 without the
+setters `auto/h2` probes for) they say so and configure again without them.
 
 #### Running fuzzers.
 

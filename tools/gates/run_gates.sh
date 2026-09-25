@@ -20,7 +20,7 @@ GATES=1,2,3,5,6
 # Tests that need no language module: G1 builds none.
 SLICE="test_static.py test_variables.py test_return.py"
 FUZZ_SECONDS=20
-PYTEST=/root/.local/bin/pytest
+PYTEST=${PYTEST:-pytest}
 FAILED=0
 
 export JAVA_TOOL_OPTIONS=

@@ -50,7 +50,8 @@ RUN set -eux \
     && apt-get install -y --no-install-recommends \
          git unzip sqlite3 patch less procps openssh-client \
     && rm -rf /var/lib/apt/lists/* \
-    && for m in gd intl zip pdo_mysql pdo_pgsql pdo_sqlite; do \
+    && for m in gd intl zip pdo_mysql pdo_pgsql pdo_sqlite \
+         dom SimpleXML tokenizer xml xmlwriter; do \
          php -m | grep -qx "$m" || exit 1; done \
     && php -d zend_extension=xdebug -m | grep -qx xdebug \
     && ! php -m | grep -qx xdebug

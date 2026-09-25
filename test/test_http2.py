@@ -1857,14 +1857,31 @@ def load_matrix(processes=4):
     )
 
 
-def app_pids(name):
-    out = subprocess.check_output(['ps', 'ax']).decode()
+def app_pids(name, unit_pid):
+    """The application processes of this Unit only: children of the
+    prototype that this Unit's main process started.  Another Unit on the
+    host (a parallel test run) can run an application of the same name."""
+
+    out = subprocess.check_output(
+        ['ps', 'ax', '-o', 'pid=,ppid=,args=']
+    ).decode()
+    procs = [
+        (int(pid), int(ppid), args)
+        for pid, ppid, args in re.findall(
+            r'^\s*(\d+)\s+(\d+)\s+(.*)$', out, re.M
+        )
+    ]
+
+    prototypes = {
+        pid
+        for pid, ppid, args in procs
+        if ppid == unit_pid and f'unit: "{name}" prototype' in args
+    }
 
     return [
-        int(pid)
-        for pid in re.findall(
-            rf'^\s*(\d+).*unit: "{name}" application', out, re.M
-        )
+        pid
+        for pid, ppid, args in procs
+        if ppid in prototypes and f'unit: "{name}" application' in args
     ]
 
 
@@ -1959,11 +1976,9 @@ def test_http2_matrix_client_goaway():
     assert_serves()
 
 
-def test_http2_matrix_app_crash(skip_alert):
+def test_http2_matrix_app_crash(skip_alert, unit_pid, wait_for_record):
     need_h2()
     load_matrix()
-
-    skip_alert(r'process \d+ exited on signal 9')
 
     c = RawH2()
     sids = [1, 3, 5, 7, 9, 11]
@@ -1973,10 +1988,11 @@ def test_http2_matrix_app_crash(skip_alert):
         c.request(sid, path='/slow', headers=[('x-delay', '5')])
 
     time.sleep(1.5)
-    pids = app_pids('delayed')
+    pids = app_pids('delayed', unit_pid)
     assert pids
 
     for pid in pids:
+        skip_alert(fr'app process {pid} exited on signal 9')
         os.kill(pid, signal.SIGKILL)
 
     # Every stream ends, with an error response or a reset, and the
@@ -1993,6 +2009,11 @@ def test_http2_matrix_app_crash(skip_alert):
     c.close()
 
     assert_serves()
+
+    # The prototype reaps the workers and logs each death on its own time.
+    # Wait for the lines, so they fall in the log of this test.
+    for pid in pids:
+        assert wait_for_record(fr'app process {pid} exited on signal 9')
 
 
 def test_http2_matrix_tls_abort():

@@ -615,6 +615,7 @@ class RawH2:
         self.buf = b''
         self.closed = False
         self.goaway = None
+        self.goaways = []
         self.frames = []
         self.status = {}
         self.data = {}
@@ -727,6 +728,7 @@ class RawH2:
 
         elif isinstance(frame, GoAwayFrame):
             self.goaway = (frame.error_code, frame.last_stream_id)
+            self.goaways.append(self.goaway)
 
         elif isinstance(frame, PingFrame) and 'ACK' not in frame.flags:
             self.send(
@@ -1360,3 +1362,124 @@ def test_http2_proxy(proto):
     for size in [10, 50000]:
         body = os.urandom(size // 2).hex().encode()
         assert h1_or_h2(proto, body=body) == (200, body), size
+
+
+# Stage 3: drain, shutdown, flow control and the error matrix.
+
+INTERNAL_ERROR = 0x2
+CANCEL = 0x8
+
+# The last stream ID of a shutdown notice (RFC 9113, 6.8).
+NOTICE = (NO_ERROR, 2**31 - 1)
+
+
+def load_drain(settings=None):
+    """The listener passes to the "delayed" application; "routes" answers
+    201, so a request shows which configuration served it."""
+
+    conf = {
+        'listeners': {'*:8080': {'pass': 'applications/delayed'}},
+        'routes': [{'action': {'return': 201}}],
+        'applications': {'delayed': python_app('delayed')},
+    }
+
+    if settings is not None:
+        conf['settings'] = {'http': settings}
+
+    load_conf(conf)
+
+
+def test_http2_drain_reconfigure():
+    need_h2()
+    load_drain()
+
+    c = RawH2()
+    c.request(1, headers=[('x-delay', '3')])
+
+    # The request is with its application: the connection has no event of
+    # its own when the configuration changes.
+    time.sleep(1)
+    start = time.monotonic()
+    assert 'success' in client.conf('"routes"', 'listeners/*:8080/pass')
+
+    # The shutdown notice comes at once, before the response.
+    assert c.wait(lambda: NOTICE in c.goaways, 2)
+    assert time.monotonic() - start < 1.5
+    assert 1 not in c.ended
+    assert not c.closed
+
+    # The request in flight completes; then the final GOAWAY names it as
+    # the last stream, and the connection closes.
+    assert c.wait_response(1) == 200
+    assert c.wait_closed()
+    assert c.goaways == [NOTICE, (NO_ERROR, 1)]
+    c.close()
+
+    # A new connection has the new configuration.
+    new = H2Client()
+    assert new.get('/')['status'] == 201
+    new.close()
+
+
+def test_http2_drain_listener_delete():
+    need_h2()
+    load_drain()
+
+    c = RawH2()
+    c.request(1, headers=[('x-delay', '2')])
+
+    time.sleep(1)
+    assert 'success' in client.conf_delete('listeners/*:8080')
+
+    assert c.wait(lambda: NOTICE in c.goaways, 2)
+    assert c.wait_response(1) == 200
+    assert c.wait_closed()
+    assert c.goaways == [NOTICE, (NO_ERROR, 1)]
+    c.close()
+
+
+def test_http2_drain_idle():
+    need_h2()
+    load_drain()
+
+    c = RawH2()
+    c.request(1)
+    assert c.wait_response(1) == 200
+
+    # An idle connection leaves at once, with no notice: no stream is in
+    # flight.
+    start = time.monotonic()
+    assert 'success' in client.conf('"routes"', 'listeners/*:8080/pass')
+
+    assert c.wait_closed(5)
+    assert time.monotonic() - start < 2
+    assert c.goaways == [(NO_ERROR, 1)]
+    c.close()
+
+
+def test_http2_drain_timeout():
+    need_h2()
+    load_drain({'send_timeout': 2})
+
+    c = RawH2()
+    c.request(1, headers=[('x-delay', '8')])
+
+    time.sleep(1)
+    start = time.monotonic()
+    assert 'success' in client.conf('"routes"', 'listeners/*:8080/pass')
+
+    assert c.wait(lambda: NOTICE in c.goaways, 2)
+
+    # send_timeout after the notice the request still in flight is failed,
+    # and the final GOAWAY and the close follow.
+    assert c.wait_closed(10)
+    elapsed = time.monotonic() - start
+
+    assert 1.5 < elapsed < 6, elapsed
+    assert 1 not in c.ended
+    assert c.goaways[-1] == (NO_ERROR, 1)
+    c.close()
+
+    new = H2Client()
+    assert new.get('/')['status'] == 201
+    new.close()

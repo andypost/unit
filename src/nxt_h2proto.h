@@ -99,6 +99,14 @@ struct nxt_h2proto_s {
     nghttp2_session             *session;
     nxt_conn_t                  *conn;
 
+    /*
+     * The listener configuration the connection started with.  It is only
+     * compared with c->listen->socket.data and never dereferenced: another
+     * joint there means the configuration has changed.  No reference is
+     * held, so an idle connection does not keep an old configuration.
+     */
+    nxt_socket_conf_joint_t     *joint;
+
     nxt_queue_t                 streams;   /* of nxt_h2p_stream_t */
 
     /* Bytes of nghttp2 output waiting in c->write. */
@@ -113,6 +121,9 @@ struct nxt_h2proto_s {
     /* engine->timers.now when a frame last advanced a stream. */
     nxt_msec_t                  progress;
 
+    /* engine->timers.now when the shutdown notice was submitted. */
+    nxt_msec_t                  drain_start;
+
     uint8_t                     busy;           /* 1 bit */
     uint8_t                     flush_pending;  /* 1 bit */
     uint8_t                     goaway_sent;    /* 1 bit */
@@ -120,10 +131,12 @@ struct nxt_h2proto_s {
     uint8_t                     failed;         /* 1 bit */
     uint8_t                     close_pending;  /* 1 bit */
     uint8_t                     closed;         /* 1 bit */
+    uint8_t                     draining;       /* 1 bit */
 };
 
 
 void nxt_h2p_conn_init(nxt_task_t *task, nxt_conn_t *c);
+void nxt_h2p_conns_drain(nxt_task_t *task, nxt_event_engine_t *engine);
 
 void nxt_h2p_request_body_read(nxt_task_t *task, nxt_http_request_t *r);
 void nxt_h2p_request_local_addr(nxt_task_t *task, nxt_http_request_t *r);

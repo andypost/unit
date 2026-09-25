@@ -164,34 +164,35 @@ struct nxt_port_s {
 	nxt_port_t *               main_app_port;        /*   272     8 */
 	nxt_atomic_t               rearm_pending;        /*   280     8 */
 	nxt_atomic_t               announce;             /*   288     8 */
-	nxt_buf_t *                free_bufs;            /*   296     8 */
-	void *                     socket_msg;           /*   304     8 */
-	nxt_msec_t                 idle_start;           /*   312     4 */
-	uint32_t                   max_size;             /*   316     4 */
+	nxt_atomic_t               quit_sent;            /*   296     8 */
+	nxt_buf_t *                free_bufs;            /*   304     8 */
+	void *                     socket_msg;           /*   312     8 */
 	/* --- cacheline 5 boundary (320 bytes) --- */
-	uint32_t                   max_share;            /*   320     4 */
-	uint32_t                   active_websockets;    /*   324     4 */
-	uint32_t                   detached_router;      /*   328     4 */
-	uint32_t                   active_requests;      /*   332     4 */
-	int                        from_socket;          /*   336     4 */
-	uint8_t                    detached;             /*   340     1 */
-	uint8_t                    detached_app;         /*   341     1 */
+	nxt_msec_t                 idle_start;           /*   320     4 */
+	uint32_t                   max_size;             /*   324     4 */
+	uint32_t                   max_share;            /*   328     4 */
+	uint32_t                   active_websockets;    /*   332     4 */
+	uint32_t                   detached_router;      /*   336     4 */
+	uint32_t                   active_requests;      /*   340     4 */
+	int                        from_socket;          /*   344     4 */
+	uint8_t                    detached;             /*   348     1 */
+	uint8_t                    detached_app;         /*   349     1 */
 
 	/* XXX 2 bytes hole, try to pack */
 
-	nxt_work_t                 release_work;         /*   344    40 */
-	/* --- cacheline 6 boundary (384 bytes) --- */
-	nxt_work_t                 rearm_work;           /*   384    40 */
-	nxt_lvlhsh_t               rpc_streams;          /*   424     8 */
-	nxt_lvlhsh_t               rpc_peers;            /*   432     8 */
-	nxt_lvlhsh_t               frags;                /*   440     8 */
+	nxt_work_t                 release_work;         /*   352    40 */
+	/* --- cacheline 6 boundary (384 bytes) was 8 bytes ago --- */
+	nxt_work_t                 rearm_work;           /*   392    40 */
+	nxt_lvlhsh_t               rpc_streams;          /*   432     8 */
+	nxt_lvlhsh_t               rpc_peers;            /*   440     8 */
 	/* --- cacheline 7 boundary (448 bytes) --- */
-	uint32_t                   frag_streams;         /*   448     4 */
-	uint32_t                   frag_size;            /*   452     4 */
+	nxt_lvlhsh_t               frags;                /*   448     8 */
+	uint32_t                   frag_streams;         /*   456     4 */
+	uint32_t                   frag_size;            /*   460     4 */
 
-	/* size: 456, cachelines: 8, members: 40 */
-	/* sum members: 452, holes: 2, sum holes: 4 */
-	/* last cacheline: 8 bytes */
+	/* size: 464, cachelines: 8, members: 41 */
+	/* sum members: 460, holes: 2, sum holes: 4 */
+	/* last cacheline: 16 bytes */
 };
 
 

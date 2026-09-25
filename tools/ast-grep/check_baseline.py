@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Fail on ast-grep violations in src/ not in baseline.json, keyed by rule,
 file and text rather than line.  A key is counted: the baseline holds one
-entry per violation, so a second copy of a known one is new.  --update
-rewrites the baseline.
+entry per violation, so a second copy of a known one is new.  A baseline
+entry no violation matches any more is stale and fails too, so a fixed
+violation's allowance cannot be reused later.  --update rewrites the
+baseline.
 
-Exit codes: 0 no new violations, 1 new violations, 2 the scan failed.
+Exit codes: 0 baseline and scan agree, 1 new or stale violations, 2 the
+scan failed.
 """
 import json
 from collections import Counter
@@ -69,6 +72,20 @@ def new_violations(matches, baseline):
     return new
 
 
+def stale_entries(matches, baseline):
+    """The baseline entries no match covers: a fixed violation's allowance."""
+    seen = Counter(key(m) for m in matches)
+    stale = []
+
+    for e in baseline:
+        if seen[key(e)] > 0:
+            seen[key(e)] -= 1
+        else:
+            stale.append(e)
+
+    return stale
+
+
 def main():
     matches = scan()
 
@@ -77,15 +94,25 @@ def main():
         print(f'wrote {len(matches)} entries to {BASELINE}')
         return 0
 
-    new = new_violations(matches, json.loads(BASELINE.read_text()))
+    baseline = json.loads(BASELINE.read_text())
+    new = new_violations(matches, baseline)
+    stale = stale_entries(matches, baseline)
 
-    if not new:
+    if not new and not stale:
         print(f'ast-grep: {len(matches)} violation(s), all in baseline. OK.')
         return 0
 
-    print(f'ast-grep: {len(new)} NEW violation(s) not in baseline.json:')
-    for m in new:
-        print(f"  {m['file']}:{m['line']}: [{m['ruleId']}] {m['text']}")
+    if new:
+        print(f'ast-grep: {len(new)} NEW violation(s) not in baseline.json:')
+        for m in new:
+            print(f"  {m['file']}:{m['line']}: [{m['ruleId']}] {m['text']}")
+
+    if stale:
+        print(f'ast-grep: {len(stale)} STALE baseline.json entry(ies) with '
+              'no violation left (fixed? then drop them):')
+        for m in stale:
+            print(f"  {m['file']}: [{m['ruleId']}] {m['text']}")
+
     print('\nIf reviewed and intended, run '
           "'python3 tools/ast-grep/check_baseline.py --update' and commit "
           'baseline.json with the change.')

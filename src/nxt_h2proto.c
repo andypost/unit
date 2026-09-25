@@ -141,16 +141,24 @@ nxt_h2p_conn_init(nxt_task_t *task, nxt_conn_t *c)
     nxt_queue_init(&h2c->streams);
 
     /*
-     * The nghttp2 session is allocated with malloc(), outside c->mem_pool.
      * Whatever path frees the connection, the pool cleanup deletes the
-     * session if nxt_h2p_closing() has not.
+     * nghttp2 session, which is allocated with malloc() outside c->mem_pool,
+     * if nxt_h2p_closing() has not, and releases the joint reference below.
      */
     if (nxt_slow_path(nxt_mp_cleanup(c->mem_pool, nxt_h2p_conn_cleanup,
-                                     task, h2c, NULL)
+                                     &engine->task, h2c, NULL)
                       != NXT_OK))
     {
         goto fail;
     }
+
+    /*
+     * The connection holds its configuration until it is freed: the TLS
+     * connection reads its nxt_tls_conf_t, which lives in that
+     * configuration, until the TLS shutdown is over, and that is after the
+     * last request has released its own reference.
+     */
+    joint->count++;
 
     b = nxt_buf_mem_alloc(c->mem_pool, NXT_H2P_READ_BUFFER_SIZE, 0);
     if (nxt_slow_path(b == NULL)) {
@@ -721,7 +729,8 @@ nxt_h2p_conn_free(nxt_task_t *task, nxt_h2proto_t *h2c)
 static void
 nxt_h2p_conn_cleanup(nxt_task_t *task, void *obj, void *data)
 {
-    nxt_h2proto_t  *h2c;
+    nxt_h2proto_t            *h2c;
+    nxt_socket_conf_joint_t  *joint;
 
     h2c = obj;
 
@@ -729,6 +738,11 @@ nxt_h2p_conn_cleanup(nxt_task_t *task, void *obj, void *data)
         nghttp2_session_del(h2c->session);
         h2c->session = NULL;
     }
+
+    joint = h2c->joint;
+    h2c->joint = NULL;
+
+    nxt_router_conf_release(task, joint);
 }
 
 

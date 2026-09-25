@@ -114,10 +114,9 @@ struct nxt_h2proto_s {
     nxt_conn_t                  *conn;
 
     /*
-     * The listener configuration the connection started with.  It is only
-     * compared with c->listen->socket.data and never dereferenced: another
-     * joint there means the configuration has changed.  No reference is
-     * held, so an idle connection does not keep an old configuration.
+     * The listener configuration the connection started with, referenced
+     * until the connection is freed.  Another joint on the listener means
+     * the configuration has changed, and the connection drains.
      */
     nxt_socket_conf_joint_t     *joint;
 

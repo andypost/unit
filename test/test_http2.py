@@ -8,6 +8,7 @@ import time
 
 import pytest
 
+from conftest import unit_stop
 from unit.applications.tls import ApplicationTLS
 from unit.option import option
 
@@ -1529,3 +1530,45 @@ def test_http2_refused_after_goaway():
     c.close()
 
     assert_serves()
+
+
+def test_http2_shutdown_idle():
+    need_h2()
+    load_return()
+
+    # Idle h2 connections at process shutdown: the router closes them with
+    # nxt_runtime_close_idle_connections(), and the nghttp2 sessions and
+    # streams are released with them.  Needs --restart (unit_stop()).
+    conns = []
+
+    for _ in range(3):
+        c = RawH2()
+        c.request(1)
+        assert c.wait_response(1) == 200
+        conns.append(c)
+
+    # One that has never had a stream.
+    conns.append(RawH2())
+
+    unit_stop()
+
+    for c in conns:
+        assert c.wait_closed(5)
+        c.close()
+
+
+def test_http2_shutdown_streams():
+    need_h2()
+    load_drain()
+
+    c = RawH2()
+    c.request(1, headers=[('x-delay', '3')])
+    c.request(3, headers=[('x-delay', '3')])
+    time.sleep(1)
+
+    # Streams in flight at process shutdown: the router exits in time and
+    # without an alert.
+    unit_stop()
+
+    assert c.wait_closed(5)
+    c.close()

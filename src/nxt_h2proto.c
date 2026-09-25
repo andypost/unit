@@ -28,6 +28,8 @@ static nxt_int_t nxt_h2p_session_create(nxt_task_t *task, nxt_h2proto_t *h2c,
 static void nxt_h2p_conn_read(nxt_task_t *task, void *obj, void *data);
 static void nxt_h2p_conn_flush(nxt_task_t *task, nxt_h2proto_t *h2c);
 static void nxt_h2p_conn_sent(nxt_task_t *task, void *obj, void *data);
+static void nxt_h2p_conn_free(nxt_task_t *task, nxt_h2proto_t *h2c);
+static void nxt_h2p_conn_cleanup(nxt_task_t *task, void *obj, void *data);
 static void nxt_h2p_conn_close(nxt_task_t *task, void *obj, void *data);
 static void nxt_h2p_conn_error(nxt_task_t *task, void *obj, void *data);
 static void nxt_h2p_conn_read_timeout(nxt_task_t *task, void *obj, void *data);
@@ -60,6 +62,7 @@ static nxt_bool_t nxt_h2p_conn_drain(nxt_task_t *task, nxt_h2proto_t *h2c);
 static void nxt_h2p_conns_walk(nxt_queue_t *queue);
 static void nxt_h2p_conn_shutdown(nxt_task_t *task, nxt_h2proto_t *h2c);
 static void nxt_h2p_closing(nxt_task_t *task, nxt_h2proto_t *h2c);
+static void nxt_h2p_release(nxt_h2proto_t *h2c);
 static void nxt_h2p_stream_free(nxt_h2proto_t *h2c, nxt_h2p_stream_t *stream);
 static void nxt_h2p_stream_fail(nxt_task_t *task, nxt_h2p_stream_t *stream);
 
@@ -133,6 +136,18 @@ nxt_h2p_conn_init(nxt_task_t *task, nxt_conn_t *c)
     h2c->joint = joint;
     nxt_queue_init(&h2c->streams);
 
+    /*
+     * The nghttp2 session is allocated with malloc(), outside c->mem_pool.
+     * Whatever path frees the connection, the pool cleanup deletes the
+     * session if nxt_h2p_closing() has not.
+     */
+    if (nxt_slow_path(nxt_mp_cleanup(c->mem_pool, nxt_h2p_conn_cleanup,
+                                     task, h2c, NULL)
+                      != NXT_OK))
+    {
+        goto fail;
+    }
+
     b = nxt_buf_mem_alloc(c->mem_pool, NXT_H2P_READ_BUFFER_SIZE, 0);
     if (nxt_slow_path(b == NULL)) {
         goto fail;
@@ -168,6 +183,7 @@ fail:
 
     if (h2c != NULL && h2c->session != NULL) {
         nghttp2_session_del(h2c->session);
+        h2c->session = NULL;
     }
 
     if (c->read != NULL) {
@@ -501,15 +517,7 @@ nxt_h2p_conn_sent(nxt_task_t *task, void *obj, void *data)
     }
 
     if (nxt_slow_path(c->socket.fd == -1)) {
-        /*
-         * nxt_runtime_close_idle_connections() closed the socket under an
-         * idle connection at process shutdown; only the session is left.
-         */
-        if (h2c->session != NULL) {
-            nghttp2_session_del(h2c->session);
-            h2c->session = NULL;
-        }
-
+        nxt_h2p_conn_free(task, h2c);
         return;
     }
 
@@ -542,6 +550,61 @@ nxt_h2p_conn_sent(nxt_task_t *task, void *obj, void *data)
 
     if (h2c->closing && c->write == NULL && h2c->stream_count == 0) {
         nxt_h2p_closing(task, h2c);
+    }
+}
+
+
+/*
+ * nxt_runtime_close_idle_connections() has closed an idle connection at
+ * process shutdown: nxt_conn_close() ends in the ready handler of the write
+ * state, which is still this one.  Release the h2 objects and free the
+ * connection as nxt_h1p_conn_free() does after nxt_h1p_closing().
+ */
+
+static void
+nxt_h2p_conn_free(nxt_task_t *task, nxt_h2proto_t *h2c)
+{
+    nxt_conn_t          *c;
+    nxt_listen_event_t  *lev;
+    nxt_event_engine_t  *engine;
+
+    c = h2c->conn;
+
+    nxt_debug(task, "h2p conn free");
+
+    nxt_h2p_release(h2c);
+
+    h2c->closed = 1;
+    c->socket.data = NULL;
+
+    engine = task->thread->engine;
+
+    nxt_sockaddr_cache_free(engine, c);
+
+    lev = c->listen;
+
+    nxt_conn_free(task, c);
+
+    nxt_router_listen_event_release(&engine->task, lev, NULL);
+}
+
+
+/*
+ * The c->mem_pool cleanup: the last word on the session, for a connection
+ * freed on a path that did not run nxt_h2p_closing(), such as a release
+ * write state that nxt_runtime_close_idle_connections() installs.
+ */
+
+static void
+nxt_h2p_conn_cleanup(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_h2proto_t  *h2c;
+
+    h2c = obj;
+
+    if (h2c->session != NULL) {
+        nghttp2_session_del(h2c->session);
+        h2c->session = NULL;
     }
 }
 
@@ -1235,9 +1298,7 @@ nxt_h2p_conn_shutdown(nxt_task_t *task, nxt_h2proto_t *h2c)
 static void
 nxt_h2p_closing(nxt_task_t *task, nxt_h2proto_t *h2c)
 {
-    nxt_conn_t        *c;
-    nxt_queue_link_t  *lnk, *next;
-    nxt_h2p_stream_t  *stream;
+    nxt_conn_t  *c;
 
     if (h2c->busy || h2c->walking != 0) {
         h2c->close_pending = 1;
@@ -1261,6 +1322,20 @@ nxt_h2p_closing(nxt_task_t *task, nxt_h2proto_t *h2c)
         c->write = NULL;
     }
 
+    nxt_h2p_release(h2c);
+
+    nxt_h1p_closing(&c->task, c);
+}
+
+
+/* Free the streams left and the session.  No request is attached. */
+
+static void
+nxt_h2p_release(nxt_h2proto_t *h2c)
+{
+    nxt_queue_link_t  *lnk, *next;
+    nxt_h2p_stream_t  *stream;
+
     for (lnk = nxt_queue_first(&h2c->streams);
          lnk != nxt_queue_tail(&h2c->streams);
          lnk = next)
@@ -1275,8 +1350,6 @@ nxt_h2p_closing(nxt_task_t *task, nxt_h2proto_t *h2c)
         nghttp2_session_del(h2c->session);
         h2c->session = NULL;
     }
-
-    nxt_h1p_closing(&c->task, c);
 }
 
 

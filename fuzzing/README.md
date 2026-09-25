@@ -37,7 +37,7 @@ $ make fuzz -j$(nproc)
 `fuzz_http_h2p` (below) needs the h2 frontend built in: add `--openssl --h2`
 (the latter needs the former) to that `configure` line, and its own
 `libnghttp2` development package installed. Left out, `make fuzz` simply
-builds the other seven targets, same as it always has. `build-fuzz.sh` and
+builds the other ten targets, same as it always has. `build-fuzz.sh` and
 `oss-fuzz.sh` add them when `libnghttp2` is installed, and if that
 `configure` fails (no OpenSSL development files, or an nghttp2 without the
 setters `auto/h2` probes for) they say so and configure again without them.
@@ -46,18 +46,26 @@ setters `auto/h2` probes for) they say so and configure again without them.
 
 ```shell
 $ mkdir -p build/fuzz_basic_seed
+$ mkdir -p build/fuzz_http_chunk_seed
 $ mkdir -p build/fuzz_http_controller_seed
 $ mkdir -p build/fuzz_http_h1p_seed
 $ mkdir -p build/fuzz_http_h1p_peer_seed
 $ mkdir -p build/fuzz_http_h2p_seed
+$ mkdir -p build/fuzz_http_h1p_peer_response_seed
+$ mkdir -p build/fuzz_http_ws_utf8_seed
 $ mkdir -p build/fuzz_json_seed
 $ mkdir -p build/fuzz_router_app_response_seed
 $ mkdir -p build/fuzz_unit_msg_seed
 
 $ ./build/fuzz_basic            build/fuzz_basic_seed            fuzzing/fuzz_basic_seed_corpus
+$ ./build/fuzz_http_chunk       build/fuzz_http_chunk_seed       fuzzing/fuzz_http_chunk_seed_corpus
 $ ./build/fuzz_http_controller  build/fuzz_http_controller_seed  fuzzing/fuzz_http_seed_corpus
 $ ./build/fuzz_http_h1p         build/fuzz_http_h1p_seed         fuzzing/fuzz_http_seed_corpus
 $ ./build/fuzz_http_h1p_peer    build/fuzz_http_h1p_peer_seed    fuzzing/fuzz_http_seed_corpus
+$ ./build/fuzz_http_h1p_peer_response \
+                                build/fuzz_http_h1p_peer_response_seed \
+                                fuzzing/fuzz_http_h1p_peer_response_seed_corpus
+$ ./build/fuzz_http_ws_utf8     build/fuzz_http_ws_utf8_seed     fuzzing/fuzz_http_ws_utf8_seed_corpus
 $ ./build/fuzz_http_h2p         build/fuzz_http_h2p_seed         fuzzing/fuzz_h2p_seed_corpus
 $ ./build/fuzz_json             build/fuzz_json_seed             fuzzing/fuzz_json_seed_corpus
 $ ./build/fuzz_router_app_response build/fuzz_router_app_response_seed fuzzing/fuzz_router_app_response_seed_corpus
@@ -86,6 +94,26 @@ Router/application dispatch is a different attack surface with its own
 fuzz target: this one's fake `nxt_socket_conf_t` always leaves `action`
 `NULL`, so every request this harness drives ends in
 `nxt_http_request_error()` rather than reaching a router action.
+
+### Differential targets.
+
+Three targets check a result, not only that the code does not crash.  Each
+one aborts on a mismatch, so a wrong answer is reported like a crash.
+
+- `fuzz_http_chunk` decodes a chunked body once as a single buffer and once
+  cut into pieces handed over in chains of one to three buffers.  Both runs
+  must agree on the verdict, on where the message ended, and on every decoded
+  byte.  The first input byte seeds the cuts.
+- `fuzz_http_h1p_peer_response` parses an upstream response header the way
+  the proxy does: resuming after every read that returned `NXT_AGAIN`.  A run
+  that gets the header a few bytes at a time must agree with a run that gets
+  it at once on the status, the header size and every field.  The first input
+  byte seeds the read sizes.
+- `fuzz_http_ws_utf8` runs the UTF-8 check for WebSocket text messages and
+  close reasons over masked frames split across buffers, and compares the
+  verdict after every frame with a small validator written from Unicode
+  Table 3-7.  Byte 0 selects a close reason, byte 1 seeds the cuts, bytes 2-5
+  are the masking key.
 
 Here is more information about [LibFuzzer](https://llvm.org/docs/LibFuzzer.html).
 
@@ -133,14 +161,14 @@ $ fuzzing/run-ci.sh -t 120 fuzz_http_h1p              # one target, longer
 A pull request that touches `src/nxt_http*`, `src/nxt_h1proto*`,
 `src/nxt_h2proto*`, `src/nxt_controller*`, `src/nxt_conf*`, `src/nxt_unit*`,
 `src/nxt_router*` or `fuzzing/` runs every target the job built -- roughly a
-minute per target, eight minutes in all; a manual `workflow_dispatch` takes a
+minute per target, eleven minutes in all; a manual `workflow_dispatch` takes a
 budget and a target list as inputs.  Reproducers land in
 `build/fuzz-artifacts/` and are uploaded as an artifact when the job fails.
 
 CI installs `libnghttp2-dev` and configures with `--openssl --h2`, so
-`fuzz_http_h2p` runs there too, alongside the other seven; `run-ci.sh`'s
+`fuzz_http_h2p` runs there too, alongside the other ten; `run-ci.sh`'s
 default target list adds it only when `build/fuzz_http_h2p` actually exists,
-so a build without nghttp2 still runs the other seven exactly as before.
+so a build without nghttp2 still runs the other ten exactly as before.
 
 Each target finishes within a second or two of its budget.  `run-ci.sh` caps
 it at the budget plus a minute anyway -- libFuzzer only checks the budget

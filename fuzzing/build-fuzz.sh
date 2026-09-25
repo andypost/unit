@@ -13,7 +13,7 @@ NXT_FUZZ_CONFIGURE="--no-regex --no-pcre2 --fuzz=$LIB_FUZZING_ENGINE"
 # succeeds: the OpenSSL development files may be missing, or nghttp2 may
 # lack the setters auto/h2 probes for.  So try the h2 configure, and if it
 # fails, configure again without h2: `make fuzz` then leaves fuzz_http_h2p
-# out (see auto/h2 and auto/sources) and still builds the other seven.
+# out (see auto/h2 and auto/sources) and still builds the other ten.
 NXT_FUZZ_H2=no
 
 if pkgconf --exists libnghttp2 2>/dev/null || pkg-config --exists libnghttp2 2>/dev/null
@@ -40,9 +40,12 @@ fi
 make fuzz -j$(nproc) || exit 1
 
 mkdir -p build/fuzz_basic_seed
+mkdir -p build/fuzz_http_chunk_seed
 mkdir -p build/fuzz_http_controller_seed
 mkdir -p build/fuzz_http_h1p_seed
 mkdir -p build/fuzz_http_h1p_peer_seed
+mkdir -p build/fuzz_http_h1p_peer_response_seed
+mkdir -p build/fuzz_http_ws_utf8_seed
 mkdir -p build/fuzz_json_seed
 mkdir -p build/fuzz_router_app_response_seed
 mkdir -p build/fuzz_unit_msg_seed

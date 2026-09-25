@@ -53,13 +53,13 @@ jobs:
   libfuzzer:
     name: libFuzzer (ASan + UBSan)
     runs-on: ubuntu-latest
-    # Eight targets at a 60s budget is a little over eight minutes -- each
+    # Eleven targets at a 60s budget is a little over eleven minutes -- each
     # finishes within a second or two of its budget, and run-ci.sh caps the
-    # worst case at two minutes each.  The clang/ASan build is a few minutes
-    # on top.  A dispatch can ask for a much longer budget across all
-    # targets, so it gets a much longer bound; a pull request must not, or a
-    # hung job holds a runner for an hour.
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 120 || 25 }}
+    # worst case at two minutes each, twenty-two in all.  The clang/ASan build
+    # is a few minutes on top.  A dispatch can ask for a much longer budget
+    # across all targets, so it gets a much longer bound; a pull request must
+    # not, or a hung job holds a runner for an hour.
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 120 || 35 }}
 
     steps:
       - uses: actions/checkout@v5
@@ -68,7 +68,7 @@ jobs:
       # links against; clang alone is not enough.  libssl-dev and
       # libnghttp2-dev are --openssl and --h2's own dependencies: without
       # them fuzz_http_h2p is simply left out of `make fuzz` (see auto/h2 and
-      # auto/sources), and the other seven targets still build and run.
+      # auto/sources), and the other ten targets still build and run.
       - name: Install clang, the sanitizer runtimes, and nghttp2
         run: |
           sudo apt-get -qq update
@@ -100,8 +100,8 @@ jobs:
       # them, and a target left out of the list is a harness that CI
       # compiles but never runs.  run-ci.sh's own default target list already
       # adjusts to whether fuzz_http_h2p got built, so nothing here needs to
-      # know that; at about 61 seconds each the whole set of eight is a
-      # little over eight minutes.
+      # know that; at about 61 seconds each the whole set of eleven is a
+      # little over eleven minutes.
       - name: Run the fuzzers
         env:
           FUZZ_SECONDS: ${{ github.event.inputs.seconds || '60' }}

@@ -29,6 +29,12 @@ esac
 
 if [ $NXT_HARDENING != off ]; then
 
+# The flags are in the order auto/make uses them: the flag under test lands
+# in NXT_CFLAGS, and CFLAGS from the environment comes last, so a -O0
+# there wins over the built-in -O in the probe as in the build.  The libc
+# header lets glibc's own #warning (a _FORTIFY_SOURCE level it treats as a
+# lower one) fail the probe instead of the real sources.  $2 is extra
+# source for the probe.
 nxt_hardening_try_cflag()
 {
     nxt_flag=$1
@@ -36,20 +42,26 @@ nxt_hardening_try_cflag()
     $echo -n "checking for $nxt_flag ..."
 
     cat << END > $NXT_AUTOTEST.c
+#include <string.h>
+${2-}
 int main(void) { return 0; }
 END
 
-    if /bin/sh -c "($CC $CFLAGS $NXT_CFLAGS $NXT_CC_OPT $nxt_flag -Werror \
+    if /bin/sh -c "($CC $NXT_CFLAGS $nxt_flag $NXT_CC_OPT $CFLAGS -Werror \
                     -o $NXT_AUTOTEST $NXT_AUTOTEST.c)" \
         >> $NXT_AUTOCONF_ERR 2>&1
     then
         $echo " found"
         NXT_CFLAGS="$NXT_CFLAGS $nxt_flag"
+        nxt_ret=0
     else
         $echo " not found"
+        nxt_ret=1
     fi
 
     rm -rf $NXT_AUTOTEST $NXT_AUTOTEST.c
+
+    return $nxt_ret
 }
 
 
@@ -101,29 +113,20 @@ set +e
 nxt_hardening_try_cflag -fstack-protector-strong
 nxt_hardening_try_cflag -fstack-clash-protection
 
-case "$NXT_SYSTEM_PLATFORM" in
-    amd64 | x86_64)
-        nxt_hardening_try_cflag -fcf-protection
-    ;;
+# Each compiler rejects the flag for a target it does not apply to
+# (x86 and arm64 respectively), so the probe alone picks the right one.
+nxt_hardening_try_cflag -fcf-protection
+nxt_hardening_try_cflag -mbranch-protection=standard
 
-    arm64 | aarch64)
-        nxt_hardening_try_cflag -mbranch-protection=standard
-    ;;
-esac
+# _FORTIFY_SOURCE does nothing without optimization, and not every libc
+# says so: check the effective level here.  A level the libc treats as a
+# lower one is a warning, so try the lower one then.
+nxt_fortify_check='#ifndef __OPTIMIZE__
+#error _FORTIFY_SOURCE needs an optimizing build
+#endif'
 
-# _FORTIFY_SOURCE needs an optimizing build to do anything, and glibc
-# turns that into a hard "requires optimization" warning under -O0 --
-# which -Werror in the probe above (and in the real build) would then
-# fail on, so an explicit -O0 in NXT_CC_OPT skips the probe outright
-# rather than rely on that warning alone.
-case " $NXT_CC_OPT " in
-    *" -O0 "*)
-    ;;
-
-    *)
-        nxt_hardening_try_cflag -D_FORTIFY_SOURCE=3
-    ;;
-esac
+nxt_hardening_try_cflag -D_FORTIFY_SOURCE=3 "$nxt_fortify_check" \
+    || nxt_hardening_try_cflag -D_FORTIFY_SOURCE=2 "$nxt_fortify_check"
 
 $echo -n "checking for -Wl,--fatal-warnings ..."
 

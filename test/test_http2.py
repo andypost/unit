@@ -894,6 +894,59 @@ def test_http2_timeout_progress():
     c.close()
 
 
+def test_http2_timeout_empty_data():
+    need_h2()
+    load_mirror({'body_read_timeout': 2})
+
+    # An empty DATA frame with END_STREAM still ends a body.
+    c = RawH2()
+    c.request(
+        1, end_stream=False, method='POST', headers=[('content-length', '5')]
+    )
+    c.send(c.data_frame(1, b'12345'), c.data_frame(1, b'', end_stream=True))
+
+    assert c.wait_response(1) == 200
+    assert c.data[1] == b'12345'
+    c.close()
+
+    stalled = RawH2()
+    stalled.request(
+        1, end_stream=False, method='POST', headers=[('content-length', '10')]
+    )
+    stalled.send(stalled.data_frame(1, b'12345'))
+    start = time.monotonic()
+
+    # Empty and padding-only DATA frames carry no body bytes: they are not
+    # progress, so they do not hold the stalled body past its timeout.
+    empty = [
+        stalled.data_frame(1, b''),
+        DataFrame(1, data=b'', flags=['PADDED'], pad_length=8),
+    ]
+    n = 0
+
+    while not stalled.closed and time.monotonic() - start < 8:
+        try:
+            stalled.send(empty[n % 2])
+
+        except (ConnectionError, ssl.SSLError, OSError):
+            break
+
+        n += 1
+        stalled.wait_closed(0.5)
+
+    assert stalled.wait_closed(5)
+    elapsed = time.monotonic() - start
+
+    assert n >= 4, n
+    assert 1.5 < elapsed < 4.5, elapsed
+    assert stalled.goaway is not None
+    assert stalled.goaway[0] == NO_ERROR
+    assert stalled.goaway[1] == 1
+    stalled.close()
+
+    assert_serves()
+
+
 def test_http2_timeout_idle():
     need_h2()
     load_return({'idle_timeout': 2, 'body_read_timeout': 30})

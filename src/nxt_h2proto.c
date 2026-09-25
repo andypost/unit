@@ -1517,6 +1517,19 @@ nxt_h2p_release(nxt_h2proto_t *h2c)
 static void
 nxt_h2p_stream_free(nxt_h2proto_t *h2c, nxt_h2p_stream_t *stream)
 {
+    nxt_event_engine_t  *engine;
+
+    if (nxt_slow_path(stream->out != NULL)) {
+        /*
+         * Response buffers must be completed, or the request pool they hold
+         * leaks.  Their completion runs from the work queue, perhaps after
+         * the connection is freed, so it gets the engine task.
+         */
+        engine = h2c->conn->socket.task->thread->engine;
+
+        nxt_h2p_stream_drain(&engine->task, stream);
+    }
+
     nxt_queue_remove(&stream->link);
 
     nxt_mp_free(h2c->conn->mem_pool, stream);
@@ -2341,8 +2354,11 @@ nxt_h2p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
 
     r->header_sent = 1;
 
-    if (stream->closed || h2c->session == NULL) {
-        /* The stream is gone; let the request finish without a peer. */
+    if (stream->closed || stream->failed || h2c->session == NULL) {
+        /*
+         * The stream is gone, or the request has failed and the stream is
+         * being reset; let the request finish without a peer.
+         */
         goto discard;
     }
 
@@ -2485,8 +2501,15 @@ nxt_h2p_request_send(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
 
     stream->out_tail = &b->next;
 
-    if (stream->no_provider || stream->closed || h2c->session == NULL) {
-        /* No DATA can be sent; the buffers are only completed. */
+    if (stream->no_provider || stream->closed || stream->failed
+        || h2c->session == NULL)
+    {
+        /*
+         * No DATA can be sent; the buffers are only completed.  A failed
+         * request can still get body buffers: nxt_h2p_request_header_send()
+         * queued the body handler before the request failed, and the
+         * buffers hold the request pool until they are completed.
+         */
         nxt_h2p_stream_drain(&h2c->conn->task, stream);
         return;
     }

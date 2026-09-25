@@ -1990,3 +1990,33 @@ def test_http2_fail_before_body(path):
     c.close()
 
     assert_serves()
+
+
+def test_http2_fail_before_body_leak(search_in_file):
+    need_h2()
+
+    # The request pool of test_http2_fail_before_body leaked when the body
+    # buffers came after the request had failed: nothing completed them.
+    # Only LeakSanitizer sees that, at process exit, so this needs an ASan
+    # build, ASAN_OPTIONS=detect_leaks=1 and --restart (unit_stop()).
+    if not option.configure_flag.get('asan') or 'detect_leaks=1' not in (
+        os.environ.get('ASAN_OPTIONS', '')
+    ):
+        pytest.skip('needs an ASan build and ASAN_OPTIONS=detect_leaks=1')
+
+    load_share()
+
+    for path in ['/nope', '/big.txt'] * 3:
+        c = RawH2()
+        c.send(
+            c.headers(1, c.block(path=path)), DataFrame(0x1000000, data=b'')
+        )
+        assert c.wait_closed()
+        c.close()
+
+    # Other processes have leaks of their own at exit; only this one counts.
+    option.skip_sanitizer = True
+
+    unit_stop()
+
+    assert search_in_file(r'in nxt_h2p_on_begin_headers ') is None

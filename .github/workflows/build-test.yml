@@ -900,6 +900,13 @@ jobs:
       - name: Run C tests
         run: sudo ./build/tests
 
+      # unitd runs as root here, and its discovery process, which loads the
+      # language modules, drops to an unprivileged user.  That user must be
+      # able to reach build/ under /home/runner, or no module is found and
+      # every test skips.  The language legs above do the same.
+      - name: Make /home/runner traversable
+        run: sudo chmod -R +x /home/runner
+
       # --restart is for the process shutdown tests, which stop unitd and
       # skip themselves without it.
       - name: Run HTTP/2 tests

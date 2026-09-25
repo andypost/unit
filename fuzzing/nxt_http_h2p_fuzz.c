@@ -97,10 +97,27 @@ static nxt_sockaddr_t          *nxt_h2p_fuzz_local;
  */
 static nxt_listen_socket_t     nxt_h2p_fuzz_remote_template;
 
+/*
+ * Set when c->mem_pool is destroyed, by nxt_h2p_fuzz_conn_gone_handler(), a
+ * cleanup on that pool.  h2c and its streams live in c->mem_pool, so once
+ * this is set they are freed memory, and c itself may already be on the
+ * engine's freelist for the next connection.  It lives outside the pool on
+ * purpose: nothing inside the pool can be read to learn that the pool is
+ * gone.  Reset at the top of every LLVMFuzzerTestOneInput().
+ */
+static nxt_bool_t              nxt_h2p_fuzz_conn_gone;
+
 
 extern int LLVMFuzzerInitialize(int *argc, char ***argv);
 extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 extern char  **environ;
+
+
+static void
+nxt_h2p_fuzz_conn_gone_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_h2p_fuzz_conn_gone = 1;
+}
 
 
 static void
@@ -412,8 +429,18 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
      */
     nxt_h2p_fuzz_lev.count = 2;
 
+    nxt_h2p_fuzz_conn_gone = 0;
+
     mp = nxt_mp_create(2048, 128, 512, 32);
     if (mp == NULL) {
+        return 0;
+    }
+
+    if (nxt_mp_cleanup(mp, nxt_h2p_fuzz_conn_gone_handler, &engine->task,
+                       NULL, NULL)
+        != NXT_OK)
+    {
+        nxt_mp_destroy(mp);
         return 0;
     }
 
@@ -553,7 +580,8 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             break;
         }
 
-        if (h2c->closing || h2c->session == NULL) {
+        /* nxt_h2p_conn_read() only queues a close; still, flag first. */
+        if (nxt_h2p_fuzz_conn_gone || h2c->closing || h2c->session == NULL) {
             /* The connection is gone; nothing left to feed it. */
             break;
         }
@@ -590,8 +618,16 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
      * its `data` argument would use it after free once that item runs.
      * Draining lets every failed stream detach (stream->r = NULL, via
      * nxt_h2p_request_close()) before that loop runs.
+     *
+     * The drain above may already have run the whole close chain: a
+     * connection failure (nxt_h2p_conn_fail(), e.g. nxt_h2p_conn_flush()
+     * out of memory) with nothing left to write goes to nxt_h2p_closing()
+     * at once, and the drain then runs the queued close down to
+     * nxt_conn_free(), which destroys c->mem_pool and h2c with it.  From
+     * then on neither h2c nor c may be touched, and there is nothing left
+     * to close: nxt_h2p_fuzz_conn_gone says so.
      */
-    if (h2c->session != NULL) {
+    if (!nxt_h2p_fuzz_conn_gone && h2c->session != NULL) {
         nxt_h2p_streams_fail(&c->task, h2c, 1);
         nxt_h2p_fuzz_drain_engine(engine);
     }
@@ -607,16 +643,24 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
      * nxt_router_listen_event_release() (decrements lev->count, reset to 2
      * every iteration above).  Idempotent either way nxt_h2p_conn_abort()
      * already reached it during the read loop (h2c->closed guards it), so
-     * this is unconditional.  Nothing below may touch c, h2c or mp again.
+     * this runs whenever the pool is still there.  Nothing below may touch
+     * c, h2c or mp again.
      */
-    nxt_h2p_closing(&c->task, h2c);
-    nxt_h2p_fuzz_drain_engine(engine);
+    if (!nxt_h2p_fuzz_conn_gone) {
+        nxt_h2p_closing(&c->task, h2c);
+        nxt_h2p_fuzz_drain_engine(engine);
+    }
 
     /* nxt_h1p_conn_free() did not touch this end; nothing else will. */
     close(sv[1]);
 
     nxt_timer_find(engine);
     nxt_conn_recycle_pending(engine);
+
+    if (!nxt_h2p_fuzz_conn_gone) {
+        /* The close chain did not reach nxt_conn_free(): a harness bug. */
+        nxt_abort();
+    }
 
     if (nxt_h2p_fuzz_joint.count != 1) {
         /* A harness bug leaked a stream's joint ref; see the comment above. */

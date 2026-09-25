@@ -1165,7 +1165,9 @@ def test_http2_rst_stream_flood(count):
     assert code == INTERNAL_ERROR
 
     # The 201st stream is stream 401; the rate adds some while it runs.
-    refill = int(elapsed * 33) + 1
+    # nghttp2 refills in whole seconds of CLOCK_MONOTONIC: 33 at each
+    # second boundary the flood crosses, even if it lasts 0.1 s.
+    refill = 33 * (int(elapsed) + 1)
     assert 401 <= last <= 401 + 2 * refill, (last, elapsed)
 
     assert all(sid <= last for sid in c.status)

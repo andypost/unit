@@ -220,6 +220,11 @@ if [ $NXT_OPENSSL = YES ]; then
 fi
 
 
+if [ "$NXT_HAVE_NGHTTP2" = "YES" ]; then
+    NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_h2proto.c"
+fi
+
+
 if [ "$NXT_HAVE_ZLIB" = "YES" ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_zlib.c"
 fi

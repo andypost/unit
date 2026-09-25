@@ -564,4 +564,6 @@ int nxt_http_cond_value(nxt_task_t *task, nxt_http_request_t *r,
 
 extern const nxt_conn_state_t  nxt_h1p_idle_close_state;
 
+void nxt_h1p_closing(nxt_task_t *task, nxt_conn_t *c);
+
 #endif  /* _NXT_HTTP_H_INCLUDED_ */

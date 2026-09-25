@@ -894,6 +894,59 @@ def test_http2_timeout_progress():
     c.close()
 
 
+def test_http2_timeout_empty_data():
+    need_h2()
+    load_mirror({'body_read_timeout': 2})
+
+    # An empty DATA frame with END_STREAM still ends a body.
+    c = RawH2()
+    c.request(
+        1, end_stream=False, method='POST', headers=[('content-length', '5')]
+    )
+    c.send(c.data_frame(1, b'12345'), c.data_frame(1, b'', end_stream=True))
+
+    assert c.wait_response(1) == 200
+    assert c.data[1] == b'12345'
+    c.close()
+
+    stalled = RawH2()
+    stalled.request(
+        1, end_stream=False, method='POST', headers=[('content-length', '10')]
+    )
+    stalled.send(stalled.data_frame(1, b'12345'))
+    start = time.monotonic()
+
+    # Empty and padding-only DATA frames carry no body bytes: they are not
+    # progress, so they do not hold the stalled body past its timeout.
+    empty = [
+        stalled.data_frame(1, b''),
+        DataFrame(1, data=b'', flags=['PADDED'], pad_length=8),
+    ]
+    n = 0
+
+    while not stalled.closed and time.monotonic() - start < 8:
+        try:
+            stalled.send(empty[n % 2])
+
+        except (ConnectionError, ssl.SSLError, OSError):
+            break
+
+        n += 1
+        stalled.wait_closed(0.5)
+
+    assert stalled.wait_closed(5)
+    elapsed = time.monotonic() - start
+
+    assert n >= 4, n
+    assert 1.5 < elapsed < 4.5, elapsed
+    assert stalled.goaway is not None
+    assert stalled.goaway[0] == NO_ERROR
+    assert stalled.goaway[1] == 1
+    stalled.close()
+
+    assert_serves()
+
+
 def test_http2_timeout_idle():
     need_h2()
     load_return({'idle_timeout': 2, 'body_read_timeout': 30})
@@ -1112,7 +1165,9 @@ def test_http2_rst_stream_flood(count):
     assert code == INTERNAL_ERROR
 
     # The 201st stream is stream 401; the rate adds some while it runs.
-    refill = int(elapsed * 33) + 1
+    # nghttp2 refills in whole seconds of CLOCK_MONOTONIC: 33 at each
+    # second boundary the flood crosses, even if it lasts 0.1 s.
+    refill = 33 * (int(elapsed) + 1)
     assert 401 <= last <= 401 + 2 * refill, (last, elapsed)
 
     assert all(sid <= last for sid in c.status)
@@ -1680,6 +1735,51 @@ def test_http2_window_stall_connection():
     assert c.goaway == (NO_ERROR, 1)
     assert c.data[1] == big[:65535]
     assert 1 not in c.ended
+    c.close()
+
+    assert_serves()
+
+
+def test_http2_window_stall_staggered():
+    need_h2()
+    big = load_big({'send_timeout': 2})
+
+    # Stream 1 waits for its own window (10 bytes, never updated) first;
+    # 1.5 s later stream 3 uses up the connection window, which the client
+    # never updates either.  The connection stall has its own start time:
+    # stream 1 is cancelled after its send_timeout, and the connection goes
+    # only send_timeout after its own window ran out.
+    c = RawH2(settings={0x4: 10}, window_update=False)
+
+    c.request(1, path='/big.txt')
+    assert c.wait(lambda: len(c.data.get(1, b'')) == 10)
+    start1 = time.monotonic()
+
+    time.sleep(1.5)
+
+    c.request(3, path='/big.txt')
+    c.send(WindowUpdateFrame(3, window_increment=100000))
+    assert c.wait(
+        lambda: len(c.data.get(1, b'')) + len(c.data.get(3, b'')) == 65535
+    )
+    start3 = time.monotonic()
+
+    assert c.wait(lambda: 1 in c.rst, 5)
+    assert 1.5 < time.monotonic() - start1 < 4, time.monotonic() - start1
+    assert c.rst[1] == CANCEL
+
+    # The old code closed here, with the stream 1 deadline.
+    assert not c.wait_closed(max(0, start3 + 1.2 - time.monotonic()))
+    assert c.goaway is None
+
+    assert c.wait_closed(10)
+    elapsed = time.monotonic() - start3
+
+    assert 1.5 < elapsed < 6, elapsed
+    assert c.goaway == (NO_ERROR, 3)
+    assert c.data[1] == big[:10]
+    assert c.data[3] == big[: 65535 - 10]
+    assert 3 not in c.ended
     c.close()
 
     assert_serves()

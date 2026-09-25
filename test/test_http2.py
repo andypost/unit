@@ -1483,3 +1483,49 @@ def test_http2_drain_timeout():
     new = H2Client()
     assert new.get('/')['status'] == 201
     new.close()
+
+
+def test_http2_refused_after_goaway():
+    need_h2()
+    load_return()
+
+    c = RawH2()
+
+    # 999 requests, in batches under SETTINGS_MAX_CONCURRENT_STREAMS.
+    sids = list(range(1, 1999, 2))
+
+    for i in range(0, len(sids), 100):
+        batch = sids[i : i + 100]
+        c.send(*[c.headers(sid, c.block()) for sid in batch])
+        assert c.wait(lambda: set(batch) <= c.ended)
+
+    assert c.goaway is None
+
+    # The 1000th request (stream 1999) reaches NXT_H2P_MAX_REQUESTS and
+    # gets the GOAWAY submitted.  The streams after it come in the same
+    # read, before the GOAWAY is written (nghttp2 ignores new streams only
+    # after that), and are refused, so the client may retry them elsewhere.
+    late = list(range(2001, 2013, 2))
+    c.send(*[c.headers(sid, c.block()) for sid in [1999] + late])
+
+    assert c.wait(lambda: c.goaway is not None)
+    assert c.goaway == (NO_ERROR, 1999)
+
+    assert c.wait_response(1999) == 200
+    assert c.wait_closed()
+
+    # REFUSED_STREAM, not INTERNAL_ERROR.  nghttp2 drops a RST_STREAM that
+    # is still queued when the session has no active stream left after its
+    # GOAWAY, so the last ones may come without one: GOAWAY's last stream
+    # ID tells the client that they were not processed either.
+    assert c.rst
+    assert set(c.rst) <= set(late)
+    assert set(c.rst.values()) == {REFUSED_STREAM}
+    assert c.rst.get(2001) == REFUSED_STREAM
+
+    # Every stream up to the last one is served, none after it.
+    assert all(c.status[sid] == 200 for sid in range(1, 2001, 2))
+    assert not any(sid in c.status for sid in late)
+    c.close()
+
+    assert_serves()

@@ -65,6 +65,7 @@ static void nxt_h2p_stream_fail(nxt_task_t *task, nxt_h2p_stream_t *stream);
 
 static int nxt_h2p_on_begin_headers(nghttp2_session *session,
     const nghttp2_frame *frame, void *user_data);
+static int nxt_h2p_stream_refuse(nxt_h2proto_t *h2c, int32_t stream_id);
 static int nxt_h2p_on_header(nghttp2_session *session,
     const nghttp2_frame *frame, const uint8_t *name, size_t namelen,
     const uint8_t *value, size_t valuelen, uint8_t flags, void *user_data);
@@ -1347,9 +1348,12 @@ nxt_h2p_on_begin_headers(nghttp2_session *session, const nghttp2_frame *frame,
     joint = c->listen->socket.data;
 
     if (nxt_slow_path(joint == NULL || h2c->goaway_sent)) {
-        nxt_h2p_conn_goaway(h2c, -1);
-
-        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+        /*
+         * The GOAWAY is submitted but not written yet, or there is no
+         * configuration to serve the stream with.  nghttp2 ignores new
+         * streams only once its GOAWAY is out.
+         */
+        return nxt_h2p_stream_refuse(h2c, frame->hd.stream_id);
     }
 
     stream = nxt_mp_zalloc(c->mem_pool, sizeof(nxt_h2p_stream_t));
@@ -1408,6 +1412,33 @@ nxt_h2p_on_begin_headers(nghttp2_session *session, const nghttp2_frame *frame,
     NXT_OTEL_TRACE();
 
     return 0;
+}
+
+
+/*
+ * A stream the connection will not serve: RST_STREAM(REFUSED_STREAM) tells
+ * the client it was not processed and may be retried (RFC 9113, 8.7).  The
+ * stream gets no user data, so the rest of its frames are ignored.
+ */
+
+static int
+nxt_h2p_stream_refuse(nxt_h2proto_t *h2c, int32_t stream_id)
+{
+    int      rc;
+    int32_t  last_id;
+
+    nxt_debug(&h2c->conn->task, "h2p stream %D refused", stream_id);
+
+    if (!h2c->goaway_sent) {
+        /* nghttp2 counts this stream as processed already. */
+        last_id = (stream_id > 2) ? stream_id - 2 : 0;
+        nxt_h2p_conn_goaway(h2c, last_id);
+    }
+
+    rc = nghttp2_submit_rst_stream(h2c->session, NGHTTP2_FLAG_NONE, stream_id,
+                                   NGHTTP2_REFUSED_STREAM);
+
+    return (rc == 0) ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
 }
 
 

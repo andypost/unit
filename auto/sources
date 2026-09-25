@@ -167,6 +167,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_string_test.c \
     src/test/nxt_http_chunk_parse_test.c \
     src/test/nxt_http_validate_host_test.c \
+    src/test/nxt_http_request_body_alloc_test.c \
     src/test/nxt_conf_parse_test.c \
     src/test/nxt_port_fail_test.c \
     src/test/nxt_port_use_unless_zero_test.c \

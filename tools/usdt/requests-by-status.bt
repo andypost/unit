@@ -25,9 +25,8 @@ usdt:/usr/sbin/unitd:freeunit:request__done
     if (@req_start[arg0]) {
         @latency_by_status_ns[arg1] = hist(nsecs - @req_start[arg0]);
         delete(@req_start[arg0]);
+        @inflight--;
     }
-
-    @inflight--;
 }
 
 interval:s:10

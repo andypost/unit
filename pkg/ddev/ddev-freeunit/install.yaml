@@ -1,0 +1,18 @@
+# DDEV add-on: serve the project with FreeUnit instead of nginx-fpm/apache-fpm.
+# Format: https://docs.ddev.com/en/stable/users/extend/creating-add-ons/
+
+name: freeunit
+
+project_files:
+  - config.freeunit.yaml
+  - web-build/Dockerfile.freeunit
+  - freeunit/render-config.sh
+  - freeunit/start-freeunit.sh
+  - commands/web/freeunit
+
+post_install_actions:
+  - chmod +x "${DDEV_APPROOT}/.ddev/commands/web/freeunit"
+
+# webserver_type: generic as the primary web server needs DDEV v1.24.3+;
+# the add-on template's floor is v1.24.10.
+ddev_version_constraint: '>= v1.24.10'

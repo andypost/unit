@@ -1,0 +1,54 @@
+#ddev-generated
+#
+# Build unitd and its PHP module from the pinned FreeUnit release, against
+# the php${DDEV_PHP_VERSION}-embed package from deb.sury.org (the same
+# repository DDEV installs php-fpm from). DDEV inserts this after its own
+# build steps, so DDEV_PHP_VERSION, uid and gid are already declared.
+#
+# Change FREEUNIT_VERSION here (after removing the #ddev-generated line) to
+# build another release. To build unreleased source instead (CI does this),
+# put a tarball with one top-level directory at
+# .ddev/web-build/freeunit-src.tar.gz, e.g.
+#   git archive --prefix=freeunit/ -o .ddev/web-build/freeunit-src.tar.gz HEAD
+# The build context is bind-mounted, so it need not be copied into a layer.
+#
+# The last two steps: unitd runs as the project user (supervisord does), so
+# /run/freeunit is handed to that user like DDEV does with /run/php; and
+# /etc/php/<version>/embed becomes a symlink to fpm, so the embedded PHP
+# uses the php.ini, .ddev/php/*.ini and module switches (enable_xdebug,
+# disable_xdebug, xhprof) DDEV manages for php-fpm.
+ARG FREEUNIT_VERSION=1.36.1
+
+RUN --mount=type=bind,source=.,target=/mnt/freeunit-ctx \
+    set -eu -o pipefail; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential pkg-config libpcre2-dev \
+        "php${DDEV_PHP_VERSION}-embed" "php${DDEV_PHP_VERSION}-dev"; \
+    mkdir -p /usr/src/freeunit; \
+    if [ -f /mnt/freeunit-ctx/freeunit-src.tar.gz ]; then \
+        tar -xzf /mnt/freeunit-ctx/freeunit-src.tar.gz -C /usr/src/freeunit --strip-components=1; \
+    else \
+        curl -fsSL "https://github.com/freeunitorg/freeunit/archive/refs/tags/${FREEUNIT_VERSION}.tar.gz" \
+            | tar -xz -C /usr/src/freeunit --strip-components=1; \
+    fi; \
+    cd /usr/src/freeunit; \
+    ./configure \
+        --prefix=/usr \
+        --modulesdir=/usr/lib/freeunit/modules \
+        --statedir=/run/freeunit/state \
+        --control=unix:/run/freeunit/control.sock \
+        --pid=/run/freeunit/unitd.pid \
+        --logdir=/var/log \
+        --log=/dev/stderr \
+        --tmpdir=/var/tmp; \
+    ./configure php --config="php-config${DDEV_PHP_VERSION}" --module=php; \
+    make -j"$(nproc)"; \
+    make install php-install; \
+    cd /; \
+    rm -rf /usr/src/freeunit; \
+    apt-get purge -y --auto-remove build-essential pkg-config libpcre2-dev "php${DDEV_PHP_VERSION}-dev"; \
+    rm -rf /var/lib/apt/lists/*; \
+    chown -R "$uid:$gid" /run/freeunit; \
+    rm -rf "/etc/php/${DDEV_PHP_VERSION}/embed"; \
+    ln -s fpm "/etc/php/${DDEV_PHP_VERSION}/embed"

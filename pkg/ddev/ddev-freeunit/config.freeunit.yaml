@@ -1,0 +1,18 @@
+#ddev-generated
+# webserver_type: generic makes DDEV start neither nginx nor php-fpm;
+# web_extra_daemons runs FreeUnit (unitd, PHP embedded) under supervisord
+# instead, and web_extra_exposed_ports sends the project's normal HTTP(S)
+# traffic from ddev-router to its listener on container port 80. TLS is
+# still terminated by ddev-router, as with nginx-fpm.
+webserver_type: generic
+
+web_extra_daemons:
+  - name: "freeunit"
+    command: "bash /mnt/ddev_config/freeunit/start-freeunit.sh"
+    directory: /var/www/html
+
+web_extra_exposed_ports:
+  - name: "freeunit"
+    container_port: 80
+    http_port: 80
+    https_port: 443

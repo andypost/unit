@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#ddev-generated
+
+## Description: Show FreeUnit's status or configuration, or restart it
+## Usage: freeunit [status|config|restart]
+## Example: "ddev freeunit status", "ddev freeunit config", "ddev freeunit restart"
+## AutocompleteTerms: ["status", "config", "restart"]
+
+set -euo pipefail
+
+case "${1:-status}" in
+    status|config)
+        curl -fsS --unix-socket /run/freeunit/control.sock "http://localhost/$1"
+        echo
+        ;;
+    restart)
+        supervisorctl restart webextradaemons:freeunit
+        ;;
+    *)
+        echo "Usage: ddev freeunit [status|config|restart]" >&2
+        exit 1
+        ;;
+esac

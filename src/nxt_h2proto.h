@@ -69,6 +69,9 @@ struct nxt_h2p_stream_s {
     nxt_off_t                   body_bytes_sent;
     size_t                      header_list_size;
 
+    /* engine->timers.now when the response began to wait for window. */
+    nxt_msec_t                  window_start;
+
     nxt_str_t                   authority;
     nxt_str_t                   method;
     nxt_str_t                   path;
@@ -92,6 +95,7 @@ struct nxt_h2p_stream_s {
     uint8_t                     body_error;    /* 1 bit */
     uint8_t                     no_provider;   /* 1 bit */
     uint8_t                     headers_done;  /* 1 bit */
+    uint8_t                     window_wait;   /* 1 bit */
 };
 
 

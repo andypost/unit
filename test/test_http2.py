@@ -1590,11 +1590,77 @@ def load_big(settings):
         return f.read()
 
 
+def test_http2_window_stall_stream():
+    need_h2()
+    big = load_big({'send_timeout': 2})
+
+    # SETTINGS_INITIAL_WINDOW_SIZE 10, and no WINDOW_UPDATE for a stream
+    # ever: a response waits for window after 10 bytes.
+    c = RawH2(settings={0x4: 10})
+
+    c.request(1, path='/big.txt')
+    assert c.wait(lambda: c.status.get(1) == 200)
+    start = time.monotonic()
+
+    # PINGs do not keep the stream.
+    for _ in range(3):
+        c.send(PingFrame(0, opaque_data=b'12345678'))
+        time.sleep(0.5)
+
+    # send_timeout after the window ran out the stream is cancelled; the
+    # connection stays.
+    assert c.wait(lambda: 1 in c.rst, 10)
+    elapsed = time.monotonic() - start
+
+    assert 1.5 < elapsed < 6, elapsed
+    assert c.rst[1] == CANCEL
+    assert c.data[1] == big[:10]
+    assert 1 not in c.ended
+    assert not c.closed
+    assert c.goaway is None
+
+    # A WINDOW_UPDATE that comes too late is ignored.
+    c.send(WindowUpdateFrame(1, window_increment=100000))
+
+    # A response that fits in the window is still served.
+    c.request(3, path='/index.html')
+    assert c.wait_response(3) == 200
+    assert c.data[3] == b'hello h2'
+    c.close()
+
+    assert_serves()
+
+
+def test_http2_window_stall_connection():
+    need_h2()
+    big = load_big({'send_timeout': 2})
+
+    # The client never sends WINDOW_UPDATE for the connection either: after
+    # 65535 bytes no stream can move, so the connection goes.
+    c = RawH2(window_update=False)
+
+    c.request(1, path='/big.txt')
+    assert c.wait(lambda: len(c.data.get(1, b'')) == 65535)
+    start = time.monotonic()
+
+    assert c.wait_closed(10)
+    elapsed = time.monotonic() - start
+
+    assert 1.5 < elapsed < 6, elapsed
+    assert c.goaway == (NO_ERROR, 1)
+    assert c.data[1] == big[:65535]
+    assert 1 not in c.ended
+    c.close()
+
+    assert_serves()
+
+
 def test_http2_window_update_resumes():
     need_h2()
     big = load_big({'send_timeout': 2})
 
-    # The response waits for window twice for 1.5 s, 3 s in all.
+    # The response waits for window twice for 1.5 s, 3 s in all: each
+    # wait is shorter than send_timeout, so none is a stall.
     step = 100000
     c = RawH2(settings={0x4: step})
 

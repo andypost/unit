@@ -21,6 +21,15 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        process was then linked into its parent's list twice, which
        corrupted the list in main. Such a message is now refused.
 
+    *) Bugfix: a request could reach the application with a truncated method
+       or header name length. The application protocol stores method and
+       field name lengths in a single byte. When a method exceeded 255
+       bytes, the router wrapped the length. For PHP, Perl, and Ruby, header
+       names carry the "HTTP_" prefix, causing names of 251 to 255 bytes to
+       wrap. The router now refuses a method longer than 255 bytes with 501,
+       and an overflowing header name with 431. Both are logged at "info".
+       Other languages continue to accept header names up to 255 bytes.
+
     *) Bugfix: an upstream 1xx interim response ("100 Continue", "103 Early
        Hints") was relayed to the client as the response, with the final
        response relayed as its body. The proxy now drops interim responses

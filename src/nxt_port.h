@@ -77,6 +77,9 @@ struct nxt_port_handlers_s {
      * namespace-local pid.  Appended for the same reason as the slot above.
      */
     nxt_port_handler_t  remove_child_pid;
+
+    /* The controller asks main to store a certificate bundle.  Appended. */
+    nxt_port_handler_t  cert_store;
 };
 
 
@@ -139,6 +142,8 @@ typedef enum {
     _NXT_PORT_MSG_REMOVE_CHILD_PID
                                   = nxt_port_handler_idx(remove_child_pid),
 
+    _NXT_PORT_MSG_CERT_STORE      = nxt_port_handler_idx(cert_store),
+
     NXT_PORT_MSG_MAX              = sizeof(nxt_port_handlers_t)
                                     / sizeof(nxt_port_handler_t),
 
@@ -186,6 +191,7 @@ typedef enum {
     NXT_PORT_MSG_DETACHED         = nxt_msg_last(_NXT_PORT_MSG_DETACHED),
     NXT_PORT_MSG_REMOVE_CHILD_PID
                               = nxt_msg_last(_NXT_PORT_MSG_REMOVE_CHILD_PID),
+    NXT_PORT_MSG_CERT_STORE       = nxt_msg_last(_NXT_PORT_MSG_CERT_STORE),
 } nxt_port_msg_type_t;
 
 
@@ -195,7 +201,7 @@ typedef enum {
  * inserted before it fails the build.  Add new slots after it and move the
  * pin to the new last slot.
  */
-nxt_static_assert(_NXT_PORT_MSG_REMOVE_CHILD_PID == 35,
+nxt_static_assert(_NXT_PORT_MSG_CERT_STORE == 36,
                   "a port message slot was inserted, not appended");
 
 

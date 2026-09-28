@@ -577,6 +577,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     p = nxt_realpath(tmp);
     if (nxt_slow_path(p == NULL)) {
         nxt_alert(task, "root realpath(%s) failed %E", tmp, nxt_errno);
+        nxt_free(tmp);
         return NXT_ERROR;
     }
 
@@ -596,7 +597,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
 
         tmp = nxt_malloc(target->root.length + 1 + str.length + 1);
         if (nxt_slow_path(tmp == NULL)) {
-            return NXT_ERROR;
+            goto fail;
         }
 
         p = tmp;
@@ -611,7 +612,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
         if (nxt_slow_path(p == NULL)) {
             nxt_alert(task, "script realpath(%s) failed %E", tmp, nxt_errno);
             nxt_free(tmp);
-            return NXT_ERROR;
+            goto fail;
         }
 
         nxt_free(tmp);
@@ -624,14 +625,17 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
         {
             nxt_alert(task, "script is not under php root");
             nxt_free(p);
-            return NXT_ERROR;
+            nxt_str_null(&target->script_filename);
+            goto fail;
         }
 
         ret = nxt_php_dirname(&target->script_filename,
                               &target->script_dirname);
         if (nxt_slow_path(ret != NXT_OK)) {
             nxt_free(target->script_filename.start);
-            return NXT_ERROR;
+            nxt_str_null(&target->script_filename);
+            nxt_str_null(&target->script_dirname);
+            goto fail;
         }
 
         target->script_name.length = target->script_filename.length
@@ -647,7 +651,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
 
             tmp = nxt_malloc(str.length + 1);
             if (nxt_slow_path(tmp == NULL)) {
-                return NXT_ERROR;
+                goto fail;
             }
 
             nxt_memcpy(tmp, str.start, str.length);
@@ -663,6 +667,13 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     }
 
     return NXT_OK;
+
+fail:
+
+    nxt_free(target->root.start);
+    nxt_str_null(&target->root);
+
+    return NXT_ERROR;
 }
 
 

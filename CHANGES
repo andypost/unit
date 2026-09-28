@@ -67,6 +67,12 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        thread stack. There, a repeated group on a subject of more than
        about 1,000 bytes can get a 500 response.
 
+    *) Bugfix: with isolation.namespaces.cgroup and isolation.cgroup.path,
+       the cgroup namespace of an application was rooted at the cgroup of
+       the main process, not at the configured cgroup. The application saw
+       its own cgroup as "/scope/python" instead of "/". The namespace is
+       now created after the process is moved into its cgroup.
+
     *) Security: the router and libunit read records from shared memory
        that the other process can still write, without enough checks. A
        buffer that was not a whole number of records was read past its

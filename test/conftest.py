@@ -853,9 +853,9 @@ def _check_fds(*, log=None):
         ps['fds'] += fds_diff
         before, ps['kinds'] = ps['kinds'], _fd_kinds(unit_instance['pid'])
 
-        assert (
-            fds_diff <= option.fds_threshold
-        ), f'descriptors leak main process: {_fd_kinds_diff(before, ps["kinds"])}'
+        assert fds_diff <= option.fds_threshold, _fd_leak(
+            'main process', fds_diff, before, ps['kinds']
+        )
 
     else:
         _fd_baseline(ps, unit_instance['pid'])
@@ -873,9 +873,9 @@ def _check_fds(*, log=None):
             if not option.restart:
                 assert ps['pid'] == ps_pid, f'same pid {name}'
 
-            assert (
-                fds_diff <= option.fds_threshold
-            ), f'descriptors leak {name}: {_fd_kinds_diff(before, ps["kinds"])}'
+            assert fds_diff <= option.fds_threshold, _fd_leak(
+                name, fds_diff, before, ps['kinds']
+            )
 
         else:
             _fd_baseline(ps, ps['pid'])
@@ -907,14 +907,15 @@ def _socket_names(pid):
         try:
             lines = (
                 Path(f'/proc/{pid}/net/{proto}')
-                .read_text(encoding='utf-8')
+                .read_bytes()
+                .decode('utf-8', 'backslashreplace')
                 .splitlines()[1:]
             )
         except OSError:
             continue
 
         for line in lines:
-            f = line.split()
+            f = line.split(maxsplit=7 if proto == 'unix' else -1)
 
             if proto == 'unix':
                 if len(f) < 7:
@@ -978,6 +979,11 @@ def _fd_kinds(pid):
         kinds[_fd_kind(target, sockets)] += 1
 
     return kinds
+
+
+def _fd_leak(name, fds_diff, before, after):
+    kinds = _fd_kinds_diff(before, after)
+    return f'descriptors leak {name}: {fds_diff:+d} fds, {kinds}'
 
 
 def _fd_kinds_diff(before, after):

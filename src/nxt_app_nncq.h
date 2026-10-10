@@ -17,6 +17,22 @@
 typedef uint32_t nxt_app_nncq_atomic_t;
 typedef uint16_t nxt_app_nncq_cycle_t;
 
+/*
+ * head, tail and the entries count in nxt_app_nncq_atomic_t and wrap at its
+ * width.  The cycle of an index i is i / NXT_APP_NNCQ_SIZE, so there are
+ * NXT_APP_NNCQ_CYCLES cycles, and after the last one the cycle is 0 again.
+ * The size must divide 2^32, or i % NXT_APP_NNCQ_SIZE would jump at the
+ * wrap.  The largest cycle must fit nxt_app_nncq_cycle_t.
+ */
+#define NXT_APP_NNCQ_CYCLES                                                   \
+    ((nxt_app_nncq_atomic_t) -1 / NXT_APP_NNCQ_SIZE + 1)
+
+nxt_static_assert((nxt_app_nncq_atomic_t) -1 % NXT_APP_NNCQ_SIZE
+                  == NXT_APP_NNCQ_SIZE - 1,
+                  "NXT_APP_NNCQ_SIZE must divide the range of the index");
+nxt_static_assert(NXT_APP_NNCQ_CYCLES - 1 <= (nxt_app_nncq_cycle_t) -1,
+                  "nxt_app_nncq_cycle_t must hold every cycle");
+
 typedef struct {
     nxt_app_nncq_atomic_t  head;
     nxt_app_nncq_atomic_t  entries[NXT_APP_NNCQ_SIZE];
@@ -70,7 +86,7 @@ static inline nxt_app_nncq_cycle_t
 nxt_app_nncq_next_cycle(nxt_app_nncq_t const volatile *q,
     nxt_app_nncq_cycle_t i)
 {
-    return i + 1;
+    return (i + 1) % NXT_APP_NNCQ_CYCLES;
 }
 
 
@@ -79,7 +95,8 @@ nxt_app_nncq_new_entry(nxt_app_nncq_t const volatile *q,
     nxt_app_nncq_cycle_t cycle,
     nxt_app_nncq_atomic_t i)
 {
-    return cycle * NXT_APP_NNCQ_SIZE + (i % NXT_APP_NNCQ_SIZE);
+    return (nxt_app_nncq_atomic_t) cycle * NXT_APP_NNCQ_SIZE
+           + (i % NXT_APP_NNCQ_SIZE);
 }
 
 

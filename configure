@@ -175,7 +175,7 @@ NXT_LIB_AUX_CFLAGS="$NXT_OPENSSL_CFLAGS \\
 
 NXT_LIB_AUX_LIBS="$NXT_OPENSSL_LIBS \\
                     $NXT_PCRE_LIB $NXT_ZLIB_LIBS $NXT_ZSTD_LIBS \\
-                    $NXT_BROTLI_LIBS"
+                    $NXT_BROTLI_LIBS $NXT_IO_URING_LIBS"
 
 if [ $NXT_NJS != NO ]; then
     . auto/njs

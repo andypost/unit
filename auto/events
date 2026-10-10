@@ -68,6 +68,72 @@ else
 fi
 
 
+# Linux io_uring via liburing.  Opt-in (--io-uring); reduces per-connection
+# syscall overhead for C10K-class workloads.
+
+if [ "$NXT_IO_URING" = "YES" ]; then
+
+    nxt_feature="Linux io_uring (liburing)"
+    nxt_feature_name=NXT_HAVE_IO_URING
+    nxt_feature_run=
+    nxt_feature_incs=
+    nxt_feature_libs="-luring"
+    nxt_feature_test="#include <liburing.h>
+                      #include <poll.h>
+
+                      int main(void) {
+                          struct io_uring      ring;
+                          struct io_uring_sqe  *sqe;
+                          int                  n;
+
+                          n = io_uring_queue_init(8, &ring, 0);
+                          if (n == 0) {
+                              /*
+                               * The engine needs liburing >= 2.3 APIs; make
+                               * the compile test prove they exist so an old
+                               * liburing fails configure, not the build.
+                               * io_uring_cq_has_overflow() is the newest one
+                               * called by the engine (added in liburing 2.3);
+                               * io_uring_prep_poll_multishot()/
+                               * io_uring_sqe_set_data64() date to 2.1.
+                               */
+                              sqe = io_uring_get_sqe(&ring);
+                              if (sqe != NULL) {
+                                  io_uring_prep_poll_multishot(sqe, 0, POLLIN);
+                                  io_uring_sqe_set_data64(sqe, 0);
+                              }
+                              (void) io_uring_cq_has_overflow(&ring);
+                              io_uring_queue_exit(&ring);
+                          }
+                          return 0;
+                      }"
+    . auto/feature
+
+    if [ $nxt_found = yes ]; then
+        NXT_HAVE_IO_URING=YES
+        NXT_IO_URING_LIBS="-luring"
+
+        if [ "$NXT_IO_URING_DEFAULT" = "YES" ]; then
+            nxt_have=NXT_IO_URING_DEFAULT . auto/have
+        fi
+
+    else
+        $echo
+        $echo $0: error: no liburing library found.
+        $echo
+        $echo "   io_uring support was requested (--io-uring) but the liburing"
+        $echo "   development library could not be found or is too old."
+        $echo "   Install liburing (>= 2.3) with its headers, or configure"
+        $echo "   without --io-uring to keep the default epoll engine."
+        $echo
+        exit 1;
+    fi
+
+else
+    NXT_HAVE_IO_URING=NO
+fi
+
+
 # FreeBSD, MacOSX, NetBSD, OpenBSD kqueue.
 
 nxt_feature="kqueue"

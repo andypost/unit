@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.37.1] - 2026-10-14
+
+### Changed
+- Version bump to track the FreeUnit 1.37.1 release.
+- Dependency updates: rand 0.9 → 0.10 in unit-client-rs, base64 0.22 → 0.23 in
+  unit-openapi, and the minor and patch updates of the Dependabot group in Cargo.lock.
+  A unit-client-rs test now imports `Rng`, the new name of `RngCore`. The code of unitctl
+  did not change.
+
 ## [1.37.0] - 2026-10-04
 
 ### Removed
@@ -94,7 +103,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Previous releases
 See earlier versions for additional change history.
 
-[Unreleased]: https://github.com/freeunitorg/freeunit/compare/unitctl/1.37.0...HEAD
+[Unreleased]: https://github.com/freeunitorg/freeunit/compare/unitctl/1.37.1...HEAD
+[1.37.1]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.37.1
 [1.37.0]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.37.0
 [1.36.1]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.36.1
 [1.36.0]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.36.0

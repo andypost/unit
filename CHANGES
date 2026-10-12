@@ -1,5 +1,5 @@
 
-Changes with FreeUnit 1.37.1                                     04 Oct 2026
+Changes with FreeUnit 1.37.1                                     14 Oct 2026
 
     *) Bugfix: with "compression" on, a response could reach the client
        as a corrupt or endless stream. When the response header fields

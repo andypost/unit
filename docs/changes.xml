@@ -7,7 +7,7 @@
 
 <changes apply="unit"
          ver="1.37.1" rev="1"
-         date="2026-10-04" time="00:00:00 +0000"
+         date="2026-10-14" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change type="bugfix">
@@ -400,7 +400,7 @@ option, the probes are not in the build.
                 unit-jsc19 unit-jsc20 unit-jsc21
                 unit-wasm"
          ver="1.37.1" rev="1"
-         date="2026-10-04" time="00:00:00 +0000"
+         date="2026-10-14" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change>

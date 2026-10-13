@@ -1153,3 +1153,29 @@ def test_php_application_content_length_not_reinstated():
         resp['headers']['Transfer-Encoding'] == 'chunked'
     ), 'chunked framing'
     assert resp['body'] == '0123456789', 'body intact'
+
+
+def test_php_application_header_only():
+    client.load('header')
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'X-Header': 'Location: /x',
+        }
+    )
+    assert resp['status'] == 302, 'status'
+    assert resp['headers']['Location'] == '/x', 'Location header'
+    assert resp['body'] == '', 'body empty'
+
+    resp = client.head(
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'X-Header': 'X-Custom: val',
+        }
+    )
+    assert resp['status'] == 200, 'HEAD status'
+    assert resp['headers']['X-Custom'] == 'val', 'HEAD header'
+    assert resp['body'] == '', 'HEAD body empty'

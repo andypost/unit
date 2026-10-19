@@ -590,7 +590,9 @@ struct nxt_port_s {
     /* The same streams, the oldest first. */
     nxt_queue_t         frag_queue;
 
+    char                cl_pad0[64]; /* experiment: isolate use_count */
     nxt_atomic_t        use_count;
+    char                cl_pad1[64];
 
     nxt_process_type_t  type;
 

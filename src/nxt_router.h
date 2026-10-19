@@ -154,6 +154,7 @@ typedef struct {
 
 struct nxt_app_s {
     nxt_thread_mutex_t     mutex;       /* Protects ports queue. */
+    char                   cl_pad0[64]; /* experiment: isolate the mutex */
     nxt_queue_t            ports;       /* of nxt_port_t.app_link */
     nxt_lvlhsh_t           port_hash;   /* of nxt_port_t */
 
@@ -175,7 +176,9 @@ struct nxt_app_s {
      */
     nxt_atomic_t           port_hash_count;
 
+    char                   cl_pad1[64]; /* experiment: isolate the hot counter */
     nxt_atomic_t           active_requests;
+    char                   cl_pad2[64];
     nxt_atomic_t           pending_processes;
     nxt_atomic_t           processes;
     nxt_atomic_t           idle_processes;

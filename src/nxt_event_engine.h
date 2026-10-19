@@ -517,10 +517,12 @@ struct nxt_event_engine_s {
     nxt_conn_t                 *free_connections;
     nxt_conn_t                 *pending_connections;
 
+    char                       cl_pad0[64]; /* experiment: isolate the counters */
     nxt_atomic_uint_t          accepted_conns_cnt;
     nxt_atomic_uint_t          idle_conns_cnt;
     nxt_atomic_uint_t          closed_conns_cnt;
     nxt_atomic_uint_t          requests_cnt;
+    char                       cl_pad1[64];
 
     nxt_queue_link_t           link;
     // STUB: router link

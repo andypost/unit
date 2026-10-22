@@ -34,14 +34,35 @@
 #define NXT_UNIT_EPOLL_OFF  (-2)
 
 /*
+ * The epoll set is made only on a system with at least this number of
+ * online CPUs.  libunit does not know how many processes the application
+ * has, and with few CPUs each process of a few is often busy: a READ_QUEUE
+ * then wakes one context on a busy CPU, and the sets of the others report
+ * an event that ends in an empty recvmsg().  As nginx, which uses
+ * EPOLLEXCLUSIVE only with more than one worker, the wait then uses poll().
+ */
+#ifndef NXT_UNIT_EPOLL_MIN_CPUS
+#define NXT_UNIT_EPOLL_MIN_CPUS  4
+#endif
+
+/*
+ * After this number of wakes for the shared port, the context removes the
+ * shared port from its set and adds it again, as ngx_reorder_accept_events()
+ * does: the context goes to the tail of the wait queue of the port, and the
+ * kernel does not wake the same context each time.
+ */
+#define NXT_UNIT_EPOLL_REORDER   16
+
+/*
  * The epoll set of a context: its read port and the shared port.  ep_fd is
  * -1 while the set is not made, and NXT_UNIT_EPOLL_OFF when it cannot be
  * made on this system; the wait then uses poll().
  */
 typedef struct {
-    int  ep_fd;
-    int  read_fd;
-    int  shared_fd;
+    int         ep_fd;
+    int         read_fd;
+    int         shared_fd;
+    nxt_uint_t  shared_wakes;
 } nxt_unit_wait_set_t;
 
 #else
@@ -6953,6 +6974,7 @@ nxt_unit_wait_set_init(nxt_unit_wait_set_t *ws)
     ws->ep_fd = -1;
     ws->read_fd = -1;
     ws->shared_fd = -1;
+    ws->shared_wakes = 0;
 }
 
 
@@ -6967,8 +6989,20 @@ nxt_unit_wait_set_free(nxt_unit_wait_set_t *ws)
 }
 
 
+static int  nxt_unit_wait_set_min_cpus = NXT_UNIT_EPOLL_MIN_CPUS;
+
+
 #if (NXT_TESTS)
 static int  nxt_unit_test_wait_set_fail_errno;
+
+
+/* For the test: the epoll set is made with at least "n" online CPUs. */
+
+void
+nxt_unit_test_wait_set_min_cpus(int n)
+{
+    nxt_unit_wait_set_min_cpus = n;
+}
 
 
 /* The next epoll set is not made, as if epoll_create1() failed with "err". */
@@ -7012,6 +7046,11 @@ nxt_unit_test_wait_set_fail(int err)
  *   - The wait ends after "timeout" (1 second) also, and the context then
  *     reads the queue again.
  *
+ * The set is made only with at least NXT_UNIT_EPOLL_MIN_CPUS online CPUs,
+ * and after each NXT_UNIT_EPOLL_REORDER wakes for the shared port the
+ * context adds the shared port to its set again, at the tail of the wait
+ * queue of the port.
+ *
  * The descriptors of the two ports stay open while the context lives.  If
  * one is different from the one in the set, the set is made again.  If the
  * set cannot be made, this wait uses poll().
@@ -7022,6 +7061,7 @@ nxt_unit_wait_set_wait(nxt_unit_ctx_t *ctx, nxt_unit_wait_set_t *ws,
     struct pollfd *fds, nxt_uint_t nfds, int timeout)
 {
     int                 i, n, err;
+    long                ncpu;
     struct epoll_event  ev[2];
 
     if (nfds != 2 || ws->ep_fd == NXT_UNIT_EPOLL_OFF) {
@@ -7035,6 +7075,17 @@ nxt_unit_wait_set_wait(nxt_unit_ctx_t *ctx, nxt_unit_wait_set_t *ws,
     }
 
     if (ws->ep_fd < 0) {
+        ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+
+        if (ncpu < nxt_unit_wait_set_min_cpus) {
+            ws->ep_fd = NXT_UNIT_EPOLL_OFF;
+
+            nxt_unit_debug(ctx, "%ld online CPUs, fewer than %d; using poll()",
+                           ncpu, nxt_unit_wait_set_min_cpus);
+
+            return poll(fds, nfds, timeout);
+        }
+
 #if (NXT_TESTS)
         if (nxt_slow_path(nxt_unit_test_wait_set_fail_errno != 0)) {
             errno = nxt_unit_test_wait_set_fail_errno;
@@ -7066,6 +7117,25 @@ nxt_unit_wait_set_wait(nxt_unit_ctx_t *ctx, nxt_unit_wait_set_t *ws,
 
         ws->read_fd = fds[0].fd;
         ws->shared_fd = fds[1].fd;
+        ws->shared_wakes = 0;
+
+    } else if (ws->shared_wakes >= NXT_UNIT_EPOLL_REORDER) {
+        ws->shared_wakes = 0;
+
+        /* EPOLL_CTL_MOD cannot be used with EPOLLEXCLUSIVE. */
+
+        nxt_memzero(&ev[1], sizeof(ev[1]));
+
+        ev[1].events = EPOLLIN | EPOLLEXCLUSIVE;
+        ev[1].data.u32 = 1;
+
+        if (nxt_slow_path(epoll_ctl(ws->ep_fd, EPOLL_CTL_DEL, fds[1].fd,
+                                    &ev[1]) == -1
+                          || epoll_ctl(ws->ep_fd, EPOLL_CTL_ADD, fds[1].fd,
+                                       &ev[1]) == -1))
+        {
+            goto fail;
+        }
     }
 
     n = epoll_wait(ws->ep_fd, ev, 2, timeout);
@@ -7073,6 +7143,10 @@ nxt_unit_wait_set_wait(nxt_unit_ctx_t *ctx, nxt_unit_wait_set_t *ws,
     for (i = 0; i < n; i++) {
         /* The EPOLLIN, EPOLLERR and EPOLLHUP bits are the poll() bits. */
         fds[ev[i].data.u32 & 1].revents = (short) ev[i].events;
+
+        if (ev[i].data.u32 == 1) {
+            ws->shared_wakes++;
+        }
     }
 
     return n;
@@ -7158,6 +7232,15 @@ int
 nxt_unit_test_wait_set_epoll(void *ws)
 {
     return ((nxt_unit_wait_set_t *) ws)->ep_fd >= 0;
+}
+
+
+/* The number of wakes for the shared port since the last reorder. */
+
+int
+nxt_unit_test_wait_set_shared_wakes(void *ws)
+{
+    return (int) ((nxt_unit_wait_set_t *) ws)->shared_wakes;
 }
 
 

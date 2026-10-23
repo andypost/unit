@@ -34,8 +34,8 @@
 #define NXT_UNIT_EPOLL_OFF  (-2)
 
 /*
- * The epoll set is made only on a system with at least this number of
- * online CPUs.  libunit does not know how many processes the application
+ * The epoll set is made only when the process can run on at least this
+ * number of CPUs.  libunit does not know how many processes the application
  * has, and with few CPUs each process of a few is often busy: a READ_QUEUE
  * then wakes one context on a busy CPU, and the sets of the others report
  * an event that ends in an empty recvmsg().  As nginx, which uses
@@ -6989,14 +6989,69 @@ nxt_unit_wait_set_free(nxt_unit_wait_set_t *ws)
 }
 
 
-static int  nxt_unit_wait_set_min_cpus = NXT_UNIT_EPOLL_MIN_CPUS;
+static int             nxt_unit_wait_set_min_cpus = NXT_UNIT_EPOLL_MIN_CPUS;
+static int             nxt_unit_wait_set_ncpu;
+static pthread_once_t  nxt_unit_wait_set_ncpu_once = PTHREAD_ONCE_INIT;
+
+
+/*
+ * Returns the number of CPUs that this thread can run on.  On Linux, this is
+ * the number of CPUs in the affinity mask.  "taskset" and the cpuset of a
+ * container make the mask smaller, but they do not change the number of
+ * online CPUs.  If the mask cannot be read, or on other systems, this is the
+ * number of online CPUs.
+ *
+ * The cgroup "cpu.max" limit is not read: the code that reads it is in
+ * src/nxt_lib.c, and libunit does not link it.
+ */
+
+static int
+nxt_unit_cpu_count(void)
+{
+    long  n;
+
+#if (NXT_HAVE_LINUX_SCHED_GETAFFINITY)
+    cpu_set_t  set;
+
+    CPU_ZERO(&set);
+
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        return CPU_COUNT(&set);
+    }
+#endif
+
+    n = sysconf(_SC_NPROCESSORS_ONLN);
+
+    return (n > 0 && n <= INT_MAX) ? (int) n : 1;
+}
+
+
+static void
+nxt_unit_wait_set_ncpu_init(void)
+{
+    nxt_unit_wait_set_ncpu = nxt_unit_cpu_count();
+}
 
 
 #if (NXT_TESTS)
-static int  nxt_unit_test_wait_set_fail_errno;
+/*
+ * The failure is armed for the thread that calls
+ * nxt_unit_test_wait_set_fail().  The other threads of the test make their
+ * sets at the same time, and they must not take it.
+ */
+static __thread int  nxt_unit_test_wait_set_fail_errno;
 
 
-/* For the test: the epoll set is made with at least "n" online CPUs. */
+/* For the test: the number of CPUs, counted again. */
+
+int
+nxt_unit_test_cpu_count(void)
+{
+    return nxt_unit_cpu_count();
+}
+
+
+/* For the test: the epoll set is made with at least "n" CPUs. */
 
 void
 nxt_unit_test_wait_set_min_cpus(int n)
@@ -7005,7 +7060,10 @@ nxt_unit_test_wait_set_min_cpus(int n)
 }
 
 
-/* The next epoll set is not made, as if epoll_create1() failed with "err". */
+/*
+ * The next epoll set of this thread is not made, as if epoll_create1() failed
+ * with "err".
+ */
 
 void
 nxt_unit_test_wait_set_fail(int err)
@@ -7046,7 +7104,8 @@ nxt_unit_test_wait_set_fail(int err)
  *   - The wait ends after "timeout" (1 second) also, and the context then
  *     reads the queue again.
  *
- * The set is made only with at least NXT_UNIT_EPOLL_MIN_CPUS online CPUs,
+ * The set is made only with at least NXT_UNIT_EPOLL_MIN_CPUS CPUs that the
+ * process can run on (nxt_unit_cpu_count(), counted once for each process),
  * and after each NXT_UNIT_EPOLL_REORDER wakes for the shared port the
  * context adds the shared port to its set again, at the tail of the wait
  * queue of the port.
@@ -7061,7 +7120,6 @@ nxt_unit_wait_set_wait(nxt_unit_ctx_t *ctx, nxt_unit_wait_set_t *ws,
     struct pollfd *fds, nxt_uint_t nfds, int timeout)
 {
     int                 i, n, err;
-    long                ncpu;
     struct epoll_event  ev[2];
 
     if (nfds != 2 || ws->ep_fd == NXT_UNIT_EPOLL_OFF) {
@@ -7075,13 +7133,14 @@ nxt_unit_wait_set_wait(nxt_unit_ctx_t *ctx, nxt_unit_wait_set_t *ws,
     }
 
     if (ws->ep_fd < 0) {
-        ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        (void) pthread_once(&nxt_unit_wait_set_ncpu_once,
+                            nxt_unit_wait_set_ncpu_init);
 
-        if (ncpu < nxt_unit_wait_set_min_cpus) {
+        if (nxt_unit_wait_set_ncpu < nxt_unit_wait_set_min_cpus) {
             ws->ep_fd = NXT_UNIT_EPOLL_OFF;
 
-            nxt_unit_debug(ctx, "%ld online CPUs, fewer than %d; using poll()",
-                           ncpu, nxt_unit_wait_set_min_cpus);
+            nxt_unit_debug(ctx, "%d CPUs, fewer than %d; using poll()",
+                           nxt_unit_wait_set_ncpu, nxt_unit_wait_set_min_cpus);
 
             return poll(fds, nfds, timeout);
         }
